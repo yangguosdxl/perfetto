@@ -81,6 +81,7 @@
 #include "protos/perfetto/trace/track_event/source_location.pbzero.h"
 #include "protos/perfetto/trace/track_event/task_execution.pbzero.h"
 #include "protos/perfetto/trace/track_event/track_event.pbzero.h"
+#include "protos/third_party/android/frameworks/base/proto/tracing/frameworks_base_track_event.pbzero.h"
 
 namespace Json {
 class Value;
@@ -1297,6 +1298,21 @@ class TrackEventEventImporter {
         parser_->AddActiveProcess(ts_, *it);
       }
     }
+
+    // Android framework process lifecycle extensions (field ids > 2000).
+    // Use FindField() since the typed decoder doesn't cover extension fields.
+    {
+      using FBTE = ::com::android::internal::pbzero::FrameworksBaseTrackEvent;
+      if (auto f = event_.FindField(FBTE::kProcessStartEventFieldNumber);
+          f.valid()) {
+        HandleAndroidProcessStart(f.as_bytes());
+      }
+      if (auto f = event_.FindField(FBTE::kBinderDiedEventFieldNumber);
+          f.valid()) {
+        HandleAndroidBinderDied(f.as_bytes());
+      }
+    }
+
     if (event_.has_correlation_id()) {
       base::StackString<512> id_str("tp:#%" PRIu64, event_.correlation_id());
       inserter->AddArg(parser_->correlation_id_key_id_,
@@ -1566,6 +1582,52 @@ class TrackEventEventImporter {
       return base::OkStatus();
     }
     return base::OkStatus();
+  }
+
+  // Handles AndroidProcessStartEvent (emitted on "process_bound" slices).
+  // Events without process_name (e.g. early "process_start" slices) are
+  // skipped. First write wins for name/uid.
+  void HandleAndroidProcessStart(protozero::ConstBytes data) {
+    ::com::android::internal::pbzero::AndroidProcessStartEvent::Decoder evt(
+        data);
+    if (!evt.has_pid() || !evt.has_process_name())
+      return;
+
+    auto* pt = context_->process_tracker.get();
+    UniquePid upid = pt->GetOrCreateProcessWithoutMainThread(evt.pid());
+    pt->SetStartTsIfUnset(upid, ts_);
+
+    auto& procs = *context_->storage->mutable_process_table();
+    if (!procs[upid].name().has_value()) {
+      pt->UpdateProcessName(upid, storage_->InternString(evt.process_name()),
+                            ProcessNamePriority::kOther);
+    }
+    if (evt.has_uid() && !procs[upid].uid().has_value()) {
+      pt->SetProcessUid(upid, static_cast<uint32_t>(evt.uid()));
+    }
+  }
+
+  // Handles AndroidBinderDiedEvent. Sets uid/name (first write wins) then
+  // ends the process.
+  void HandleAndroidBinderDied(protozero::ConstBytes data) {
+    ::com::android::internal::pbzero::AndroidBinderDiedEvent::Decoder evt(data);
+    if (!evt.has_pid())
+      return;
+
+    auto* pt = context_->process_tracker.get();
+    auto opt_upid = pt->UpidForPid(evt.pid());
+    if (opt_upid) {
+      auto& procs = *context_->storage->mutable_process_table();
+      if (evt.has_uid() && !procs[*opt_upid].uid().has_value()) {
+        pt->SetProcessUid(*opt_upid, static_cast<uint32_t>(evt.uid()));
+      }
+      if (evt.has_process_name() && !procs[*opt_upid].name().has_value()) {
+        pt->UpdateProcessName(*opt_upid,
+                              storage_->InternString(evt.process_name()),
+                              ProcessNamePriority::kOther);
+      }
+    }
+    pt->EndProcess(ts_, evt.pid());
   }
 
   TraceProcessorContext* context_;

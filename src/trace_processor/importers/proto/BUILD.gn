@@ -99,6 +99,7 @@ source_set("minimal") {
     "../../../../protos/perfetto/trace/system_info:zero",
     "../../../../protos/perfetto/trace/track_event:zero",
     "../../../../protos/perfetto/trace/translation:zero",
+    "../../../../protos/third_party/android/frameworks/base/proto/tracing:frameworks_base_track_event_zero",
     "../../../../protos/third_party/chromium:zero",
     "../../../base",
     "../../../protovm",

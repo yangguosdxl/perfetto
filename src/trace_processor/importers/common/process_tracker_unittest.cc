@@ -337,6 +337,129 @@ TEST_F(ProcessTrackerTest, NamespacedProcessesAndThreads) {
             1029u);
 }
 
+TEST_F(ProcessTrackerTest, EndProcessWithMainThread) {
+  context.process_tracker->StartNewProcess(
+      1000, std::nullopt, 123, kNullStringId, ThreadNamePriority::kFtrace);
+  context.process_tracker->EndProcess(2000, 123);
+
+  ASSERT_EQ(context.storage->process_table()[1].end_ts(), 2000);
+  ASSERT_EQ(context.storage->thread_table()[1].end_ts(), 2000);
+}
+
+TEST_F(ProcessTrackerTest, EndProcessWithoutMainThread) {
+  auto upid = context.process_tracker->StartNewProcessWithoutMainThread(
+      1000, std::nullopt, 123, kNullStringId,
+      ThreadNamePriority::kGenericKernelTask);
+  context.process_tracker->EndProcess(2000, 123);
+
+  ASSERT_EQ(context.storage->process_table()[upid].end_ts(), 2000);
+}
+
+TEST_F(ProcessTrackerTest, EndProcessNonExistent) {
+  context.process_tracker->EndProcess(1000, 999);
+}
+
+// Ftrace-first: Android start reuses existing upid.
+TEST_F(ProcessTrackerTest, FtraceStartThenAndroidStart) {
+  auto name = context.storage->InternString("com.app");
+  auto upid = context.process_tracker->StartNewProcess(
+      1000, std::nullopt, 100, name, ThreadNamePriority::kFtrace);
+
+  auto same = context.process_tracker->GetOrCreateProcessWithoutMainThread(100);
+  ASSERT_EQ(same, upid);
+
+  context.process_tracker->SetProcessUid(same, 10042);
+  ASSERT_EQ(*context.storage->process_table()[upid].uid(), 10042u);
+}
+
+// Android-first: ftrace overwrites pid mapping.
+TEST_F(ProcessTrackerTest, AndroidStartThenFtraceStart) {
+  context.process_tracker->StartNewProcessWithoutMainThread(
+      900, std::nullopt, 100, context.storage->InternString("com.app"),
+      ThreadNamePriority::kOther);
+
+  auto ftrace_upid = context.process_tracker->StartNewProcess(
+      1000, std::nullopt, 100, context.storage->InternString("com.app"),
+      ThreadNamePriority::kFtrace);
+
+  auto current = context.process_tracker->UpidForPid(100);
+  ASSERT_TRUE(current.has_value());
+  ASSERT_EQ(*current, ftrace_upid);
+}
+
+// BinderDied sets uid and ends ftrace-created process.
+TEST_F(ProcessTrackerTest, FtraceStartAndroidDeath) {
+  auto upid = context.process_tracker->StartNewProcess(
+      1000, std::nullopt, 100, context.storage->InternString("com.app"),
+      ThreadNamePriority::kFtrace);
+
+  auto opt = context.process_tracker->UpidForPid(100);
+  ASSERT_TRUE(opt.has_value());
+  context.process_tracker->SetProcessUid(*opt, 10042);
+  context.process_tracker->EndProcess(2000, 100);
+
+  ASSERT_EQ(context.storage->process_table()[upid].end_ts(), 2000);
+  ASSERT_EQ(*context.storage->process_table()[upid].uid(), 10042u);
+  ASSERT_FALSE(context.process_tracker->UpidForPid(100).has_value());
+}
+
+// Duplicate start/death events must not overwrite name, uid, or start_ts.
+TEST_F(ProcessTrackerTest, FirstWriteWins) {
+  auto* tracker = context.process_tracker.get();
+  auto& pt = *context.storage->mutable_process_table();
+
+  auto name1 = context.storage->InternString("com.app");
+  UniquePid upid = tracker->GetOrCreateProcessWithoutMainThread(100);
+  tracker->SetStartTsIfUnset(upid, 1000);
+  if (!pt[upid].name().has_value())
+    tracker->UpdateProcessName(upid, name1, ProcessNamePriority::kOther);
+  if (!pt[upid].uid().has_value())
+    tracker->SetProcessUid(upid, 10001);
+
+  // Second start for same pid should be a no-op for name/uid/ts.
+  auto name2 = context.storage->InternString("com.app.v2");
+  ASSERT_EQ(tracker->GetOrCreateProcessWithoutMainThread(100), upid);
+  tracker->SetStartTsIfUnset(upid, 2000);
+  if (!pt[upid].name().has_value())
+    tracker->UpdateProcessName(upid, name2, ProcessNamePriority::kOther);
+  if (!pt[upid].uid().has_value())
+    tracker->SetProcessUid(upid, 10002);
+
+  ASSERT_EQ(context.storage->GetString(*pt[upid].name()), "com.app");
+  ASSERT_EQ(*pt[upid].uid(), 10001u);
+  ASSERT_EQ(pt[upid].start_ts(), 1000);
+
+  // BinderDied should also not overwrite.
+  auto opt = tracker->UpidForPid(100);
+  ASSERT_TRUE(opt.has_value());
+  if (!pt[*opt].uid().has_value())
+    tracker->SetProcessUid(*opt, 99999);
+  if (!pt[*opt].name().has_value())
+    tracker->UpdateProcessName(*opt, context.storage->InternString("death"),
+                               ProcessNamePriority::kOther);
+  tracker->EndProcess(3000, 100);
+
+  ASSERT_EQ(context.storage->GetString(*pt[upid].name()), "com.app");
+  ASSERT_EQ(*pt[upid].uid(), 10001u);
+  ASSERT_EQ(pt[upid].end_ts(), 3000);
+}
+
+// PID reuse after EndProcess yields distinct upids.
+TEST_F(ProcessTrackerTest, AndroidOnlyLifecycleWithPidReuse) {
+  auto upid1 = context.process_tracker->StartNewProcessWithoutMainThread(
+      1000, std::nullopt, 200, context.storage->InternString("com.first"),
+      ThreadNamePriority::kOther);
+  context.process_tracker->EndProcess(2000, 200);
+
+  auto upid2 = context.process_tracker->StartNewProcessWithoutMainThread(
+      3000, std::nullopt, 200, context.storage->InternString("com.second"),
+      ThreadNamePriority::kOther);
+
+  ASSERT_NE(upid1, upid2);
+  ASSERT_EQ(context.storage->process_table()[upid1].end_ts(), 2000);
+  ASSERT_FALSE(context.storage->process_table()[upid2].end_ts().has_value());
+}
+
 TEST_F(ProcessTrackerTest, NamespacedThreadMissingProcess) {
   // Try to update a namespaced thread without first registering the process.
   // This should fail and return false.

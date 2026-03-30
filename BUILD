@@ -640,6 +640,7 @@ perfetto_cc_library(
                ":protos_perfetto_trace_system_info_zero",
                ":protos_perfetto_trace_track_event_zero",
                ":protos_perfetto_trace_translation_zero",
+               ":protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_zero",
                ":protos_third_party_chromium_zero",
                ":protos_third_party_pprof_zero",
                ":protos_third_party_primes_cpp",
@@ -941,6 +942,7 @@ perfetto_cc_library(
                ":protos_perfetto_trace_system_info_zero",
                ":protos_perfetto_trace_track_event_zero",
                ":protos_perfetto_trace_translation_zero",
+               ":protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_zero",
                ":protos_third_party_chromium_zero",
                ":protos_third_party_pprof_zero",
                ":protos_third_party_primes_cpp",
@@ -9678,6 +9680,15 @@ perfetto_proto_library(
     ],
 )
 
+# GN target: //protos/third_party/android/frameworks/base/proto/tracing:frameworks_base_track_event_zero
+perfetto_cc_protozero_library(
+    name = "protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_zero",
+    deps = [
+        ":protos_perfetto_trace_track_event_zero",
+        ":protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_protos",
+    ],
+)
+
 # GN target: //protos/third_party/android/frameworks/native/tracing:frameworks_native_track_event_source_set
 perfetto_proto_library(
     name = "protos_third_party_android_frameworks_native_tracing_frameworks_native_track_event_protos",
@@ -10320,6 +10331,7 @@ perfetto_cc_library(
                ":protos_perfetto_trace_system_info_zero",
                ":protos_perfetto_trace_track_event_zero",
                ":protos_perfetto_trace_translation_zero",
+               ":protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_zero",
                ":protos_third_party_chromium_zero",
                ":protos_third_party_pprof_zero",
                ":protos_third_party_primes_cpp",
@@ -10628,6 +10640,7 @@ perfetto_cc_binary(
                ":protos_perfetto_trace_system_info_zero",
                ":protos_perfetto_trace_track_event_zero",
                ":protos_perfetto_trace_translation_zero",
+               ":protos_third_party_android_frameworks_base_proto_tracing_frameworks_base_track_event_zero",
                ":protos_third_party_chromium_zero",
                ":protos_third_party_pprof_zero",
                ":protos_third_party_primes_cpp",

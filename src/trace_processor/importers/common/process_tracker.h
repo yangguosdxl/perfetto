@@ -200,11 +200,17 @@ class ProcessTracker {
   // to the pid.
   UniquePid GetOrCreateProcessWithoutMainThread(int64_t pid);
 
-  // Returns the upid for a given pid.
-  std::optional<UniquePid> UpidForPidForTesting(uint32_t pid) {
+  std::optional<UniquePid> UpidForPid(int64_t pid) {
     auto* it = pids_.Find(pid);
     return it ? std::make_optional(*it) : std::nullopt;
   }
+
+  std::optional<UniquePid> UpidForPidForTesting(uint32_t pid) {
+    return UpidForPid(static_cast<int64_t>(pid));
+  }
+
+  // Like EndThread but also handles processes without a main thread.
+  void EndProcess(int64_t timestamp, int64_t pid);
 
   // Returns the bounds of a range that includes all UniqueTids that have the
   // requested tid.
