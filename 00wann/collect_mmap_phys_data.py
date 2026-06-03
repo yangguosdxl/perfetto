@@ -79,6 +79,12 @@ def format_smaps_progress_line(path: str, size_bytes: int, remaining_s: float) -
   return f"smaps 快照: {path} ({size_bytes} bytes) 剩余: {max(0.0, remaining_s):.1f}s"
 
 
+def launch_app(name: str):
+  """目标进程未运行时，通过 monkey 发送一次启动 Intent。"""
+  print(f"目标进程未启动，尝试启动应用: {name}")
+  adb_shell(f"monkey -p {shell_quote(name)} 1")
+
+
 class TwoLineProgress:
   """用两行原地刷新高频采样状态，避免长时间采集刷屏。"""
 
@@ -97,6 +103,7 @@ class TwoLineProgress:
 def wait_for_pid(name: str, timeout_s: int) -> int:
   start_time = time.time()
   deadline = time.time() + timeout_s if timeout_s > 0 else None
+  launch_attempted = False
   while True:
     elapsed_s = time.time() - start_time
     out = adb_shell(f"pidof {shell_quote(name)} || true", log=False).strip()
@@ -106,6 +113,9 @@ def wait_for_pid(name: str, timeout_s: int) -> int:
       return pid
     if deadline is not None and time.time() > deadline:
       raise RuntimeError(f"等待目标进程超时: {name}")
+    if not launch_attempted:
+      launch_app(name)
+      launch_attempted = True
     print("\r\033[K" + format_wait_status(name, elapsed_s), end="", flush=True)
     time.sleep(0.2)
 
@@ -877,7 +887,9 @@ def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: i
           "value_type": row.get("c8", ""),
       }
       for row in rows
-      if row.get("section") == "syscall"
+      if row.get("section") == "syscall" and all(
+          row.get(key) not in ("", None)
+          for key in ("c0", "c1", "c2", "c3", "c4", "c5"))
   ]
   return {
       "trace_health": summarize_trace_health(health_rows) if health_rows else None,

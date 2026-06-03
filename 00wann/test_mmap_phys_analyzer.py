@@ -291,6 +291,44 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     self.assertEqual(status, "等待应用启动: com.example.app 已等待 12.3s")
 
+  def test_wait_for_pid_launches_app_once_when_not_running(self):
+    """目标进程未启动时，应自动拉起游戏并继续等待 pid。"""
+    pidof_outputs = ["", "4321"]
+    shell_calls = []
+
+    def fake_adb_shell(cmd, **_kwargs):
+      shell_calls.append(cmd)
+      if cmd.startswith("pidof "):
+        return pidof_outputs.pop(0)
+      return "monkey ok"
+
+    with mock.patch.object(collector, "adb_shell", side_effect=fake_adb_shell), \
+         mock.patch.object(collector.time, "sleep"):
+      pid = collector.wait_for_pid("com.example.app", timeout_s=5)
+
+    self.assertEqual(pid, 4321)
+    self.assertEqual(
+        shell_calls,
+        [
+            "pidof 'com.example.app' || true",
+            "monkey -p 'com.example.app' 1",
+            "pidof 'com.example.app' || true",
+        ])
+
+  def test_wait_for_pid_does_not_launch_when_already_running(self):
+    """目标进程已存在时，不应额外发送 monkey 启动命令。"""
+    shell_calls = []
+
+    def fake_adb_shell(cmd, **_kwargs):
+      shell_calls.append(cmd)
+      return "4321"
+
+    with mock.patch.object(collector, "adb_shell", side_effect=fake_adb_shell):
+      pid = collector.wait_for_pid("com.example.app", timeout_s=5)
+
+    self.assertEqual(pid, 4321)
+    self.assertEqual(shell_calls, ["pidof 'com.example.app' || true"])
+
   def test_two_line_progress_reuses_existing_lines(self):
     """smaps 采样进度应复用两行输出，避免每次采样都刷屏。"""
     out = io.StringIO()
@@ -442,6 +480,7 @@ TOTAL SWAP PSS: 7,000K
               f'"{collector.ARM64_MMAP_NR}","","int",""\n'
               '"syscall","1","1000","7","raw_syscalls/sys_enter","11","args",'
               '"268435456","","uint",""\n'
+              '"syscall"\n'
               '"syscall","1","1000","7","raw_syscalls/sys_enter","12","args",'
               '"4096","","uint",""\n'
               '"syscall","2","1001","7","raw_syscalls/sys_exit","13","ret",'
