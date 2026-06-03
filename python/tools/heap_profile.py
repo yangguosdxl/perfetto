@@ -19,7 +19,10 @@ from __future__ import print_function
 
 import argparse
 import atexit
+import csv
+import io
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -29,6 +32,7 @@ import time
 import uuid
 
 from perfetto.prebuilts.manifests.heapprofd_glibc_preload import *
+from perfetto.prebuilts.manifests.trace_processor_shell import *
 from perfetto.prebuilts.manifests.tracebox import *
 from perfetto.prebuilts.manifests.traceconv import *
 from perfetto.prebuilts.perfetto_prebuilts import *
@@ -50,6 +54,8 @@ PACKAGES_LIST_CFG = '''data_sources {
 '''
 
 CFG_INDENT = '      '
+ROOT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CFG = '''buffers {{
   size_kb: 63488
 }}
@@ -84,6 +90,19 @@ PROFILE_LOCAL_PATH = os.path.join(tempfile.gettempdir(), UUID)
 
 IS_INTERRUPTED = False
 
+TRACE_HEALTH_STATS = (
+    'traced_buf_bytes_overwritten',
+    'traced_buf_chunks_overwritten',
+    'traced_buf_chunks_discarded',
+    'traced_buf_trace_writer_packet_loss',
+    'traced_buf_patches_failed',
+    'traced_buf_abi_violations',
+    'heapprofd_buffer_overran',
+    'heapprofd_client_error',
+    'heapprofd_missing_packet',
+    'heapprofd_non_finalized_profile',
+)
+
 
 def sigint_handler(sig, frame):
   global IS_INTERRUPTED
@@ -116,6 +135,120 @@ def maybe_known_issues():
       ['adb', 'shell', 'getprop',
        'ro.build.version.release_or_codename']).decode('utf-8').strip()
   return KNOWN_ISSUES.get(release_or_codename, None)
+
+
+def parse_trace_processor_csv(output, required_columns=('name', 'idx', 'value')):
+  """从 trace_processor 日志混合输出中截取 CSV 查询结果。"""
+  lines = [
+      re.sub(r'\[\d+\.\d+\]\s+.*$', '', line) for line in output.splitlines()
+  ]
+  header_index = None
+  for i, line in enumerate(lines):
+    try:
+      header = next(csv.reader([line]))
+    except csv.Error:
+      continue
+    if all(column in header for column in required_columns):
+      header_index = i
+      break
+  if header_index is None:
+    return []
+  return list(csv.DictReader(io.StringIO('\n'.join(lines[header_index:]))))
+
+
+def stat_value(value):
+  if value in ('', None):
+    return 0
+  return int(float(value))
+
+
+def summarize_trace_health(rows):
+  def sum_stats(names):
+    return sum(
+        stat_value(row.get('value')) for row in rows
+        if row.get('name') in names)
+
+  return {
+      'perfetto_data_loss': sum_stats({
+          'traced_buf_bytes_overwritten',
+          'traced_buf_chunks_overwritten',
+          'traced_buf_chunks_discarded',
+          'traced_buf_trace_writer_packet_loss',
+          'traced_buf_patches_failed',
+          'traced_buf_abi_violations',
+      }),
+      'heapprofd_data_loss': sum_stats({
+          'heapprofd_buffer_overran',
+          'heapprofd_missing_packet',
+          'heapprofd_non_finalized_profile',
+      }),
+      'heapprofd_errors': sum_stats({
+          'heapprofd_client_error',
+      }),
+  }
+
+
+def warn_if_sample_data_discarded(summary):
+  data_loss = summary['perfetto_data_loss'] + summary['heapprofd_data_loss']
+  if data_loss == 0 and summary['heapprofd_errors'] == 0:
+    return
+  print(
+      'WARNING: heap profile sample data was discarded or incomplete: '
+      'perfetto_data_loss={perfetto_data_loss}, '
+      'heapprofd_data_loss={heapprofd_data_loss}, '
+      'heapprofd_errors={heapprofd_errors}. '
+      'Consider increasing --shmem-size, increasing --interval, or reducing '
+      'the profiling duration.'.format(**summary),
+      file=sys.stderr)
+
+
+def find_trace_processor_binary(args, traceconv_binary):
+  candidates = []
+  if args.trace_processor_binary:
+    candidates.append(args.trace_processor_binary)
+  env_binary = os.getenv('PERFETTO_TRACE_PROCESSOR_BINARY')
+  if env_binary:
+    candidates.append(env_binary)
+  if traceconv_binary:
+    candidates.append(os.path.join(os.path.dirname(traceconv_binary),
+                                   'trace_processor_shell'))
+  candidates.append(os.path.join(ROOT_DIR, 'out', 'linux_clang_release',
+                                 'trace_processor_shell'))
+
+  for candidate in candidates:
+    if candidate and os.path.isfile(candidate):
+      return candidate
+
+  return get_perfetto_prebuilt(TRACE_PROCESSOR_SHELL_MANIFEST, soft_fail=True)
+
+
+def query_trace_health(trace_processor_binary, trace_path):
+  quoted_names = ', '.join("'{}'".format(name) for name in TRACE_HEALTH_STATS)
+  sql = ('select name, idx, value from stats '
+         'where name in ({}) order by name, idx'.format(quoted_names))
+  proc = subprocess.run(
+      [trace_processor_binary, 'query', trace_path, sql],
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      check=False)
+  if proc.returncode != 0:
+    print(
+        'WARNING: failed to check heap profile sample loss: {}'.format(
+            proc.stdout.strip()),
+        file=sys.stderr)
+    return []
+  return parse_trace_processor_csv(proc.stdout)
+
+
+def check_trace_health(args, trace_path, traceconv_binary):
+  trace_processor_binary = find_trace_processor_binary(args, traceconv_binary)
+  if not trace_processor_binary:
+    return
+  rows = query_trace_health(trace_processor_binary, trace_path)
+  if not rows:
+    return
+  warn_if_sample_data_discarded(summarize_trace_health(rows))
 
 
 SDK = {
@@ -329,6 +462,8 @@ def linux_main(args, cfg, cmd, traceconv_binary):
   print('Waiting for profiler shutdown...')
   perfetto_proc.wait()
 
+  check_trace_health(args, trace_output, traceconv_binary)
+
   return process_trace(
       trace_output, profile_target, traceconv_binary, args, android_mode=False)
 
@@ -462,6 +597,9 @@ def main(argv):
       "only for heapprofd development.")
   common.add_argument(
       "--traceconv-binary", help="Path to local trace to text. For debugging.")
+  common.add_argument(
+      "--trace-processor-binary",
+      help="Path to local trace_processor_shell. For heap profile loss checks.")
   common.add_argument(
       "--no-annotations",
       help="Do not suffix the pprof function names with Android ART mode "
@@ -727,6 +865,8 @@ def main(argv):
   if uuid_trace:
     subprocess.check_call(['adb', 'shell', 'rm', profile_device_path],
                           stdout=NULL)
+
+  check_trace_health(args, profile_host_path, traceconv_binary)
 
   return process_trace(
       profile_host_path,

@@ -30,6 +30,7 @@ import shlex
 import sys
 import re
 from dataclasses import dataclass
+from typing import List
 
 COPYRIGHT_HEADER = '''/*
  * Copyright (C) 2019 The Android Open Source Project
@@ -59,7 +60,7 @@ class Flag:
 class HeaderGenerator:
   """Generates the build flag header file."""
 
-  def __init__(self, out_path: str, flags: list[Flag]):
+  def __init__(self, out_path: str, flags: List[Flag]):
     self._out_path = out_path
     self._flags = flags
     self._guard = re.sub(r'[^A-Z0-9_]', '_', out_path.upper()) + '_'
@@ -123,7 +124,7 @@ static const int kPerfettoBuildFlagsCount = sizeof(kPerfettoBuildFlags) / sizeof
       out.write(header_template)
 
 
-def parse_flags_from_rsp(rsp_file: str) -> list[Flag]:
+def parse_flags_from_rsp(rsp_file: str) -> List['Flag']:
   """Parses the response file and returns a list of flags."""
   with open(rsp_file, 'r') as f:
     content = f.read()
@@ -132,7 +133,7 @@ def parse_flags_from_rsp(rsp_file: str) -> list[Flag]:
   if not parts or parts[0] != '--flags':
     raise ValueError("Invalid response file format: --flags not found.")
 
-  flags: list[Flag] = []
+  flags: List['Flag'] = []
   for flag_str in parts[1:]:
     if '=' not in flag_str:
       raise ValueError(f"Invalid flag format: {flag_str}")

@@ -1,0 +1,5 @@
+{
+    "Wait10SForAttachDebug":0,
+    "MemoryLevel":1,
+    "DeviceQualityLevel":0
+}

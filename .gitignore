@@ -50,3 +50,7 @@ mise.toml
 perf.data*
 rfcs
 TAGS
+
+.venv2/
+00wann/PerfData/
+00wann/workspace/

@@ -137,7 +137,7 @@ def get_library_target_type(target: str) -> str:
   return 'source_set'
 
 
-def yaml_to_gn_targets(desc: Dict[str, Any], build_types: list[str],
+def yaml_to_gn_targets(desc: Dict[str, Any], build_types: List[str],
                        config_name: str) -> List[str]:
   '''Given a gRPC YAML description of the build graph, generates GN targets.'''
   out = []
