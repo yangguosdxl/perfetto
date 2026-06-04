@@ -220,14 +220,67 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn("shmem_size_bytes: 8388608", config)
     self.assertNotIn("stream_allocations", config)
 
-  def test_collect_defaults_to_three_minutes(self):
-    """默认 mmap 物理内存采集时长应为 3 分钟。"""
+  def test_collect_defaults_to_75_seconds(self):
+    """默认 mmap 物理内存采集时长应为 1 分 15 秒。"""
     with mock.patch.object(sys, "argv", ["collect_mmap_phys_data.py", "--name", "app"]):
       args = collector.parse_args()
 
-    self.assertEqual(args.duration_ms, 180000)
+    self.assertEqual(args.duration_ms, 75000)
     self.assertTrue(args.collect_malloc)
     self.assertTrue(args.mmap_callstacks)
+
+  def test_main_captures_meminfo_before_trace_analysis(self):
+    """采样结束后应先保存 meminfo，再运行 trace 健康检查和离线分析。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          duration_ms=75000,
+          smaps_interval_ms=1000,
+          output=tmpdir,
+          wait_timeout_s=120,
+          buffer_kb=262144,
+          perf_ring_buffer_pages=8192,
+          perf_ring_buffer_read_period_ms=100,
+          collect_malloc=True,
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=8 * 1024 * 1024,
+          mmap_callstacks=True,
+          no_ftrace=False,
+          no_kernel_frames=False,
+          no_guardrails=False,
+          use_su=False,
+          no_analyze=False,
+          trace_processor="tp",
+          analyzer="analyzer.py")
+      calls = []
+
+      def record(name, result=None):
+        def inner(*_args, **_kwargs):
+          calls.append(name)
+          return result
+        return inner
+
+      with mock.patch.object(collector, "parse_args", return_value=args), \
+          mock.patch.object(collector, "wait_for_pid", return_value=1234), \
+          mock.patch.object(collector, "write_config", record("write_config")), \
+          mock.patch.object(collector, "start_perfetto",
+                            record("start_perfetto", 5678)), \
+          mock.patch.object(collector, "collect_smaps", record("collect_smaps")), \
+          mock.patch.object(collector, "pull_trace", record("pull_trace")), \
+          mock.patch.object(collector, "capture_meminfo",
+                            record("capture_meminfo", os.path.join(tmpdir, "dumpsys_meminfo.txt"))), \
+          mock.patch.object(collector, "check_trace_health",
+                            record("check_trace_health", {})), \
+          mock.patch.object(collector, "run_analyzer", record("run_analyzer")), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            record("collect_memory_validation")):
+        self.assertEqual(collector.main(), 0)
+
+    self.assertIn("capture_meminfo", calls)
+    self.assertLess(calls.index("capture_meminfo"), calls.index("check_trace_health"))
+    self.assertLess(calls.index("capture_meminfo"), calls.index("run_analyzer"))
+    self.assertLess(calls.index("capture_meminfo"),
+                    calls.index("collect_memory_validation"))
 
   def test_trace_health_summary_flags_perf_lost_records(self):
     """健康检查需要区分 Perfetto buffer 和 perf 内核 buffer 丢数。"""
@@ -284,6 +337,63 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     self.assertIn("WARN: heapprofd", out.getvalue())
     self.assertIn("data_loss=1", out.getvalue())
+
+  def test_heapprofd_retry_params_grow_shmem_before_sampling_interval(self):
+    """自动重试应先增大 heapprofd shmem，到上限后再放宽采样间隔。"""
+    next_params = collector.next_heapprofd_retry_params(
+        sampling_interval_bytes=4096,
+        shmem_size_bytes=8 * 1024 * 1024,
+        max_shmem_size_bytes=512 * 1024 * 1024,
+        max_sampling_interval_bytes=65536)
+
+    self.assertEqual(next_params, (4096, 16 * 1024 * 1024))
+
+    next_params = collector.next_heapprofd_retry_params(
+        sampling_interval_bytes=4096,
+        shmem_size_bytes=512 * 1024 * 1024,
+        max_shmem_size_bytes=512 * 1024 * 1024,
+        max_sampling_interval_bytes=65536)
+
+    self.assertEqual(next_params, (8192, 512 * 1024 * 1024))
+
+  def test_validation_mode_retries_until_heapprofd_health_is_clean(self):
+    """无栈验证模式遇到 heapprofd 异常时，应自动调参重跑直到计数清零。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          mmap_callstacks=False,
+          collect_malloc=True,
+          trace_processor="tp",
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=8 * 1024 * 1024,
+          max_malloc_sampling_interval_bytes=65536,
+          max_malloc_shmem_size_bytes=512 * 1024 * 1024,
+          max_heapprofd_retries=3)
+      attempts = []
+
+      def fake_run_collection(run_args):
+        attempts.append((run_args.output,
+                         run_args.malloc_sampling_interval_bytes,
+                         run_args.malloc_shmem_size_bytes))
+        if len(attempts) == 1:
+          return {"trace_health": {"heapprofd_data_loss": 1,
+                                   "heapprofd_errors": 1}}
+        return {"trace_health": {"heapprofd_data_loss": 0,
+                                 "heapprofd_errors": 0}}
+
+      with mock.patch.object(collector, "force_stop_app") as force_stop_app, \
+          mock.patch.object(collector, "run_collection",
+                             side_effect=fake_run_collection):
+        status = collector.run_auto_heapprofd_retry(args, tmpdir)
+
+    self.assertEqual(status, 0)
+    self.assertEqual(len(attempts), 2)
+    self.assertTrue(os.path.basename(attempts[0][0]).startswith("attempt_01"))
+    self.assertTrue(os.path.basename(attempts[1][0]).startswith("attempt_02"))
+    self.assertEqual(attempts[0][1:], (4096, 8 * 1024 * 1024))
+    self.assertEqual(attempts[1][1:], (4096, 16 * 1024 * 1024))
+    self.assertEqual([call.args[0] for call in force_stop_app.mock_calls],
+                     ["com.example.app", "com.example.app"])
 
   def test_wait_status_includes_elapsed_seconds(self):
     """等待应用启动的进度需要在同一行展示累计秒数。"""

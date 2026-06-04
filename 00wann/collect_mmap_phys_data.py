@@ -85,6 +85,20 @@ def launch_app(name: str):
   adb_shell(f"monkey -p {shell_quote(name)} 1")
 
 
+def force_stop_app(name: str, timeout_s: float = 5.0):
+  """验证 attempt 前停止目标应用，保证下一轮重新启动并获取新 pid。"""
+  print(f"重启验证目标应用，先停止进程: {name}")
+  adb_shell(f"am force-stop {shell_quote(name)}")
+  deadline = time.time() + timeout_s
+  while time.time() < deadline:
+    out = adb_shell(f"pidof {shell_quote(name)} || true", log=False).strip()
+    if not out:
+      return
+    time.sleep(0.2)
+  print(f"WARN: force-stop 后目标进程仍存在，将继续尝试重新采集: {name}",
+        file=sys.stderr)
+
+
 class TwoLineProgress:
   """用两行原地刷新高频采样状态，避免长时间采集刷屏。"""
 
@@ -1020,6 +1034,29 @@ def build_memory_validation_status(mmap_summary, trace_health):
   }
 
 
+def has_heapprofd_health_issue(trace_health) -> bool:
+  """判断 heapprofd 异常计数是否仍未清零。"""
+  if not trace_health:
+    return False
+  return (
+      int_value(trace_health.get("heapprofd_data_loss")) > 0 or
+      int_value(trace_health.get("heapprofd_errors")) > 0)
+
+
+def next_heapprofd_retry_params(sampling_interval_bytes: int,
+                                shmem_size_bytes: int,
+                                max_shmem_size_bytes: int,
+                                max_sampling_interval_bytes: int):
+  """生成下一轮 heapprofd 参数；先扩 shmem，再降低采样密度。"""
+  if shmem_size_bytes < max_shmem_size_bytes:
+    return (sampling_interval_bytes,
+            min(shmem_size_bytes * 2, max_shmem_size_bytes))
+  if sampling_interval_bytes < max_sampling_interval_bytes:
+    return (min(sampling_interval_bytes * 2, max_sampling_interval_bytes),
+            shmem_size_bytes)
+  return None
+
+
 def write_memory_validation_report(output_dir: str, malloc_summary,
                                    mmap_summary, meminfo_path: str,
                                    trace_health=None) -> str:
@@ -1068,7 +1105,8 @@ def write_memory_validation_report(output_dir: str, malloc_summary,
   return path
 
 
-def collect_memory_validation(args, pid: int, trace_path: str, trace_health=None):
+def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str,
+                              trace_health=None):
   malloc_summary = {"live_bytes": 0, "allocated_bytes": 0, "freed_bytes": 0,
                     "heaps": []}
   mmap_summary = {"pss_bytes": 0, "rss_bytes": 0, "virtual_bytes": 0}
@@ -1095,15 +1133,13 @@ def collect_memory_validation(args, pid: int, trace_path: str, trace_health=None
       print("跳过 malloc 汇总：未指定 --trace-processor", file=sys.stderr)
     print("跳过 mmap 汇总：未指定 --trace-processor", file=sys.stderr)
 
-  try:
-    meminfo_path = capture_meminfo(args.name, args.output)
-  except subprocess.CalledProcessError as exc:
-    print("跳过 meminfo 对比，dumpsys meminfo 失败:", file=sys.stderr)
-    print(exc.output.decode("utf-8", errors="replace"), file=sys.stderr)
-    return
+  if not meminfo_path:
+    print("跳过 meminfo 对比：采样结束后未成功保存 dumpsys meminfo", file=sys.stderr)
+    return {"trace_health": trace_health, "report_path": ""}
 
-  write_memory_validation_report(args.output, malloc_summary, mmap_summary,
-                                 meminfo_path, trace_health)
+  report_path = write_memory_validation_report(
+      args.output, malloc_summary, mmap_summary, meminfo_path, trace_health)
+  return {"trace_health": trace_health, "report_path": report_path}
 
 
 def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
@@ -1138,7 +1174,7 @@ def parse_args():
   parser = argparse.ArgumentParser(
       description="采集 mmap/perf/smaps 数据，并生成 mmap 物理内存归因结果")
   parser.add_argument("-n", "--name", required=True, help="目标进程名/包名")
-  parser.add_argument("-d", "--duration-ms", type=int, default=180000,
+  parser.add_argument("-d", "--duration-ms", type=int, default=75000,
                       help="Perfetto 采集时长，单位 ms")
   parser.add_argument("--smaps-interval-ms", type=int, default=1000,
                       help="smaps 采样间隔，单位 ms")
@@ -1160,6 +1196,17 @@ def parse_args():
                       help="heapprofd libc.malloc 采样间隔；1 表示尽量精确")
   parser.add_argument("--malloc-shmem-size-bytes", type=int, default=32 * 1024 * 1024,
                       help="heapprofd 共享内存大小，必须是 4096 的倍数且为 2 的幂")
+  parser.add_argument("--no-auto-heapprofd-retry", dest="auto_heapprofd_retry",
+                      action="store_false", default=True,
+                      help="验证模式中 heapprofd 异常计数未清零时不自动调参重跑")
+  parser.add_argument("--max-heapprofd-retries", type=int, default=10,
+                      help="heapprofd 异常自动调参重试次数上限")
+  parser.add_argument("--max-malloc-shmem-size-bytes", type=int,
+                      default=512 * 1024 * 1024,
+                      help="自动重试允许的 heapprofd shmem 上限")
+  parser.add_argument("--max-malloc-sampling-interval-bytes", type=int,
+                      default=65536,
+                      help="自动重试允许的 malloc 采样间隔上限")
   parser.add_argument("--mmap-callstacks", dest="mmap_callstacks",
                       action="store_true", default=True,
                       help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
@@ -1181,23 +1228,22 @@ def parse_args():
   return parser.parse_args()
 
 
-def main() -> int:
-  signal.signal(signal.SIGINT, on_signal)
-  signal.signal(signal.SIGTERM, on_signal)
-  args = parse_args()
+def prepare_output_dir(output_dir: str) -> bool:
+  os.makedirs(output_dir, exist_ok=True)
+  if os.listdir(output_dir):
+    print(f"FATAL: 输出目录非空: {output_dir}", file=sys.stderr)
+    return False
+  return True
 
-  if args.output is None:
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    args.output = os.path.join("PerfData", "mmap_phys", stamp)
-  os.makedirs(args.output, exist_ok=True)
-  if os.listdir(args.output):
-    print(f"FATAL: 输出目录非空: {args.output}", file=sys.stderr)
-    return 1
 
+def run_collection(args):
+  """执行一次 mmap 物理内存采集，并返回验证健康信息。"""
+  if not prepare_output_dir(args.output):
+    return {"status": 1, "trace_health": None, "report_path": ""}
   pid = wait_for_pid(args.name, args.wait_timeout_s)
   smaps_dir = os.path.join(args.output, "smaps")
   trace_path = os.path.join(args.output, "mmap_trace.perfetto-trace")
-  device_trace = f"/data/misc/perfetto-traces/mmap-phys-{int(time.time())}"
+  device_trace = f"/data/misc/perfetto-traces/mmap-phys-{int(time.time() * 1000)}"
 
   config = build_perfetto_config(
       name=args.name,
@@ -1222,6 +1268,13 @@ def main() -> int:
       stop_perfetto(perfetto_pid)
 
   pull_trace(device_trace, trace_path)
+  try:
+    meminfo_path = capture_meminfo(args.name, args.output)
+  except subprocess.CalledProcessError as exc:
+    meminfo_path = ""
+    print("跳过 meminfo 对比，dumpsys meminfo 失败:", file=sys.stderr)
+    print(exc.output.decode("utf-8", errors="replace"), file=sys.stderr)
+
   trace_health = None
   if args.mmap_callstacks:
     trace_health = check_trace_health(args, trace_path)
@@ -1231,11 +1284,103 @@ def main() -> int:
   elif not args.mmap_callstacks and not args.no_analyze:
     print("跳过 mmap 调用栈分析：当前验证模式未采集 mmap 调用栈")
 
-  collect_memory_validation(args, pid, trace_path, trace_health)
+  validation = collect_memory_validation(args, pid, trace_path, meminfo_path,
+                                         trace_health)
 
   print("采集完成")
   print(f"输出目录: {os.path.abspath(args.output)}")
-  return 0
+  validation = validation or {"trace_health": trace_health, "report_path": ""}
+  validation["status"] = 0
+  validation["output"] = args.output
+  return validation
+
+
+def should_auto_retry_heapprofd(args) -> bool:
+  """仅无栈 malloc+mmap 验证模式自动重跑，避免影响默认主功能采集。"""
+  return (
+      getattr(args, "auto_heapprofd_retry", True) and
+      not args.mmap_callstacks and
+      args.collect_malloc and
+      bool(args.trace_processor))
+
+
+def format_heapprofd_attempt_dir(base_output: str, attempt: int,
+                                 sampling_interval_bytes: int,
+                                 shmem_size_bytes: int) -> str:
+  return os.path.join(
+      base_output,
+      f"attempt_{attempt:02d}_i{sampling_interval_bytes}_s{shmem_size_bytes}")
+
+
+def run_auto_heapprofd_retry(args, base_output: str) -> int:
+  """无栈验证模式下自动调参重跑，直到 heapprofd 异常计数清零。"""
+  os.makedirs(base_output, exist_ok=True)
+  if os.listdir(base_output):
+    print(f"FATAL: 输出目录非空: {base_output}", file=sys.stderr)
+    return 1
+
+  attempt = 1
+  while True:
+    args.output = format_heapprofd_attempt_dir(
+        base_output, attempt, args.malloc_sampling_interval_bytes,
+        args.malloc_shmem_size_bytes)
+    print("heapprofd 自动验证尝试:")
+    print(f"  attempt={attempt}")
+    print(f"  malloc_sampling_interval_bytes="
+          f"{args.malloc_sampling_interval_bytes}")
+    print(f"  malloc_shmem_size_bytes={args.malloc_shmem_size_bytes}")
+
+    force_stop_app(args.name)
+    result = run_collection(args)
+    if result.get("status", 0) != 0:
+      return int(result.get("status", 1))
+
+    trace_health = result.get("trace_health")
+    if not has_heapprofd_health_issue(trace_health):
+      print("heapprofd 自动验证通过：data_loss=0, errors=0")
+      print(f"最终输出目录: {os.path.abspath(args.output)}")
+      return 0
+
+    if attempt > args.max_heapprofd_retries:
+      print("FATAL: heapprofd 自动验证达到重试上限后仍有异常计数: "
+            f"data_loss={trace_health.get('heapprofd_data_loss', 0)}, "
+            f"errors={trace_health.get('heapprofd_errors', 0)}",
+            file=sys.stderr)
+      return 1
+
+    next_params = next_heapprofd_retry_params(
+        args.malloc_sampling_interval_bytes,
+        args.malloc_shmem_size_bytes,
+        args.max_malloc_shmem_size_bytes,
+        args.max_malloc_sampling_interval_bytes)
+    if next_params is None:
+      print("FATAL: heapprofd 自动验证达到参数上限后仍有异常计数: "
+            f"data_loss={trace_health.get('heapprofd_data_loss', 0)}, "
+            f"errors={trace_health.get('heapprofd_errors', 0)}",
+            file=sys.stderr)
+      return 1
+
+    args.malloc_sampling_interval_bytes, args.malloc_shmem_size_bytes = next_params
+    print("WARN: heapprofd 异常仍存在，自动调整参数后重试: "
+          f"--malloc-sampling-interval-bytes "
+          f"{args.malloc_sampling_interval_bytes}, "
+          f"--malloc-shmem-size-bytes {args.malloc_shmem_size_bytes}")
+    attempt += 1
+
+
+def main() -> int:
+  signal.signal(signal.SIGINT, on_signal)
+  signal.signal(signal.SIGTERM, on_signal)
+  args = parse_args()
+
+  if args.output is None:
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    args.output = os.path.join("PerfData", "mmap_phys", stamp)
+
+  if should_auto_retry_heapprofd(args):
+    return run_auto_heapprofd_retry(args, args.output)
+
+  return int(run_collection(args).get("status", 1))
 
 
 if __name__ == "__main__":
