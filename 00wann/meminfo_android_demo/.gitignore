@@ -1,0 +1,5 @@
+build/
+libs/
+obj/
+debug.keystore
+__pycache__/
