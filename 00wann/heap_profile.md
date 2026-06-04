@@ -14,7 +14,7 @@
 00wann/run_heap_profile.sh 45000
 ```
 
-如需指定采样 interval，可把 interval 作为第二个参数传入，单位为 bytes。不传时沿用 `heap_profile.py` 默认值 4096：
+如需指定采样 interval，可把 interval 作为第二个参数传入，单位为 bytes。不传时脚本默认使用 1024。真机验证中 4096 曾出现 malloc live 与 `meminfo Native Heap Alloc` 相差百 MB 级的问题；1024 在当前设备上通过 64MiB 绝对阈值验证：
 
 ```bash
 00wann/run_heap_profile.sh 45000 1024
@@ -28,17 +28,29 @@
 
 ## 启动目标应用
 
-脚本会先通过 `adb shell pidof <package>` 检查目标进程是否已经运行。
+为了让 heapprofd 的 malloc live 总量和采集后 `dumpsys meminfo` 的 `Native Heap / Heap Alloc` 具备同口径可比性，脚本会在采集前重启目标应用：
 
-如果目标进程不存在，脚本会输出关键步骤日志，并执行一次：
+```bash
+adb shell am force-stop com.tencent.dhwdxkty.trunk.profiler
+```
+
+随后脚本以 `--no-running` 启动 `heap_profile.py`，等待日志出现 `Profiling active`，再执行一次：
 
 ```bash
 adb shell monkey -p <package> 1
 ```
 
-该命令只用于发送启动 Intent 拉起目标应用，不用于随机触发测试场景。应用启动后，脚本继续执行 `heap_profile.py` 采集。
+该命令只用于发送启动 Intent 拉起目标应用，不用于随机触发测试场景。需要测试数据或目标场景交互时，仍应在手机上手动操作。
+
+这个顺序保证目标进程启动后的 native malloc/free 会被 heapprofd 观察到；如果附加到已经运行很久的进程，heapprofd 无法还原采集开始前已经发生的 native 分配，`malloc_live_bytes` 会明显低于 `meminfo Native Heap Alloc`。
 
 脚本会导出 `PYTHONPATH="$PerfettoRoot/python"`，确保直接执行 `python/tools/heap_profile.py` 时可以导入仓库内的 `perfetto` Python 包。
+
+脚本同时导出 `PYTHONUNBUFFERED=1`，避免 `heap_profile.py` 的 `Profiling active` 输出因为管道缓冲而延迟。profiler 原始日志会在采集结束后保存到：
+
+```text
+PerfData/mem/<日期时间>/heap_profile.log
+```
 
 脚本还会显式传入本地构建产物：
 
@@ -52,6 +64,47 @@ adb shell monkey -p <package> 1
 AI 做真机验证时必须传入 `45000`，表示采集 45 秒后自动停止并拉取 `raw-trace`、生成 `symbolized-trace` 和 `heap_dump.*.pb.gz`。下探采样 interval 时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes> <shmem_size>`。
 
 ## 验证
+
+每次 `heap_profile.py` 输出 `Waiting for profiler shutdown...` 后，脚本会在 host 侧 trace 转换、符号化和 pprof 生成完成前立刻执行：
+
+```bash
+adb shell dumpsys meminfo com.tencent.dhwdxkty.trunk.profiler
+```
+
+原始输出保存为：
+
+```text
+PerfData/mem/<日期时间>/dumpsys_meminfo.txt
+```
+
+随后脚本使用 `trace_processor_shell` 查询采集 trace：
+
+```sql
+select coalesce(sum(size), 0) as malloc_live_bytes from heap_profile_allocation;
+```
+
+这个值是 `heap_profile_allocation` 全采集窗口的累计净 malloc live bytes。它是本验证的主判断口径，不能替换成 `max(ts)` 最新 dump 分片。
+
+脚本会解析 `dumpsys meminfo` 主表 `Native Heap` 行的 `Heap Alloc` 列，并换算为 bytes。验证结果保存到：
+
+```text
+PerfData/mem/<日期时间>/heap_meminfo_validation.txt
+```
+
+默认判定规则：
+
+```text
+abs(malloc_live_bytes - meminfo_native_heap_alloc_bytes)
+  <= 64 MiB
+```
+
+可通过环境变量调整：
+
+```bash
+HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES=67108864
+```
+
+验证通过时输出 `HEAP_MEMINFO_VALIDATION=PASS`。如果不相当，脚本输出 `HEAP_MEMINFO_VALIDATION=FAIL` 并返回失败。百 MB 级差异不能通过百分比阈值放行，必须继续定位是否存在 heapprofd 丢包、trace 缺失、采样间隔过粗、启动前分配未覆盖、meminfo 抓取晚于采集窗口，或 `Native Heap Alloc` 中存在 heapprofd 未统计来源等根因。报告中会保留 `health_sum`、`heap_dump_count`、trace 路径和 meminfo 路径。
 
 修改 `run_heap_profile.sh` 后可运行：
 
