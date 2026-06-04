@@ -184,6 +184,18 @@ data_sources {
   }
 }
 """ % high_volume_events
+  process_stats_block = ""
+  if include_ftrace:
+    process_stats_block = """
+data_sources {
+  config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
+"""
   malloc_block = ""
   if include_malloc:
     malloc_block = f"""
@@ -231,6 +243,7 @@ data_sources {{
 }}
 
 {ftrace_block}
+{process_stats_block}
 {malloc_block}
 {perf_block}
 
@@ -472,7 +485,7 @@ def format_mib(value: int) -> str:
   return f"{value / 1024 / 1024:.1f} MiB"
 
 
-def print_trace_health(summary):
+def print_trace_health(summary, include_heapprofd: bool = True):
   print("Perfetto buffer 健康检查:")
   print(f"  顶层 trace buffer: size={format_mib(summary['buffer_size_bytes'])}, "
         f"bytes_written={format_mib(summary['bytes_written'])}")
@@ -492,7 +505,9 @@ def print_trace_health(summary):
     print(f"  WARN: linux.perf 每 CPU ring buffer 丢样本计数="
           f"{summary['perf_data_loss']}，建议增大 --perf-ring-buffer-pages "
           "或降低采样压力")
-  if summary.get("heapprofd_data_loss", 0) == 0 and summary.get("heapprofd_errors", 0) == 0:
+  if not include_heapprofd:
+    print("  heapprofd: 未启用，跳过 malloc profile 健康检查")
+  elif summary.get("heapprofd_data_loss", 0) == 0 and summary.get("heapprofd_errors", 0) == 0:
     print("  OK: heapprofd 未报告共享内存截断或客户端错误")
   else:
     print(f"  WARN: heapprofd 异常计数 data_loss={summary.get('heapprofd_data_loss', 0)}, "
@@ -509,7 +524,9 @@ def check_trace_health(args, trace_path: str):
     print("跳过 Perfetto buffer 健康检查：stats 查询无结果", file=sys.stderr)
     return None
   summary = summarize_trace_health(rows)
-  print_trace_health(summary)
+  print_trace_health(
+      summary,
+      include_heapprofd=args.collect_malloc and args.mmap_callstacks)
   return summary
 
 
@@ -560,56 +577,6 @@ def capture_meminfo(name: str, output_dir: str) -> str:
   return path
 
 
-def query_malloc_summary(trace_processor: str, trace_path: str, pid: int):
-  """只聚合 heap_profile_allocation，不查询 malloc 分配调用栈。"""
-  sql = f"""
-WITH target_process AS (
-  SELECT upid
-  FROM process
-  WHERE pid = {pid}
-  ORDER BY start_ts DESC
-  LIMIT 1
-)
-SELECT
-  h.heap_name AS heap_name,
-  sum(h.size) AS live_bytes,
-  sum(CASE WHEN h.size > 0 THEN h.size ELSE 0 END) AS allocated_bytes,
-  sum(CASE WHEN h.size < 0 THEN -h.size ELSE 0 END) AS freed_bytes
-FROM heap_profile_allocation h
-JOIN target_process t ON h.upid = t.upid
-WHERE h.heap_name IN ('libc.malloc', 'malloc')
-GROUP BY h.heap_name
-ORDER BY h.heap_name
-"""
-  print("+ " + " ".join([trace_processor, "query", trace_path, sql]))
-  proc = subprocess.run(
-      [trace_processor, "query", trace_path, sql],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      check=False)
-  if proc.returncode != 0:
-    raise RuntimeError("查询 malloc 汇总失败:\n" + proc.stdout)
-  rows = parse_trace_processor_csv(
-      proc.stdout,
-      required_columns=("heap_name", "live_bytes", "allocated_bytes",
-                        "freed_bytes"))
-  heaps = []
-  for row in rows:
-    heaps.append({
-        "heap_name": row.get("heap_name", ""),
-        "live_bytes": int_value(row.get("live_bytes")),
-        "allocated_bytes": int_value(row.get("allocated_bytes")),
-        "freed_bytes": int_value(row.get("freed_bytes")),
-    })
-  return {
-      "live_bytes": sum(item["live_bytes"] for item in heaps),
-      "allocated_bytes": sum(item["allocated_bytes"] for item in heaps),
-      "freed_bytes": sum(item["freed_bytes"] for item in heaps),
-      "heaps": heaps,
-  }
-
-
 def query_mmap_validation_syscalls(trace_processor: str, trace_path: str, pid: int):
   """只查询目标进程 mmap/munmap/mremap syscall，不读取调用栈表。"""
   import mmap_phys_analyzer as analyzer
@@ -643,8 +610,8 @@ target_ftrace_events AS (
     fe.arg_set_id AS arg_set_id
   FROM __intrinsic_ftrace_event fe
   JOIN __intrinsic_thread th ON fe.utid = th.id
-  JOIN __intrinsic_process pr ON th.upid = pr.id
-  WHERE pr.pid = {pid}
+  LEFT JOIN __intrinsic_process pr ON th.upid = pr.id
+  WHERE (pr.pid = {pid} OR th.tid = {pid})
     AND (
       fe.name LIKE '%mmap%' OR
       fe.name LIKE '%munmap%' OR
@@ -748,28 +715,10 @@ def build_syscall_events_from_rows(rows, analyzer):
 
 
 def build_memory_validation_inputs_sql(pid: int) -> str:
-  """一次 trace_processor 查询拿齐健康检查、malloc 累计汇总和 mmap syscall。"""
+  """一次 trace_processor 查询拿齐健康检查和 mmap syscall。"""
   quoted_names = ", ".join(f"'{name}'" for name in TRACE_HEALTH_STATS)
   return f"""
 WITH
-target_process AS (
-  SELECT upid
-  FROM process
-  WHERE pid = {pid}
-  ORDER BY start_ts DESC
-  LIMIT 1
-),
-malloc_rows AS (
-  SELECT
-    h.heap_name AS heap_name,
-    sum(h.size) AS live_bytes,
-    sum(CASE WHEN h.size > 0 THEN h.size ELSE 0 END) AS allocated_bytes,
-    sum(CASE WHEN h.size < 0 THEN -h.size ELSE 0 END) AS freed_bytes
-  FROM heap_profile_allocation h
-  JOIN target_process t ON h.upid = t.upid
-  WHERE h.heap_name IN ('libc.malloc', 'malloc')
-  GROUP BY h.heap_name
-),
 {build_mmap_validation_ctes(pid)}
 SELECT section, c0, c1, c2, c3, c4, c5, c6, c7, c8, c9
 FROM (
@@ -794,24 +743,6 @@ FROM (
   UNION ALL
   SELECT
     1 AS sort_section,
-    0 AS sort_ts,
-    0 AS sort_id,
-    0 AS sort_arg,
-    'malloc' AS section,
-    heap_name AS c0,
-    IFNULL(live_bytes, 0) AS c1,
-    IFNULL(allocated_bytes, 0) AS c2,
-    IFNULL(freed_bytes, 0) AS c3,
-    '' AS c4,
-    '' AS c5,
-    '' AS c6,
-    '' AS c7,
-    '' AS c8,
-    '' AS c9
-  FROM malloc_rows
-  UNION ALL
-  SELECT
-    2 AS sort_section,
     ts AS sort_ts,
     event_id AS sort_id,
     arg_id AS sort_arg,
@@ -832,26 +763,8 @@ ORDER BY sort_section, sort_ts, sort_id, sort_arg
 """
 
 
-def parse_malloc_summary_rows(rows):
-  """把统一查询里的 malloc 行汇总成报告结构。"""
-  heaps = []
-  for row in rows:
-    heaps.append({
-        "heap_name": row.get("c0", ""),
-        "live_bytes": int_value(row.get("c1")),
-        "allocated_bytes": int_value(row.get("c2")),
-        "freed_bytes": int_value(row.get("c3")),
-    })
-  return {
-      "live_bytes": sum(item["live_bytes"] for item in heaps),
-      "allocated_bytes": sum(item["allocated_bytes"] for item in heaps),
-      "freed_bytes": sum(item["freed_bytes"] for item in heaps),
-      "heaps": heaps,
-  }
-
-
 def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: int):
-  """一次冷加载 trace，拿齐无栈健康和 malloc/native heap 口径校验输入。"""
+  """一次冷加载 trace，拿齐无栈 mmap 健康检查输入。"""
   import mmap_phys_analyzer as analyzer
 
   sql = build_memory_validation_inputs_sql(pid)
@@ -873,7 +786,6 @@ def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: i
       for row in rows
       if row.get("section") == "health"
   ]
-  malloc_rows = [row for row in rows if row.get("section") == "malloc"]
   syscall_rows = [
       {
           "event_id": row.get("c0", ""),
@@ -893,7 +805,6 @@ def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: i
   ]
   return {
       "trace_health": summarize_trace_health(health_rows) if health_rows else None,
-      "malloc_summary": parse_malloc_summary_rows(malloc_rows),
       "syscalls": build_syscall_events_from_rows(syscall_rows, analyzer),
   }
 
@@ -998,17 +909,11 @@ def query_mmap_summary(trace_processor: str, trace_path: str, pid: int,
   return build_mmap_summary_from_syscalls(syscalls, pid, smaps_dir)
 
 
-def build_memory_validation_status(mmap_summary, trace_health,
-                                   malloc_summary=None, meminfo=None):
+def build_memory_validation_status(mmap_summary, trace_health):
   issues = []
   if int_value(mmap_summary.get("smaps_snapshots")) > 0 and int_value(
       mmap_summary.get("syscall_events")) == 0:
     issues.append("mmap_syscall_events_missing")
-  if malloc_summary and meminfo:
-    native_alloc = int_value(meminfo.get("native_heap_alloc_bytes"))
-    malloc_live = int_value(malloc_summary.get("live_bytes"))
-    if native_alloc > 0 and abs(malloc_live - native_alloc) / native_alloc > 0.5:
-      issues.append("malloc_native_heap_alloc_mismatch")
   if trace_health:
     if int_value(trace_health.get("heapprofd_data_loss")) > 0:
       issues.append("heapprofd_data_loss")
@@ -1026,50 +931,20 @@ def build_memory_validation_status(mmap_summary, trace_health,
   }
 
 
-def has_heapprofd_health_issue(trace_health) -> bool:
-  """判断 heapprofd 异常计数是否仍未清零。"""
-  if not trace_health:
-    return False
-  return (
-      int_value(trace_health.get("heapprofd_data_loss")) > 0 or
-      int_value(trace_health.get("heapprofd_errors")) > 0)
-
-
-def next_heapprofd_retry_params(sampling_interval_bytes: int,
-                                shmem_size_bytes: int,
-                                max_shmem_size_bytes: int,
-                                max_sampling_interval_bytes: int):
-  """生成下一轮 heapprofd 参数；先扩 shmem，再降低采样密度。"""
-  if shmem_size_bytes < max_shmem_size_bytes:
-    return (sampling_interval_bytes,
-            min(shmem_size_bytes * 2, max_shmem_size_bytes))
-  if sampling_interval_bytes < max_sampling_interval_bytes:
-    return (min(sampling_interval_bytes * 2, max_sampling_interval_bytes),
-            shmem_size_bytes)
-  return None
-
-
-def write_memory_validation_report(output_dir: str, malloc_summary,
-                                   mmap_summary, meminfo_path: str,
+def write_memory_validation_report(output_dir: str, mmap_summary, meminfo_path: str,
                                    trace_health=None) -> str:
   with open(meminfo_path, "r", encoding="utf-8") as fd:
     meminfo = parse_meminfo_summary(fd.read())
   report = {
       "units": "bytes",
       "note": (
-          "malloc 来自 heap_profile_allocation 全采集窗口累计净 live bytes；"
-          "mmap 来自 mmap 归因最终 PSS；两者定义不同，不做合并校验。"),
-      "malloc": malloc_summary,
+          "无栈验证只检查 mmap syscall events + smaps 的采集健康；"
+          "不启用 heapprofd malloc，也不做 Native Heap Alloc 对比。"),
       "mmap": mmap_summary,
       "trace_health": trace_health or {},
-      "validation": build_memory_validation_status(
-          mmap_summary, trace_health, malloc_summary, meminfo),
+      "validation": build_memory_validation_status(mmap_summary, trace_health),
       "meminfo": meminfo,
-      "comparison": {
-          "malloc_live_minus_meminfo_native_heap_alloc_bytes":
-              int_value(malloc_summary.get("live_bytes")) -
-              meminfo["native_heap_alloc_bytes"],
-      },
+      "comparison": {},
       "sources": {
           "meminfo": meminfo_path,
           "mmap": "mmap syscall events + smaps",
@@ -1080,10 +955,8 @@ def write_memory_validation_report(output_dir: str, malloc_summary,
     json.dump(report, fd, ensure_ascii=False, indent=2)
     fd.write("\n")
   print("内存验证:")
-  print(f"  malloc live: {format_mib(report['malloc'].get('live_bytes', 0))}")
+  print("  malloc 验证: 已移除（无栈验证不启用 heapprofd）")
   print(f"  mmap PSS: {format_mib(report['mmap'].get('pss_bytes', 0))}")
-  print(f"  meminfo Native Heap Alloc: "
-        f"{format_mib(meminfo['native_heap_alloc_bytes'])}")
   print(f"  meminfo Native Heap PSS: "
         f"{format_mib(meminfo['native_heap_pss_bytes'])}")
   print(f"  validation status: {report['validation']['status']}")
@@ -1095,8 +968,6 @@ def write_memory_validation_report(output_dir: str, malloc_summary,
 
 def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str,
                               trace_health=None):
-  malloc_summary = {"live_bytes": 0, "allocated_bytes": 0, "freed_bytes": 0,
-                    "heaps": []}
   mmap_summary = {"pss_bytes": 0, "rss_bytes": 0, "virtual_bytes": 0}
   combined_inputs = None
 
@@ -1111,14 +982,12 @@ def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str
     if trace_health is None:
       trace_health = combined_inputs.get("trace_health")
       if trace_health:
-        print_trace_health(trace_health)
-    if args.collect_malloc:
-      malloc_summary = combined_inputs["malloc_summary"]
+        print_trace_health(
+            trace_health,
+            include_heapprofd=args.collect_malloc and args.mmap_callstacks)
     mmap_summary = build_mmap_summary_from_syscalls(
         combined_inputs["syscalls"], pid, os.path.join(args.output, "smaps"))
   else:
-    if args.collect_malloc:
-      print("跳过 malloc 汇总：未指定 --trace-processor", file=sys.stderr)
     print("跳过 mmap 汇总：未指定 --trace-processor", file=sys.stderr)
 
   if not meminfo_path:
@@ -1126,7 +995,7 @@ def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str
     return {"trace_health": trace_health, "report_path": ""}
 
   report_path = write_memory_validation_report(
-      args.output, malloc_summary, mmap_summary, meminfo_path, trace_health)
+      args.output, mmap_summary, meminfo_path, trace_health)
   return {"trace_health": trace_health, "report_path": report_path}
 
 
@@ -1177,30 +1046,19 @@ def parse_args():
                       help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
   parser.add_argument("--malloc", dest="collect_malloc", action="store_true",
                       default=True,
-                      help="采集 libc.malloc 堆快照，用于 native heap 口径校验")
+                      help="主功能采集 libc.malloc Native heap profile；无栈验证会忽略该参数")
   parser.add_argument("--no-malloc", dest="collect_malloc", action="store_false",
                       help="不采集 libc.malloc 堆快照")
   parser.add_argument("--malloc-sampling-interval-bytes", type=int, default=4096,
                       help="heapprofd libc.malloc 采样间隔；1 表示尽量精确")
   parser.add_argument("--malloc-shmem-size-bytes", type=int, default=32 * 1024 * 1024,
                       help="heapprofd 共享内存大小，必须是 4096 的倍数且为 2 的幂")
-  parser.add_argument("--no-auto-heapprofd-retry", dest="auto_heapprofd_retry",
-                      action="store_false", default=True,
-                      help="验证模式中 heapprofd 异常计数未清零时不自动调参重跑")
-  parser.add_argument("--max-heapprofd-retries", type=int, default=10,
-                      help="heapprofd 异常自动调参重试次数上限")
-  parser.add_argument("--max-malloc-shmem-size-bytes", type=int,
-                      default=256 * 1024 * 1024,
-                      help="自动重试允许的 heapprofd shmem 上限")
-  parser.add_argument("--max-malloc-sampling-interval-bytes", type=int,
-                      default=65536,
-                      help="自动重试允许的 malloc 采样间隔上限")
   parser.add_argument("--mmap-callstacks", dest="mmap_callstacks",
                       action="store_true", default=True,
                       help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
   parser.add_argument("--no-mmap-callstacks", dest="mmap_callstacks",
                       action="store_false",
-                      help="不采集 mmap 调用栈；仅运行无栈健康和 malloc/native heap 口径校验时使用")
+                      help="不采集 mmap 调用栈；仅运行无栈 mmap 事件健康检查")
   parser.add_argument("--no-ftrace", action="store_true",
                       help="不启用 linux.ftrace syscall_events；会跳过无栈 mmap 验证")
   parser.add_argument("--no-kernel-frames", action="store_true",
@@ -1240,14 +1098,14 @@ def run_collection(args, start_target_after_perfetto: bool = False):
       kernel_frames=not args.no_kernel_frames,
       perf_ring_buffer_pages=args.perf_ring_buffer_pages,
       perf_ring_buffer_read_period_ms=args.perf_ring_buffer_read_period_ms,
-      include_malloc=args.collect_malloc,
+      include_malloc=args.collect_malloc and args.mmap_callstacks,
       malloc_sampling_interval_bytes=args.malloc_sampling_interval_bytes,
       malloc_shmem_size_bytes=args.malloc_shmem_size_bytes,
       include_mmap_callstacks=args.mmap_callstacks)
   write_config(config, args.output)
   if start_target_after_perfetto:
-    # 验证 attempt 必须先让 heapprofd/ftrace 就绪，再启动 App，
-    # 否则启动期 malloc/mmap 会被漏采，meminfo 对比没有意义。
+    # 验证 attempt 必须先让 ftrace 就绪，再启动 App，
+    # 否则启动期 mmap 会被漏采，事件健康检查没有意义。
     perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
     pid = wait_for_pid(args.name, args.wait_timeout_s)
   else:
@@ -1289,79 +1147,6 @@ def run_collection(args, start_target_after_perfetto: bool = False):
   return validation
 
 
-def should_auto_retry_heapprofd(args) -> bool:
-  """仅无栈验证模式自动重跑，避免影响默认主功能采集。"""
-  return (
-      getattr(args, "auto_heapprofd_retry", True) and
-      not args.mmap_callstacks and
-      args.collect_malloc and
-      bool(args.trace_processor))
-
-
-def format_heapprofd_attempt_dir(base_output: str, attempt: int,
-                                 sampling_interval_bytes: int,
-                                 shmem_size_bytes: int) -> str:
-  return os.path.join(
-      base_output,
-      f"attempt_{attempt:02d}_i{sampling_interval_bytes}_s{shmem_size_bytes}")
-
-
-def run_auto_heapprofd_retry(args, base_output: str) -> int:
-  """无栈验证模式下自动调参重跑，直到 heapprofd 异常计数清零。"""
-  os.makedirs(base_output, exist_ok=True)
-  if os.listdir(base_output):
-    print(f"FATAL: 输出目录非空: {base_output}", file=sys.stderr)
-    return 1
-
-  attempt = 1
-  while True:
-    args.output = format_heapprofd_attempt_dir(
-        base_output, attempt, args.malloc_sampling_interval_bytes,
-        args.malloc_shmem_size_bytes)
-    print("heapprofd 自动验证尝试:")
-    print(f"  attempt={attempt}")
-    print(f"  malloc_sampling_interval_bytes="
-          f"{args.malloc_sampling_interval_bytes}")
-    print(f"  malloc_shmem_size_bytes={args.malloc_shmem_size_bytes}")
-
-    force_stop_app(args.name)
-    result = run_collection(args, start_target_after_perfetto=True)
-    if result.get("status", 0) != 0:
-      return int(result.get("status", 1))
-
-    trace_health = result.get("trace_health")
-    if not has_heapprofd_health_issue(trace_health):
-      print("heapprofd 自动验证通过：data_loss=0, errors=0")
-      print(f"最终输出目录: {os.path.abspath(args.output)}")
-      return 0
-
-    if attempt > args.max_heapprofd_retries:
-      print("FATAL: heapprofd 自动验证达到重试上限后仍有异常计数: "
-            f"data_loss={trace_health.get('heapprofd_data_loss', 0)}, "
-            f"errors={trace_health.get('heapprofd_errors', 0)}",
-            file=sys.stderr)
-      return 1
-
-    next_params = next_heapprofd_retry_params(
-        args.malloc_sampling_interval_bytes,
-        args.malloc_shmem_size_bytes,
-        args.max_malloc_shmem_size_bytes,
-        args.max_malloc_sampling_interval_bytes)
-    if next_params is None:
-      print("FATAL: heapprofd 自动验证达到参数上限后仍有异常计数: "
-            f"data_loss={trace_health.get('heapprofd_data_loss', 0)}, "
-            f"errors={trace_health.get('heapprofd_errors', 0)}",
-            file=sys.stderr)
-      return 1
-
-    args.malloc_sampling_interval_bytes, args.malloc_shmem_size_bytes = next_params
-    print("WARN: heapprofd 异常仍存在，自动调整参数后重试: "
-          f"--malloc-sampling-interval-bytes "
-          f"{args.malloc_sampling_interval_bytes}, "
-          f"--malloc-shmem-size-bytes {args.malloc_shmem_size_bytes}")
-    attempt += 1
-
-
 def main() -> int:
   signal.signal(signal.SIGINT, on_signal)
   signal.signal(signal.SIGTERM, on_signal)
@@ -1371,8 +1156,9 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     args.output = os.path.join("PerfData", "mmap_phys", stamp)
 
-  if should_auto_retry_heapprofd(args):
-    return run_auto_heapprofd_retry(args, args.output)
+  if not args.mmap_callstacks:
+    force_stop_app(args.name)
+    return int(run_collection(args, start_target_after_perfetto=True).get("status", 1))
 
   return int(run_collection(args).get("status", 1))
 

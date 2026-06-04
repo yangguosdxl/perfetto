@@ -35,23 +35,23 @@ export TEST_LOG="$tmpdir/commands.log"
 cd "$tmpdir"
 ./run_mmap_phys_profile.sh --no-mmap-callstacks >"$tmpdir/test.out"
 
-if ! grep -Fq -- "--malloc-sampling-interval-bytes 4096" "$TEST_LOG"; then
-  echo "无栈验证默认 sampling interval 应固定为 4096"
+if grep -Fq -- "--malloc" "$TEST_LOG"; then
+  echo "无栈验证入口不应传入 malloc/heapprofd 参数"
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq -- "--malloc-shmem-size-bytes 33554432" "$TEST_LOG"; then
-  echo "无栈验证默认 heapprofd shmem 应固定为 33554432"
+if grep -Fq -- "--malloc-sampling-interval-bytes" "$TEST_LOG"; then
+  echo "无栈验证不应传入 malloc sampling interval"
   cat "$TEST_LOG"
   exit 1
 fi
-if grep -Fq -- "--max-malloc-sampling-interval-bytes" "$TEST_LOG"; then
-  echo "固定默认值不应限制自动重试 sampling interval 上限"
+if grep -Fq -- "--malloc-shmem-size-bytes" "$TEST_LOG"; then
+  echo "无栈验证不应传入 heapprofd shmem 参数"
   cat "$TEST_LOG"
   exit 1
 fi
-if grep -Fq -- "--max-malloc-shmem-size-bytes" "$TEST_LOG"; then
-  echo "固定默认值不应限制自动重试 shmem 上限"
+if grep -Fq -- "--max-malloc" "$TEST_LOG"; then
+  echo "无栈验证不应启用 heapprofd 自动调参参数"
   cat "$TEST_LOG"
   exit 1
 fi

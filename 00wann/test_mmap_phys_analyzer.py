@@ -121,6 +121,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('ftrace_events: "raw_syscalls/sys_enter"', config)
     self.assertIn('ftrace_events: "raw_syscalls/sys_exit"', config)
     self.assertIn('tracepoint {\n          name: "raw_syscalls:sys_enter"', config)
+    self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("ring_buffer_pages: 4096", config)
     self.assertIn("ring_buffer_read_period_ms: 100", config)
 
@@ -176,17 +177,18 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('ftrace_events: "raw_syscalls/sys_enter"', config)
     self.assertIn('name: "android.heapprofd"', config)
     self.assertIn('name: "linux.perf"', config)
+    self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("callstack_sampling", config)
 
   def test_validation_config_does_not_collect_mmap_callstacks(self):
-    """显式验证模式不采 mmap 调用栈，但保留 raw syscall 和线程归属。"""
+    """显式验证模式不采 mmap 调用栈，也不启用 heapprofd malloc。"""
     config = collector.build_perfetto_config(
         name="com.example.app",
         duration_ms=1000,
         buffer_kb=1024,
         include_ftrace=True,
         kernel_frames=True,
-        include_malloc=True,
+        include_malloc=False,
         include_mmap_callstacks=False)
 
     self.assertIn('syscall_events: "sys_mmap"', config)
@@ -195,7 +197,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('ftrace_events: "raw_syscalls/sys_enter"', config)
     self.assertIn('ftrace_events: "raw_syscalls/sys_exit"', config)
     self.assertIn('ftrace_events: "sched/sched_switch"', config)
-    self.assertIn('name: "android.heapprofd"', config)
+    self.assertIn('name: "linux.process_stats"', config)
+    self.assertNotIn('name: "android.heapprofd"', config)
     self.assertNotIn('name: "linux.perf"', config)
     self.assertNotIn("callstack_sampling", config)
 
@@ -228,7 +231,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(args.duration_ms, 75000)
     self.assertTrue(args.collect_malloc)
     self.assertTrue(args.mmap_callstacks)
-    self.assertEqual(args.max_malloc_shmem_size_bytes, 256 * 1024 * 1024)
 
   def test_main_captures_meminfo_before_trace_analysis(self):
     """采样结束后应先保存 meminfo，再运行 trace 健康检查和离线分析。"""
@@ -283,6 +285,47 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertLess(calls.index("capture_meminfo"),
                     calls.index("collect_memory_validation"))
 
+  def test_main_no_mmap_callstacks_restarts_app_before_validation(self):
+    """无栈验证应先重启目标 App，并让 Perfetto 先于 App 启动。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          duration_ms=120000,
+          smaps_interval_ms=1000,
+          output=tmpdir,
+          wait_timeout_s=120,
+          buffer_kb=262144,
+          perf_ring_buffer_pages=8192,
+          perf_ring_buffer_read_period_ms=100,
+          collect_malloc=True,
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=32 * 1024 * 1024,
+          mmap_callstacks=False,
+          no_ftrace=False,
+          no_kernel_frames=False,
+          no_guardrails=False,
+          use_su=False,
+          no_analyze=False,
+          trace_processor="tp",
+          analyzer="analyzer.py")
+      calls = []
+
+      def fake_run_collection(run_args, start_target_after_perfetto=False):
+        calls.append(("run_collection", start_target_after_perfetto))
+        return {"status": 0}
+
+      with mock.patch.object(collector, "parse_args", return_value=args), \
+          mock.patch.object(collector, "force_stop_app",
+                            side_effect=lambda name: calls.append(("force_stop", name))), \
+          mock.patch.object(collector, "run_collection",
+                            side_effect=fake_run_collection):
+        self.assertEqual(collector.main(), 0)
+
+    self.assertEqual(calls, [
+        ("force_stop", "com.example.app"),
+        ("run_collection", True),
+    ])
+
   def test_collection_can_start_perfetto_before_launching_app(self):
     """验证 attempt 应先启动 Perfetto，再拉起 App，避免错过启动期分配。"""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -332,6 +375,48 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(result["status"], 0)
     self.assertLess(calls.index("start_perfetto"), calls.index("wait_for_pid"))
     self.assertLess(calls.index("wait_for_pid"), calls.index("collect_smaps"))
+
+  def test_no_mmap_callstacks_does_not_enable_heapprofd(self):
+    """无栈验证即使保留默认 collect_malloc，也不能生成 heapprofd 配置。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          duration_ms=75000,
+          smaps_interval_ms=1000,
+          output=tmpdir,
+          wait_timeout_s=120,
+          buffer_kb=262144,
+          perf_ring_buffer_pages=8192,
+          perf_ring_buffer_read_period_ms=100,
+          collect_malloc=True,
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=32 * 1024 * 1024,
+          mmap_callstacks=False,
+          no_ftrace=False,
+          no_kernel_frames=False,
+          no_guardrails=False,
+          use_su=False,
+          no_analyze=True,
+          trace_processor=None,
+          analyzer="analyzer.py")
+      configs = []
+
+      def fake_write_config(config, _output_dir):
+        configs.append(config)
+
+      with mock.patch.object(collector, "write_config", side_effect=fake_write_config), \
+          mock.patch.object(collector, "wait_for_pid", return_value=1234), \
+          mock.patch.object(collector, "start_perfetto", return_value=5678), \
+          mock.patch.object(collector, "collect_smaps"), \
+          mock.patch.object(collector, "pull_trace"), \
+          mock.patch.object(collector, "capture_meminfo",
+                            return_value=os.path.join(tmpdir, "dumpsys_meminfo.txt")), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            return_value={"trace_health": {}}):
+        result = collector.run_collection(args)
+
+    self.assertEqual(result["status"], 0)
+    self.assertNotIn('name: "android.heapprofd"', configs[0])
 
   def test_trace_health_summary_flags_perf_lost_records(self):
     """健康检查需要区分 Perfetto buffer 和 perf 内核 buffer 丢数。"""
@@ -389,62 +474,24 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn("WARN: heapprofd", out.getvalue())
     self.assertIn("data_loss=1", out.getvalue())
 
-  def test_heapprofd_retry_params_grow_shmem_before_sampling_interval(self):
-    """自动重试应先增大 heapprofd shmem，到上限后再放宽采样间隔。"""
-    next_params = collector.next_heapprofd_retry_params(
-        sampling_interval_bytes=4096,
-        shmem_size_bytes=8 * 1024 * 1024,
-        max_shmem_size_bytes=512 * 1024 * 1024,
-        max_sampling_interval_bytes=65536)
+  def test_trace_health_skips_heapprofd_when_malloc_is_disabled(self):
+    """无栈验证未启用 heapprofd 时，不应输出 heapprofd OK 造成误导。"""
+    out = io.StringIO()
+    summary = {
+        "buffer_size_bytes": 256 * 1024 * 1024,
+        "bytes_written": 16 * 1024 * 1024,
+        "perfetto_data_loss": 0,
+        "ftrace_data_loss": 0,
+        "perf_data_loss": 0,
+        "heapprofd_data_loss": 0,
+        "heapprofd_errors": 0,
+    }
 
-    self.assertEqual(next_params, (4096, 16 * 1024 * 1024))
+    with mock.patch.object(sys, "stdout", out):
+      collector.print_trace_health(summary, include_heapprofd=False)
 
-    next_params = collector.next_heapprofd_retry_params(
-        sampling_interval_bytes=4096,
-        shmem_size_bytes=512 * 1024 * 1024,
-        max_shmem_size_bytes=512 * 1024 * 1024,
-        max_sampling_interval_bytes=65536)
-
-    self.assertEqual(next_params, (8192, 512 * 1024 * 1024))
-
-  def test_validation_mode_retries_until_heapprofd_health_is_clean(self):
-    """无栈验证模式遇到 heapprofd 异常时，应自动调参重跑直到计数清零。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-      args = collector.argparse.Namespace(
-          name="com.example.app",
-          mmap_callstacks=False,
-          collect_malloc=True,
-          trace_processor="tp",
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=8 * 1024 * 1024,
-          max_malloc_sampling_interval_bytes=65536,
-          max_malloc_shmem_size_bytes=512 * 1024 * 1024,
-          max_heapprofd_retries=3)
-      attempts = []
-
-      def fake_run_collection(run_args, **_kwargs):
-        attempts.append((run_args.output,
-                         run_args.malloc_sampling_interval_bytes,
-                         run_args.malloc_shmem_size_bytes))
-        if len(attempts) == 1:
-          return {"trace_health": {"heapprofd_data_loss": 1,
-                                   "heapprofd_errors": 1}}
-        return {"trace_health": {"heapprofd_data_loss": 0,
-                                 "heapprofd_errors": 0}}
-
-      with mock.patch.object(collector, "force_stop_app") as force_stop_app, \
-          mock.patch.object(collector, "run_collection",
-                             side_effect=fake_run_collection):
-        status = collector.run_auto_heapprofd_retry(args, tmpdir)
-
-    self.assertEqual(status, 0)
-    self.assertEqual(len(attempts), 2)
-    self.assertTrue(os.path.basename(attempts[0][0]).startswith("attempt_01"))
-    self.assertTrue(os.path.basename(attempts[1][0]).startswith("attempt_02"))
-    self.assertEqual(attempts[0][1:], (4096, 8 * 1024 * 1024))
-    self.assertEqual(attempts[1][1:], (4096, 16 * 1024 * 1024))
-    self.assertEqual([call.args[0] for call in force_stop_app.mock_calls],
-                     ["com.example.app", "com.example.app"])
+    self.assertIn("heapprofd: 未启用", out.getvalue())
+    self.assertNotIn("OK: heapprofd", out.getvalue())
 
   def test_wait_status_includes_elapsed_seconds(self):
     """等待应用启动的进度需要在同一行展示累计秒数。"""
@@ -584,28 +631,6 @@ TOTAL SWAP PSS: 7,000K
     self.assertEqual(summary["native_heap_alloc_bytes"], 32000 * 1024)
     self.assertEqual(summary["total_pss_bytes"], 50000 * 1024)
 
-  def test_query_malloc_summary_does_not_read_callstacks(self):
-    """malloc 汇总只按 heap_profile_allocation 聚合，不读取分配调用栈。"""
-    seen_sql = []
-
-    def fake_run(cmd, **_kwargs):
-      seen_sql.append(cmd[-1])
-      return subprocess_result(
-          returncode=0,
-          stdout='"heap_name","live_bytes","allocated_bytes","freed_bytes"\n'
-                 '"libc.malloc","4096","8192","4096"\n',
-          stderr=None)
-
-    with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
-      summary = collector.query_malloc_summary("fake-tp", "fake-trace", 1234)
-
-    self.assertEqual(summary["live_bytes"], 4096)
-    self.assertEqual(summary["allocated_bytes"], 8192)
-    self.assertEqual(summary["freed_bytes"], 4096)
-    self.assertFalse(any("stack_profile" in sql or "callsite" in sql
-                         for sql in seen_sql))
-    self.assertFalse(any("latest_dump" in sql for sql in seen_sql))
-
   def test_query_mmap_validation_syscalls_does_not_read_callstacks(self):
     """mmap 验证只查目标进程 raw syscall，不读取 mmap 调用栈。"""
     seen_sql = []
@@ -626,8 +651,8 @@ TOTAL SWAP PSS: 7,000K
                          "__intrinsic_perf_sample" in sql
                          for sql in seen_sql))
 
-  def test_query_memory_validation_inputs_loads_trace_once(self):
-    """无栈健康和 malloc/native heap 口径校验应一次查询拿齐输入。"""
+  def test_query_memory_validation_inputs_loads_trace_once_without_malloc(self):
+    """无栈健康检查应一次查询拿齐 mmap 输入，但不读取 malloc 表。"""
     calls = []
 
     def fake_run(cmd, **_kwargs):
@@ -636,8 +661,7 @@ TOTAL SWAP PSS: 7,000K
           returncode=0,
           stdout=(
               '"section","c0","c1","c2","c3","c4","c5","c6","c7","c8","c9"\n'
-              '"health","heapprofd_buffer_overran","0","1","","","","","","",""\n'
-              '"malloc","libc.malloc","4096","8192","4096","","","","","",""\n'
+              '"health","traced_buf_buffer_size","0","1024","","","","","","",""\n'
               f'"syscall","1","1000","7","raw_syscalls/sys_enter","10","id",'
               f'"{collector.ARM64_MMAP_NR}","","int",""\n'
               '"syscall","1","1000","7","raw_syscalls/sys_enter","11","args",'
@@ -654,10 +678,11 @@ TOTAL SWAP PSS: 7,000K
           "fake-tp", "fake-trace", 1234)
 
     self.assertEqual(len(calls), 1)
-    self.assertEqual(inputs["trace_health"]["heapprofd_data_loss"], 1)
-    self.assertEqual(inputs["malloc_summary"]["live_bytes"], 4096)
+    self.assertEqual(inputs["trace_health"]["buffer_size_bytes"], 1024)
+    self.assertNotIn("malloc_summary", inputs)
     self.assertEqual(len(inputs["syscalls"]), 2)
     self.assertEqual(inputs["syscalls"][0].args["arg1"], 4096)
+    self.assertNotIn("heap_profile_allocation", calls[0][-1])
     self.assertNotIn("latest_dump", calls[0][-1])
 
   def test_memory_validation_syscall_sql_filters_target_events_before_args(self):
@@ -665,14 +690,15 @@ TOTAL SWAP PSS: 7,000K
     sql = collector.build_memory_validation_inputs_sql(1234)
 
     self.assertIn("target_ftrace_events AS", sql)
-    self.assertIn("WHERE pr.pid = 1234", sql)
+    self.assertIn("LEFT JOIN __intrinsic_process pr ON th.upid = pr.id", sql)
+    self.assertIn("WHERE (pr.pid = 1234 OR th.tid = 1234)", sql)
     self.assertIn("raw_syscall_events AS", sql)
     self.assertIn("FROM target_ftrace_events tfe", sql)
     self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id", sql)
     self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id", sql)
 
-  def test_write_memory_validation_report_compares_malloc_with_native_heap_alloc(self):
-    """验证报告只把 malloc live 与 Native Heap Alloc 作为 meminfo 主口径。"""
+  def test_write_memory_validation_report_omits_malloc_when_disabled(self):
+    """无栈验证报告不输出 malloc 与 Native Heap Alloc 对比。"""
     with tempfile.TemporaryDirectory() as tmpdir:
       meminfo_path = os.path.join(tmpdir, "dumpsys_meminfo.txt")
       with open(meminfo_path, "w", encoding="utf-8") as fd:
@@ -680,7 +706,6 @@ TOTAL SWAP PSS: 7,000K
 
       report_path = collector.write_memory_validation_report(
           output_dir=tmpdir,
-          malloc_summary={"live_bytes": 4096},
           mmap_summary={
               "pss_bytes": 3072,
               "rss_bytes": 4096,
@@ -693,10 +718,12 @@ TOTAL SWAP PSS: 7,000K
       with open(report_path, "r", encoding="utf-8") as fd:
         report = json.load(fd)
 
-    self.assertEqual(report["malloc"]["live_bytes"], 4096)
+    self.assertNotIn("malloc", report)
     self.assertEqual(report["mmap"]["pss_bytes"], 3072)
     self.assertNotIn("tracked_sum", report)
     self.assertNotIn("tracked_sum_minus_meminfo_total_pss_bytes",
+                     report["comparison"])
+    self.assertNotIn("malloc_live_minus_meminfo_native_heap_alloc_bytes",
                      report["comparison"])
     self.assertEqual(report["meminfo"]["native_heap_alloc_bytes"], 4 * 1024)
     self.assertEqual(report["validation"]["status"], "pass")
@@ -710,39 +737,16 @@ TOTAL SWAP PSS: 7,000K
 
       report_path = collector.write_memory_validation_report(
           output_dir=tmpdir,
-          malloc_summary={"live_bytes": 4096},
           mmap_summary={"pss_bytes": 0, "syscall_events": 0, "smaps_snapshots": 3},
           meminfo_path=meminfo_path,
-          trace_health={"heapprofd_data_loss": 1})
+          trace_health={"ftrace_data_loss": 1})
 
       with open(report_path, "r", encoding="utf-8") as fd:
         report = json.load(fd)
 
     self.assertEqual(report["validation"]["status"], "fail")
     self.assertIn("mmap_syscall_events_missing", report["validation"]["issues"])
-    self.assertIn("heapprofd_data_loss", report["validation"]["issues"])
-
-  def test_memory_validation_report_fails_when_malloc_is_far_from_native_heap_alloc(self):
-    """malloc live 与 meminfo Native Heap Alloc 差距过大时，验证应失败。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-      meminfo_path = os.path.join(tmpdir, "dumpsys_meminfo.txt")
-      with open(meminfo_path, "w", encoding="utf-8") as fd:
-        fd.write("Native Heap 900000 0 0 0 1000000 900000 100000\n"
-                 "TOTAL 1000000 0 0 0 0 0 0\n")
-
-      report_path = collector.write_memory_validation_report(
-          output_dir=tmpdir,
-          malloc_summary={"live_bytes": 4 * 1024 * 1024, "heaps": [{"heap_name": "libc.malloc"}]},
-          mmap_summary={"pss_bytes": 0, "syscall_events": 1, "smaps_snapshots": 1},
-          meminfo_path=meminfo_path,
-          trace_health={"heapprofd_data_loss": 0, "heapprofd_errors": 0})
-
-      with open(report_path, "r", encoding="utf-8") as fd:
-        report = json.load(fd)
-
-    self.assertEqual(report["validation"]["status"], "fail")
-    self.assertIn("malloc_native_heap_alloc_mismatch",
-                  report["validation"]["issues"])
+    self.assertIn("ftrace_data_loss", report["validation"]["issues"])
 
   def test_mmap_perf_sample_and_munmap_are_attributed_to_smaps_pss(self):
     """构造 mmap/perf/smaps 样例，验证释放区间不会继续计入物理占用。"""

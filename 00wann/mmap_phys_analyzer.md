@@ -15,16 +15,19 @@
   -> 采 mmap 调用栈，输出 mmap 物理内存归因 JSON 和 Speedscope 火焰图。
 
 验证模式
-  -> 不采 mmap 调用栈，只做无栈 mmap 事件健康检查和 malloc/native heap 口径校验。
+  -> 不采 mmap 调用栈，只做无栈 mmap 事件健康检查。
 ```
 
-无栈验证是测试功能，用来检查 heapprofd、mmap 事件采集和 malloc/native heap 口径是否合理，不能替代调用栈归因结果。
+无栈验证是测试功能，用来检查 mmap syscall 事件、smaps 和 meminfo 快照是否能被稳定采集，不能替代调用栈归因结果。无栈验证不启用 heapprofd malloc，也不做 malloc live 与 Native Heap Alloc 对比。
 
 ## 核心思路
 
 ```text
 Perfetto raw_syscalls/sys_enter + sys_exit
   -> 还原 mmap / munmap / mremap 生命周期
+
+Perfetto linux.process_stats + sched_switch
+  -> 补齐 pid / thread 归属，避免无栈验证按目标进程过滤时误判为空
 
 Perfetto linux.perf
   -> 在 mmap syscall enter 附近采样调用栈
@@ -119,7 +122,7 @@ memory_validation.json
 
 主功能必须优先看 `mmap_phys_attribution.json` 和 Speedscope 火焰图。`memory_validation.json` 不能替代调用栈归因。
 
-## 验证模式：无栈 mmap/malloc 健康校验
+## 验证模式：无栈 mmap 事件健康校验
 
 验证模式用于测试或改代码后的量级校验。它故意关闭 mmap 调用栈采样，但会保留 `raw_syscalls/sys_enter`、`raw_syscalls/sys_exit` 和线程归属所需事件作为兼容兜底；部分设备的 `syscall_events` 过滤不会产出事件，只依赖它会让 mmap 侧验证结果恒为 0。
 
@@ -127,12 +130,8 @@ memory_validation.json
 ./run_mmap_phys_profile.sh --no-mmap-callstacks
 ```
 
-`run_mmap_phys_profile.sh` 的无栈验证参数默认固定为 `i4096_s33554432`：
-`--malloc-sampling-interval-bytes 4096` 和 `--malloc-shmem-size-bytes 33554432`。
-这是自动重试的起始参数；如果该参数下 heapprofd 异常计数仍不为 0，
-脚本会继续按“先增大 shmem，再提高 sampling interval”的顺序自动重试。
-每个 attempt 开始前都会 `am force-stop` 目标 App，再通过启动 Intent 重新拉起，
-并基于新的 pid 采集 trace、smaps 和 meminfo。
+该模式不采 `android.heapprofd`，也不传 `--malloc`、`--malloc-sampling-interval-bytes`、`--malloc-shmem-size-bytes` 或 heapprofd 自动调参参数。malloc 总量验证已经从无栈验证中删除；需要验证 Perfetto malloc 统计能力时，使用独立 heapprofd malloc APK demo。
+运行无栈验证时脚本会先 `am force-stop` 目标 App，再启动 Perfetto，最后拉起目标 App，确保启动期 mmap syscall 不会在 Perfetto 就绪前漏掉。
 
 验证模式采集和汇总内容：
 
@@ -143,21 +142,18 @@ sys_mmap / sys_munmap / sys_mremap
 最后一个 smaps 快照
   -> 与无栈 mmap live range 做地址重叠，汇总 mmap PSS / RSS / virtual bytes。
 
-heap_profile_allocation
-  -> 不读取 malloc 分配调用栈，只汇总全采集窗口 libc.malloc / malloc heap 的累计净 live bytes。
-
 dumpsys meminfo
-  -> 解析 Native Heap PSS / Native Heap Alloc / TOTAL PSS。
+  -> 解析 Native Heap PSS / Native Heap Alloc / TOTAL PSS；报告保留 meminfo 作为快照参考，但不再做 malloc 对比。
 ```
 
 验证模式输出：
 
 ```text
-PerfData/mmap_phys/<时间戳>/attempt_01_i4096_s33554432/
-  -> 固定参数验证的 attempt 目录；通过或失败都会保留原始输入和报告。
+PerfData/mmap_phys/<时间戳>/
+  -> 单轮无栈验证目录；通过或失败都会保留原始输入和报告。
 
 memory_validation.json
-  -> malloc live 与 Native Heap Alloc 的口径校验，以及 mmap 事件健康状态。
+  -> mmap 事件健康状态、mmap PSS 汇总和 meminfo 快照参考。
 
 dumpsys_meminfo.txt
   -> adb shell dumpsys meminfo <package> 原始输出。
@@ -166,7 +162,7 @@ mmap_trace.perfetto-trace 和 smaps/
   -> 验证报告的原始输入。
 ```
 
-验证模式不会生成新的 `mmap_phys_attribution.json` 和 `mmap_phys_attribution.speedscope.json`，因为当前运行没有采集 mmap 调用栈。它适合回答“heapprofd/meminfo 的 malloc 口径是否大致合理”，不适合回答“哪个调用栈占了物理内存”。
+验证模式不会生成新的 `mmap_phys_attribution.json` 和 `mmap_phys_attribution.speedscope.json`，因为当前运行没有采集 mmap 调用栈。它适合回答“无栈 mmap 事件是否能采到、smaps 是否能汇总”，不适合回答“哪个调用栈占了物理内存”，也不再回答“malloc live 是否接近 Native Heap Alloc”。
 
 ## 常用参数
 
@@ -196,10 +192,11 @@ mmap_trace.perfetto-trace 和 smaps/
   -> 采集 mmap 调用栈并运行 mmap 物理归因分析；这是默认主功能入口。
 
 --no-mmap-callstacks
-  -> 进入验证模式：不采 mmap 调用栈，只运行 mmap 事件健康检查和 malloc/native heap 口径校验。
+  -> 进入验证模式：不采 mmap 调用栈，只运行 mmap 事件健康检查。
 
 --malloc / --no-malloc
-  -> 是否采集 libc.malloc Native heap profile；默认开启。
+  -> 主功能是否采集 libc.malloc Native heap profile；默认开启。
+  -> 无栈验证模式会忽略 malloc 采集，不启用 heapprofd。
 
 --malloc-sampling-interval-bytes
   -> heapprofd libc.malloc 采样间隔，默认 4096 bytes。
@@ -217,20 +214,6 @@ mmap_trace.perfetto-trace 和 smaps/
   -> heapprofd 共享内存大小，默认 33554432 bytes。
   -> 目标进程先把 heapprofd 样本写入这块共享内存；如果写入速度超过 heapprofd 消费速度，
      trace_processor 的 stats 会出现 heapprofd_buffer_overran，说明 malloc profile 已截断。
-
---no-auto-heapprofd-retry
-  -> 关闭无栈验证模式的 heapprofd 自动调参重跑。
-
---max-heapprofd-retries
-  -> heapprofd 异常自动调参重试次数上限，默认 10。
-
---max-malloc-shmem-size-bytes
-  -> 自动重试允许的 heapprofd shmem 上限，默认 268435456 bytes。
-  -> 如果 256 MiB shmem 下 heapprofd 异常计数仍未清零，应停止继续扩大主验证参数，
-     改用独立 APK demo 验证 Perfetto malloc 统计功能。
-
---max-malloc-sampling-interval-bytes
-  -> 自动重试允许的 malloc 采样间隔上限，默认 65536 bytes。
 
 --no-ftrace
   -> 不采 raw syscall 参数；只能调试 perf 调用栈，不适合最终归因。
@@ -356,6 +339,15 @@ data_sources {
 
 data_sources {
   config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
+
+data_sources {
+  config {
     name: "android.heapprofd"
     heapprofd_config {
       shmem_size_bytes: 33554432
@@ -428,11 +420,11 @@ linux.perf / tracepoint / raw_syscalls:sys_enter / filter: "id == 222"
   -> 目标是 mmap 生命周期 + mmap 调用栈归因，优先保证参数、返回值和采样对齐信息完整。
 
 验证模式
-  -> 保留 syscall_events 和 raw_syscalls enter/exit，不采 sched_switch，也不采 linux.perf。
-  -> 目标是无栈 mmap 事件健康检查和 malloc/native heap 口径校验，优先避免 mmap 事件缺失。
+  -> 保留 syscall_events、raw_syscalls enter/exit、sched_switch 和 linux.process_stats，不采 linux.perf。
+  -> 目标是无栈 mmap 事件健康检查，优先避免 mmap 事件缺失。
 ```
 
-验证模式会保留 `linux.ftrace` 和 `android.heapprofd`，但不会生成 `linux.perf` 的 `callstack_sampling` 配置，也不会采 `sched_switch`；因此验证模式不会采 mmap 调用栈，也不会运行 mmap 调用栈归因分析。
+验证模式保留 `linux.ftrace` 和 `linux.process_stats`，不会生成 `android.heapprofd` 或 `linux.perf` 的 `callstack_sampling` 配置；因此验证模式不会采 mmap 调用栈、不会展开 malloc 调用栈，也不会运行 mmap 调用栈归因分析。
 
 arm64 syscall id：
 
@@ -473,7 +465,7 @@ dumpsys_meminfo.txt
   -> 在 Perfetto 采样结束并拉回 trace 后立即保存，早于 trace 健康检查和离线分析。
 
 memory_validation.json
-  -> 随主功能一起生成的验证报告：malloc/native heap 口径校验和 mmap 事件健康状态。
+  -> 随主功能一起生成的 mmap 事件健康报告和 meminfo 快照参考。
 ```
 
 验证模式一次成功运行会生成：
@@ -493,25 +485,8 @@ dumpsys_meminfo.txt
   -> 在 Perfetto 采样结束并拉回 trace 后立即保存，避免分析耗时影响 meminfo 快照时点。
 
 memory_validation.json
-  -> 验证模式主输出：malloc/native heap 口径校验和 mmap 事件健康报告。
+  -> 验证模式主输出：mmap 事件健康报告和 meminfo 快照参考。
 ```
-
-自动重试启用时，最外层输出目录只作为重试容器；每轮验证会生成一个独立 attempt 子目录：
-
-```text
-PerfData/mmap_phys/<时间戳>/
-  attempt_01_i4096_s33554432/
-    mmap_phys_config.pbtxt
-    mmap_trace.perfetto-trace
-    smaps/
-    dumpsys_meminfo.txt
-    memory_validation.json
-```
-
-目录名里的 `i` 表示 `malloc_sampling_interval_bytes`，`s` 表示
-`malloc_shmem_size_bytes`。`run_mmap_phys_profile.sh` 默认从
-`attempt_01_i4096_s33554432` 开始；如果 heapprofd 异常计数没有清零，后续 attempt
-会继续自动扩大参数。每个 attempt 都会先重启 App 并重新获取 pid，避免不同参数复用同一个存活进程导致验证口径不一致。
 
 实际验证过的输出示例：
 
@@ -629,9 +604,9 @@ PerfData/mmap_phys/<时间戳>/memory_validation.json
 验证报告属于“验证模式”口径，用于回答：
 
 ```text
-libc.malloc live bytes
-  与 dumpsys meminfo Native Heap Alloc 是否在合理量级；
-无栈 mmap 只检查事件是否可采，并输出最终 PSS 作为辅助观察值。
+无栈 mmap syscall 事件是否可采；
+smaps 是否能与无栈 mmap 生命周期汇总出最终 PSS；
+dumpsys meminfo 是否已在采样结束后保存为同一轮验证的参考快照。
 ```
 
 验证流程：
@@ -641,10 +616,6 @@ sys_mmap / sys_munmap / sys_mremap
   -> 不读取 mmap 调用栈
   -> 与最后一个 smaps 快照做地址重叠，汇总 mmap PSS/RSS/virtual bytes
 
-heap_profile_allocation
-  -> 不读取 malloc 分配调用栈
-  -> 汇总全采集窗口 libc.malloc / malloc heap 的累计净 live bytes
-
 dumpsys meminfo
   -> 解析 Native Heap PSS / Native Heap Alloc / TOTAL PSS
   -> 采样结束后立即获取，后续 trace 健康检查和离线分析只复用这个文件
@@ -653,41 +624,30 @@ dumpsys meminfo
 关键字段：
 
 ```text
-malloc.live_bytes
-  -> heap_profile_allocation 全采集窗口的 libc.malloc 累计净 live bytes。
-  -> 如果 trace 配置启用 continuous dump，每个 ts 可能只是分片，不能只按 max(ts) 当作全量 live。
-
 mmap.pss_bytes
   -> 无栈 mmap 生命周期与 smaps 交叉后的 PSS 汇总。
 
 meminfo.native_heap_alloc_bytes
-  -> dumpsys meminfo Native Heap 的 Heap Alloc。
+  -> dumpsys meminfo Native Heap 的 Heap Alloc；无栈验证只记录该快照字段，不与 malloc live 对比。
 
 trace_health.heapprofd_data_loss
   -> 来自 trace_processor stats 中的 heapprofd_buffer_overran /
      heapprofd_missing_packet / heapprofd_non_finalized_profile 汇总。
-  -> 大于 0 时表示 heapprofd 数据不完整，脚本会在终端输出 WARN，并在
-     validation.issues 中写入 heapprofd_data_loss。
-  -> 最常见原因是 sampling_interval_bytes 太小或 shmem_size_bytes 太小：
-     例如 sampling_interval_bytes: 4096 在 malloc/free 很密集的游戏进程里会产生大量样本，
-     8 MiB shmem 可能来不及被消费而溢出。
-  -> 验证模式会自动按“先增大 --malloc-shmem-size-bytes，再提高
-     --malloc-sampling-interval-bytes”的顺序重跑，直到 heapprofd_data_loss 和
-     heapprofd_errors 都清零。
+  -> 无栈验证不启用 heapprofd，正常不会出现该问题；如果主功能启用 heapprofd 时大于 0，
+     表示 malloc profile 数据不完整，脚本会在终端输出 WARN。
 
 trace_health.heapprofd_errors
   -> 来自 trace_processor stats 中的 heapprofd_client_error 汇总。
-  -> 大于 0 时同样会触发验证模式自动调参重跑，并在 validation.issues 中写入
-     heapprofd_errors。
+  -> 无栈验证不启用 heapprofd，正常不会出现该问题；主功能启用 heapprofd 时大于 0
+     会在 validation.issues 中写入 heapprofd_errors。
 ```
 
-注意：验证报告是测试口径，主要看量级和趋势。它不提供调用栈归因，也不替代 `mmap_phys_attribution.json` 和 Speedscope 火焰图。
+注意：验证报告是测试口径，主要看 mmap 事件健康和 smaps 汇总是否可用。它不提供调用栈归因，也不替代 `mmap_phys_attribution.json` 和 Speedscope 火焰图。
 
 ## 独立 heapprofd malloc APK demo
 
-当无栈验证在 256 MiB shmem 下仍出现 heapprofd data loss 或 client error 时，
-不要继续扩大主验证参数；应运行独立 APK demo，隔离验证 Perfetto/heapprofd 的
-malloc 数据统计功能是否正常。
+malloc 总量验证已从无栈验证中删除。需要隔离验证 Perfetto/heapprofd 的
+malloc 数据统计功能是否正常时，应运行独立 APK demo。
 
 ```bash
 TOTAL_BYTES=1073741824 \
@@ -758,18 +718,16 @@ python3 -B -m unittest -v test_mmap_phys_analyzer.py
 ```text
 1. trace_processor stderr 日志不会污染 CSV。
 2. raw_syscalls repeated args 会按顺序展开成 arg0 / arg1。
-3. 默认主功能和验证模式都包含 raw_syscalls/sys_enter 和 raw_syscalls/sys_exit；验证模式不采 sched_switch 和 linux.perf 调用栈。
+3. 默认主功能和验证模式都包含 raw_syscalls/sys_enter、raw_syscalls/sys_exit、sched_switch 和 linux.process_stats；验证模式不采 linux.perf 调用栈和 android.heapprofd。
 4. smaps 普通读取无效时会自动尝试 su 0。
 5. mmap + perf sample + munmap 会正确归因到 smaps PSS。
 6. raw syscall 缺少 mmap length 时，用返回地址所在 VMA 归因。
 7. partial munmap 会切分 live range。
 8. 默认主功能会采 mmap 调用栈和 libc.malloc Native heap profile。
-9. 显式验证模式不会采 mmap 调用栈，也不会采全系统 raw syscall。
-10. malloc / mmap 验证 SQL 不读取调用栈表。
-11. memory_validation.json 会输出 malloc/native heap 口径校验和 mmap 事件健康状态。
+9. 显式验证模式不会采 mmap 调用栈，也不会启用 heapprofd malloc。
+10. mmap 验证 SQL 不读取调用栈表，也不读取 heap_profile_allocation。
+11. memory_validation.json 会输出 mmap 事件健康状态，不输出 malloc/native heap 口径校验。
 12. 默认采集时长是 75000 ms，且 dumpsys meminfo 早于 trace 健康检查和离线分析保存。
-13. 无栈验证模式会在 heapprofd 异常计数未清零时自动调参重跑，且每轮 attempt 独立落盘。
-14. 自动重试每轮 attempt 前都会重启目标 App，并重新获取 pid。
 ```
 
 保留单元测试落盘输出：
@@ -834,5 +792,5 @@ stack: mmap [libc.so] -> android::MemoryHeapBase::mapfd [libbinder.so]
 6. 如果采集窗口内没有新的 mmap 调用栈，结果可能为空；需要触发目标 App 行为。
 7. perf lost records 会影响调用栈完整性，可通过降低事件量、缩短采集窗口或调整 perf buffer 继续优化。
 8. 多个 mmap 调用栈命中同一个 VMA 时，VMA 的 PSS/RSS 会按命中权重分摊，避免同一份物理页重复计入多个栈。
-9. `memory_validation.json` 是测试验证口径；它故意不读取 mmap 调用栈和 malloc 分配调用栈，只用于检查 mmap 事件健康和 `malloc.live_bytes` 与 `Native Heap Alloc` 的量级关系。
+9. `memory_validation.json` 是测试验证口径；它故意不读取 mmap 调用栈，也不启用 heapprofd malloc，只用于检查 mmap 事件健康、smaps 汇总和 meminfo 快照参考。
 ```
