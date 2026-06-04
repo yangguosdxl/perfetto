@@ -1236,11 +1236,10 @@ def prepare_output_dir(output_dir: str) -> bool:
   return True
 
 
-def run_collection(args):
+def run_collection(args, start_target_after_perfetto: bool = False):
   """执行一次 mmap 物理内存采集，并返回验证健康信息。"""
   if not prepare_output_dir(args.output):
     return {"status": 1, "trace_health": None, "report_path": ""}
-  pid = wait_for_pid(args.name, args.wait_timeout_s)
   smaps_dir = os.path.join(args.output, "smaps")
   trace_path = os.path.join(args.output, "mmap_trace.perfetto-trace")
   device_trace = f"/data/misc/perfetto-traces/mmap-phys-{int(time.time() * 1000)}"
@@ -1258,7 +1257,14 @@ def run_collection(args):
       malloc_shmem_size_bytes=args.malloc_shmem_size_bytes,
       include_mmap_callstacks=args.mmap_callstacks)
   write_config(config, args.output)
-  perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
+  if start_target_after_perfetto:
+    # 验证 attempt 必须先让 heapprofd/ftrace 就绪，再启动 App，
+    # 否则启动期 malloc/mmap 会被漏采，meminfo 对比没有意义。
+    perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
+    pid = wait_for_pid(args.name, args.wait_timeout_s)
+  else:
+    pid = wait_for_pid(args.name, args.wait_timeout_s)
+    perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
 
   try:
     collect_smaps(pid, perfetto_pid, smaps_dir, args.smaps_interval_ms, args.use_su,
@@ -1331,7 +1337,7 @@ def run_auto_heapprofd_retry(args, base_output: str) -> int:
     print(f"  malloc_shmem_size_bytes={args.malloc_shmem_size_bytes}")
 
     force_stop_app(args.name)
-    result = run_collection(args)
+    result = run_collection(args, start_target_after_perfetto=True)
     if result.get("status", 0) != 0:
       return int(result.get("status", 1))
 

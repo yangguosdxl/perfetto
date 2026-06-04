@@ -282,6 +282,56 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertLess(calls.index("capture_meminfo"),
                     calls.index("collect_memory_validation"))
 
+  def test_collection_can_start_perfetto_before_launching_app(self):
+    """验证 attempt 应先启动 Perfetto，再拉起 App，避免错过启动期分配。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          duration_ms=75000,
+          smaps_interval_ms=1000,
+          output=tmpdir,
+          wait_timeout_s=120,
+          buffer_kb=262144,
+          perf_ring_buffer_pages=8192,
+          perf_ring_buffer_read_period_ms=100,
+          collect_malloc=True,
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=32 * 1024 * 1024,
+          mmap_callstacks=False,
+          no_ftrace=False,
+          no_kernel_frames=False,
+          no_guardrails=False,
+          use_su=False,
+          no_analyze=False,
+          trace_processor="tp",
+          analyzer="analyzer.py")
+      calls = []
+
+      def record(name, result=None):
+        def inner(*_args, **_kwargs):
+          calls.append(name)
+          return result
+        return inner
+
+      with mock.patch.object(collector, "write_config", record("write_config")), \
+          mock.patch.object(collector, "start_perfetto",
+                            record("start_perfetto", 5678)), \
+          mock.patch.object(collector, "wait_for_pid",
+                            record("wait_for_pid", 1234)), \
+          mock.patch.object(collector, "collect_smaps", record("collect_smaps")), \
+          mock.patch.object(collector, "pull_trace", record("pull_trace")), \
+          mock.patch.object(collector, "capture_meminfo",
+                            record("capture_meminfo",
+                                   os.path.join(tmpdir, "dumpsys_meminfo.txt"))), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            record("collect_memory_validation",
+                                   {"trace_health": {}})):
+        result = collector.run_collection(args, start_target_after_perfetto=True)
+
+    self.assertEqual(result["status"], 0)
+    self.assertLess(calls.index("start_perfetto"), calls.index("wait_for_pid"))
+    self.assertLess(calls.index("wait_for_pid"), calls.index("collect_smaps"))
+
   def test_trace_health_summary_flags_perf_lost_records(self):
     """健康检查需要区分 Perfetto buffer 和 perf 内核 buffer 丢数。"""
     rows = [
@@ -371,7 +421,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           max_heapprofd_retries=3)
       attempts = []
 
-      def fake_run_collection(run_args):
+      def fake_run_collection(run_args, **_kwargs):
         attempts.append((run_args.output,
                          run_args.malloc_sampling_interval_bytes,
                          run_args.malloc_shmem_size_bytes))
