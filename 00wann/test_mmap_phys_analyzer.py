@@ -603,6 +603,7 @@ TOTAL SWAP PSS: 7,000K
     self.assertEqual(summary["freed_bytes"], 4096)
     self.assertFalse(any("stack_profile" in sql or "callsite" in sql
                          for sql in seen_sql))
+    self.assertFalse(any("latest_dump" in sql for sql in seen_sql))
 
   def test_query_mmap_validation_syscalls_does_not_read_callstacks(self):
     """mmap 验证只查目标进程 raw syscall，不读取 mmap 调用栈。"""
@@ -625,7 +626,7 @@ TOTAL SWAP PSS: 7,000K
                          for sql in seen_sql))
 
   def test_query_memory_validation_inputs_loads_trace_once(self):
-    """无栈 mmap+malloc 总量验证应一次查询拿齐健康、malloc、mmap 输入。"""
+    """无栈健康和 malloc/native heap 口径校验应一次查询拿齐输入。"""
     calls = []
 
     def fake_run(cmd, **_kwargs):
@@ -656,6 +657,7 @@ TOTAL SWAP PSS: 7,000K
     self.assertEqual(inputs["malloc_summary"]["live_bytes"], 4096)
     self.assertEqual(len(inputs["syscalls"]), 2)
     self.assertEqual(inputs["syscalls"][0].args["arg1"], 4096)
+    self.assertNotIn("latest_dump", calls[0][-1])
 
   def test_memory_validation_syscall_sql_filters_target_events_before_args(self):
     """raw syscall 量大时，SQL 应先下推目标 pid 和事件名，再扫描 args。"""
@@ -668,8 +670,8 @@ TOTAL SWAP PSS: 7,000K
     self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id", sql)
     self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id", sql)
 
-  def test_write_memory_validation_report_combines_malloc_mmap_and_meminfo(self):
-    """验证报告应输出 malloc + mmap 与 dumpsys meminfo 的对比。"""
+  def test_write_memory_validation_report_compares_malloc_with_native_heap_alloc(self):
+    """验证报告只把 malloc live 与 Native Heap Alloc 作为 meminfo 主口径。"""
     with tempfile.TemporaryDirectory() as tmpdir:
       meminfo_path = os.path.join(tmpdir, "dumpsys_meminfo.txt")
       with open(meminfo_path, "w", encoding="utf-8") as fd:
@@ -692,7 +694,9 @@ TOTAL SWAP PSS: 7,000K
 
     self.assertEqual(report["malloc"]["live_bytes"], 4096)
     self.assertEqual(report["mmap"]["pss_bytes"], 3072)
-    self.assertEqual(report["tracked_sum"]["malloc_live_plus_mmap_pss_bytes"], 7168)
+    self.assertNotIn("tracked_sum", report)
+    self.assertNotIn("tracked_sum_minus_meminfo_total_pss_bytes",
+                     report["comparison"])
     self.assertEqual(report["meminfo"]["native_heap_alloc_bytes"], 4 * 1024)
     self.assertEqual(report["validation"]["status"], "pass")
 
@@ -716,6 +720,28 @@ TOTAL SWAP PSS: 7,000K
     self.assertEqual(report["validation"]["status"], "fail")
     self.assertIn("mmap_syscall_events_missing", report["validation"]["issues"])
     self.assertIn("heapprofd_data_loss", report["validation"]["issues"])
+
+  def test_memory_validation_report_fails_when_malloc_is_far_from_native_heap_alloc(self):
+    """malloc live 与 meminfo Native Heap Alloc 差距过大时，验证应失败。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      meminfo_path = os.path.join(tmpdir, "dumpsys_meminfo.txt")
+      with open(meminfo_path, "w", encoding="utf-8") as fd:
+        fd.write("Native Heap 900000 0 0 0 1000000 900000 100000\n"
+                 "TOTAL 1000000 0 0 0 0 0 0\n")
+
+      report_path = collector.write_memory_validation_report(
+          output_dir=tmpdir,
+          malloc_summary={"live_bytes": 4 * 1024 * 1024, "heaps": [{"heap_name": "libc.malloc"}]},
+          mmap_summary={"pss_bytes": 0, "syscall_events": 1, "smaps_snapshots": 1},
+          meminfo_path=meminfo_path,
+          trace_health={"heapprofd_data_loss": 0, "heapprofd_errors": 0})
+
+      with open(report_path, "r", encoding="utf-8") as fd:
+        report = json.load(fd)
+
+    self.assertEqual(report["validation"]["status"], "fail")
+    self.assertIn("malloc_native_heap_alloc_mismatch",
+                  report["validation"]["issues"])
 
   def test_mmap_perf_sample_and_munmap_are_attributed_to_smaps_pss(self):
     """构造 mmap/perf/smaps 样例，验证释放区间不会继续计入物理占用。"""

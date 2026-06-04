@@ -569,12 +569,6 @@ WITH target_process AS (
   WHERE pid = {pid}
   ORDER BY start_ts DESC
   LIMIT 1
-),
-latest_dump AS (
-  SELECT max(ts) AS ts
-  FROM heap_profile_allocation h
-  JOIN target_process t ON h.upid = t.upid
-  WHERE h.heap_name IN ('libc.malloc', 'malloc')
 )
 SELECT
   h.heap_name AS heap_name,
@@ -583,7 +577,6 @@ SELECT
   sum(CASE WHEN h.size < 0 THEN -h.size ELSE 0 END) AS freed_bytes
 FROM heap_profile_allocation h
 JOIN target_process t ON h.upid = t.upid
-JOIN latest_dump d ON h.ts = d.ts
 WHERE h.heap_name IN ('libc.malloc', 'malloc')
 GROUP BY h.heap_name
 ORDER BY h.heap_name
@@ -755,7 +748,7 @@ def build_syscall_events_from_rows(rows, analyzer):
 
 
 def build_memory_validation_inputs_sql(pid: int) -> str:
-  """一次 trace_processor 查询拿齐健康检查、malloc 汇总和 mmap syscall。"""
+  """一次 trace_processor 查询拿齐健康检查、malloc 累计汇总和 mmap syscall。"""
   quoted_names = ", ".join(f"'{name}'" for name in TRACE_HEALTH_STATS)
   return f"""
 WITH
@@ -766,12 +759,6 @@ target_process AS (
   ORDER BY start_ts DESC
   LIMIT 1
 ),
-latest_dump AS (
-  SELECT max(ts) AS ts
-  FROM heap_profile_allocation h
-  JOIN target_process t ON h.upid = t.upid
-  WHERE h.heap_name IN ('libc.malloc', 'malloc')
-),
 malloc_rows AS (
   SELECT
     h.heap_name AS heap_name,
@@ -780,7 +767,6 @@ malloc_rows AS (
     sum(CASE WHEN h.size < 0 THEN -h.size ELSE 0 END) AS freed_bytes
   FROM heap_profile_allocation h
   JOIN target_process t ON h.upid = t.upid
-  JOIN latest_dump d ON h.ts = d.ts
   WHERE h.heap_name IN ('libc.malloc', 'malloc')
   GROUP BY h.heap_name
 ),
@@ -865,7 +851,7 @@ def parse_malloc_summary_rows(rows):
 
 
 def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: int):
-  """一次冷加载 trace，拿齐无栈 mmap+malloc 验证所需输入。"""
+  """一次冷加载 trace，拿齐无栈健康和 malloc/native heap 口径校验输入。"""
   import mmap_phys_analyzer as analyzer
 
   sql = build_memory_validation_inputs_sql(pid)
@@ -1012,11 +998,17 @@ def query_mmap_summary(trace_processor: str, trace_path: str, pid: int,
   return build_mmap_summary_from_syscalls(syscalls, pid, smaps_dir)
 
 
-def build_memory_validation_status(mmap_summary, trace_health):
+def build_memory_validation_status(mmap_summary, trace_health,
+                                   malloc_summary=None, meminfo=None):
   issues = []
   if int_value(mmap_summary.get("smaps_snapshots")) > 0 and int_value(
       mmap_summary.get("syscall_events")) == 0:
     issues.append("mmap_syscall_events_missing")
+  if malloc_summary and meminfo:
+    native_alloc = int_value(meminfo.get("native_heap_alloc_bytes"))
+    malloc_live = int_value(malloc_summary.get("live_bytes"))
+    if native_alloc > 0 and abs(malloc_live - native_alloc) / native_alloc > 0.5:
+      issues.append("malloc_native_heap_alloc_mismatch")
   if trace_health:
     if int_value(trace_health.get("heapprofd_data_loss")) > 0:
       issues.append("heapprofd_data_loss")
@@ -1062,25 +1054,18 @@ def write_memory_validation_report(output_dir: str, malloc_summary,
                                    trace_health=None) -> str:
   with open(meminfo_path, "r", encoding="utf-8") as fd:
     meminfo = parse_meminfo_summary(fd.read())
-  tracked_sum = (
-      int_value(malloc_summary.get("live_bytes")) +
-      int_value(mmap_summary.get("pss_bytes")))
   report = {
       "units": "bytes",
       "note": (
-          "malloc 来自 heap_profile_allocation 最新快照净 live bytes；"
-          "mmap 来自 mmap 归因最终 PSS；两者定义不同，报告用于趋势和量级校验。"),
+          "malloc 来自 heap_profile_allocation 全采集窗口累计净 live bytes；"
+          "mmap 来自 mmap 归因最终 PSS；两者定义不同，不做合并校验。"),
       "malloc": malloc_summary,
       "mmap": mmap_summary,
       "trace_health": trace_health or {},
-      "validation": build_memory_validation_status(mmap_summary, trace_health),
-      "tracked_sum": {
-          "malloc_live_plus_mmap_pss_bytes": tracked_sum,
-      },
+      "validation": build_memory_validation_status(
+          mmap_summary, trace_health, malloc_summary, meminfo),
       "meminfo": meminfo,
       "comparison": {
-          "tracked_sum_minus_meminfo_total_pss_bytes":
-              tracked_sum - meminfo["total_pss_bytes"],
           "malloc_live_minus_meminfo_native_heap_alloc_bytes":
               int_value(malloc_summary.get("live_bytes")) -
               meminfo["native_heap_alloc_bytes"],
@@ -1097,10 +1082,13 @@ def write_memory_validation_report(output_dir: str, malloc_summary,
   print("内存验证:")
   print(f"  malloc live: {format_mib(report['malloc'].get('live_bytes', 0))}")
   print(f"  mmap PSS: {format_mib(report['mmap'].get('pss_bytes', 0))}")
-  print(f"  malloc+mmap: {format_mib(tracked_sum)}")
-  print(f"  meminfo TOTAL PSS: {format_mib(meminfo['total_pss_bytes'])}")
   print(f"  meminfo Native Heap Alloc: "
         f"{format_mib(meminfo['native_heap_alloc_bytes'])}")
+  print(f"  meminfo Native Heap PSS: "
+        f"{format_mib(meminfo['native_heap_pss_bytes'])}")
+  print(f"  validation status: {report['validation']['status']}")
+  if report["validation"]["issues"]:
+    print("  validation issues: " + ", ".join(report["validation"]["issues"]))
   print(f"验证报告已保存: {path}")
   return path
 
@@ -1189,7 +1177,7 @@ def parse_args():
                       help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
   parser.add_argument("--malloc", dest="collect_malloc", action="store_true",
                       default=True,
-                      help="采集 libc.malloc 堆快照，用于和 mmap、meminfo 做总量验证")
+                      help="采集 libc.malloc 堆快照，用于 native heap 口径校验")
   parser.add_argument("--no-malloc", dest="collect_malloc", action="store_false",
                       help="不采集 libc.malloc 堆快照")
   parser.add_argument("--malloc-sampling-interval-bytes", type=int, default=4096,
@@ -1212,7 +1200,7 @@ def parse_args():
                       help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
   parser.add_argument("--no-mmap-callstacks", dest="mmap_callstacks",
                       action="store_false",
-                      help="不采集 mmap 调用栈；仅运行无栈 mmap+malloc 验证时使用")
+                      help="不采集 mmap 调用栈；仅运行无栈健康和 malloc/native heap 口径校验时使用")
   parser.add_argument("--no-ftrace", action="store_true",
                       help="不启用 linux.ftrace syscall_events；会跳过无栈 mmap 验证")
   parser.add_argument("--no-kernel-frames", action="store_true",
@@ -1302,7 +1290,7 @@ def run_collection(args, start_target_after_perfetto: bool = False):
 
 
 def should_auto_retry_heapprofd(args) -> bool:
-  """仅无栈 malloc+mmap 验证模式自动重跑，避免影响默认主功能采集。"""
+  """仅无栈验证模式自动重跑，避免影响默认主功能采集。"""
   return (
       getattr(args, "auto_heapprofd_retry", True) and
       not args.mmap_callstacks and
