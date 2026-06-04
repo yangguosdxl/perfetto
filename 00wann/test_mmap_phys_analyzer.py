@@ -228,6 +228,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(args.duration_ms, 75000)
     self.assertTrue(args.collect_malloc)
     self.assertTrue(args.mmap_callstacks)
+    self.assertEqual(args.max_malloc_shmem_size_bytes, 256 * 1024 * 1024)
 
   def test_main_captures_meminfo_before_trace_analysis(self):
     """采样结束后应先保存 meminfo，再运行 trace 健康检查和离线分析。"""

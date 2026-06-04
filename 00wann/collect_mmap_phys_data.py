@@ -1190,7 +1190,7 @@ def parse_args():
   parser.add_argument("--max-heapprofd-retries", type=int, default=10,
                       help="heapprofd 异常自动调参重试次数上限")
   parser.add_argument("--max-malloc-shmem-size-bytes", type=int,
-                      default=512 * 1024 * 1024,
+                      default=256 * 1024 * 1024,
                       help="自动重试允许的 heapprofd shmem 上限")
   parser.add_argument("--max-malloc-sampling-interval-bytes", type=int,
                       default=65536,
