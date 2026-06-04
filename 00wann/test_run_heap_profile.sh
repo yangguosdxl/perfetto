@@ -5,11 +5,20 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+if [[ ! -f "$script_dir/run_heap_profile.py" ]]; then
+  echo "缺少 Python 实现: run_heap_profile.py"
+  exit 1
+fi
 cp "$script_dir/run_heap_profile.sh" "$tmpdir/run_heap_profile.sh"
+cp "$script_dir/run_heap_profile.py" "$tmpdir/run_heap_profile.py"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 
 if [[ "$(head -n 1 "$tmpdir/run_heap_profile.sh")" != "#!/usr/bin/env bash" ]]; then
   echo "run_heap_profile.sh 缺少 bash shebang，直接执行时可能被 /bin/sh 解释"
+  exit 1
+fi
+if ! grep -Fq "run_heap_profile.py" "$tmpdir/run_heap_profile.sh"; then
+  echo "run_heap_profile.sh 应只作为 Python 实现入口包装"
   exit 1
 fi
 
@@ -62,7 +71,6 @@ printf 'python3 %s\n' "$*" >>"${TEST_LOG:?}"
 printf 'PYTHONPATH=%s\n' "${PYTHONPATH:-}" >>"${TEST_LOG:?}"
 printf 'PYTHONUNBUFFERED=%s\n' "${PYTHONUNBUFFERED:-}" >>"${TEST_LOG:?}"
 printf 'Profiling active. Press Ctrl+C to terminate.\n'
-printf 'Waiting for profiler shutdown...\n'
 out_dir=""
 while [[ "$#" -gt 0 ]]; do
   if [[ "$1" == "-o" ]]; then
@@ -71,12 +79,27 @@ while [[ "$#" -gt 0 ]]; do
   fi
   shift
 done
-if [[ "$out_dir" != "" ]]; then
+
+write_fake_profile_outputs() {
+  if [[ "$out_dir" == "" ]]; then
+    return 0
+  fi
   mkdir -p "$out_dir"
   printf 'fake trace\n' >"$out_dir/symbolized-trace"
   printf 'fake raw trace\n' >"$out_dir/raw-trace"
   printf 'fake heap dump\n' >"$out_dir/heap_dump.1.4321.libc.malloc.pb.gz"
+}
+
+if [[ "${FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT:-0}" == "1" ]]; then
+  # 模拟 Perfetto heap_profile.py：人工 Ctrl+C 后先进入 profiler shutdown，再做 host 后处理。
+  trap 'printf "PYTHON_GOT_SIGINT\n" >>"${TEST_LOG:?}"; printf "Waiting for profiler shutdown...\n"; write_fake_profile_outputs; sleep 0.5; printf "PYTHON_SIGINT_DONE\n" >>"${TEST_LOG:?}"; exit 0' INT
+  while true; do
+    sleep 0.2
+  done
 fi
+
+printf 'Waiting for profiler shutdown...\n'
+write_fake_profile_outputs
 exit "${FAKE_HEAP_PROFILE_RC:-0}"
 EOF
 chmod +x "$tmpdir/bin/adb" "$tmpdir/bin/cp" "$tmpdir/bin/python3"
@@ -232,6 +255,79 @@ run_script "$TEST_LOG" 45000 1024 67108864
 if ! grep -Fq -- "--shmem-size 67108864" "$TEST_LOG"; then
   echo "传入 67108864 时未设置 heapprofd 共享缓冲区大小"
   cat "$TEST_LOG"
+  exit 1
+fi
+
+export FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT=1
+: >"$TEST_LOG"
+printf '0' >"$PIDOF_COUNT_FILE"
+cd /
+set +e
+/usr/bin/python3 - "$tmpdir/run_heap_profile.sh" "$TEST_LOG" "$tmpdir/run_heap_profile_sigint.out" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+script, test_log, output_path = sys.argv[1:4]
+
+def restore_sigint():
+  signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+with open(output_path, "w", encoding="utf-8") as output:
+  proc = subprocess.Popen(
+      [script],
+      stdout=output,
+      stderr=subprocess.STDOUT,
+      start_new_session=True,
+      preexec_fn=restore_sigint)
+
+  deadline = time.time() + 5
+  while time.time() < deadline:
+    try:
+      with open(test_log, "r", encoding="utf-8") as log:
+        if "adb shell monkey -p com.tencent.dhwdxkty.trunk.profiler 1" in log.read():
+          break
+    except FileNotFoundError:
+      pass
+    time.sleep(0.1)
+  else:
+    os.killpg(proc.pid, signal.SIGTERM)
+    proc.wait(timeout=5)
+    sys.exit(125)
+
+  os.kill(proc.pid, signal.SIGINT)
+  try:
+    rc = proc.wait(timeout=8)
+  except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGTERM)
+    proc.wait(timeout=5)
+    sys.exit(124)
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY
+sigint_rc=$?
+set -e
+unset FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT
+if [[ "$sigint_rc" -ne 0 ]]; then
+  echo "人工 Ctrl+C 后应等待 heap_profile.py 收尾并继续执行验证，不应直接 130 退出"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_sigint.out"
+  exit 1
+fi
+if ! grep -Fq "PYTHON_GOT_SIGINT" "$TEST_LOG"; then
+  echo "人工 Ctrl+C 未转发给 heap_profile.py"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "PYTHON_SIGINT_DONE" "$TEST_LOG"; then
+  echo "脚本未等待 heap_profile.py 完成 Ctrl+C 后的 trace 收尾"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "HEAP_MEMINFO_VALIDATION=PASS" "$tmpdir/run_heap_profile_sigint.out"; then
+  echo "人工 Ctrl+C 收尾后未继续执行 malloc live 与 meminfo 验证"
+  cat "$tmpdir/run_heap_profile_sigint.out"
   exit 1
 fi
 

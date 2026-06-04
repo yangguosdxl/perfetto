@@ -1,12 +1,14 @@
 # Native heap profile 采集脚本
 
-`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，默认目标包名为 `com.tencent.dhwdxkty.trunk.profiler`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。脚本会自动切换到自身所在目录，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
+`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，默认目标包名为 `com.tencent.dhwdxkty.trunk.profiler`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。`run_heap_profile.sh` 只是兼容入口，实际流程由 `run_heap_profile.py` 执行；入口会自动切换到自身所在目录，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
 
 默认执行时不限制采集时长，`heap_profile.py` 会持续采集直到人工中断：
 
 ```bash
 00wann/run_heap_profile.sh
 ```
+
+人工按 Ctrl+C 时，Python 主脚本会把 SIGINT 转发给 `heap_profile.py`，让 Perfetto 进入 `Waiting for profiler shutdown...` 收尾流程。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
 
 如需自动退出，可把采集时长作为第一个参数传入，单位为毫秒：
 
@@ -44,15 +46,15 @@ adb shell monkey -p <package> 1
 
 这个顺序保证目标进程启动后的 native malloc/free 会被 heapprofd 观察到；如果附加到已经运行很久的进程，heapprofd 无法还原采集开始前已经发生的 native 分配，`malloc_live_bytes` 会明显低于 `meminfo Native Heap Alloc`。
 
-脚本会导出 `PYTHONPATH="$PerfettoRoot/python"`，确保直接执行 `python/tools/heap_profile.py` 时可以导入仓库内的 `perfetto` Python 包。
+Python 主脚本会导出 `PYTHONPATH="$PerfettoRoot/python"`，确保直接执行 `python/tools/heap_profile.py` 时可以导入仓库内的 `perfetto` Python 包。
 
-脚本同时导出 `PYTHONUNBUFFERED=1`，避免 `heap_profile.py` 的 `Profiling active` 输出因为管道缓冲而延迟。profiler 原始日志会在采集结束后保存到：
+Python 主脚本同时导出 `PYTHONUNBUFFERED=1`，避免 `heap_profile.py` 的 `Profiling active` 输出因为管道缓冲而延迟。profiler 原始日志会在采集结束后保存到：
 
 ```text
 PerfData/mem/<日期时间>/heap_profile.log
 ```
 
-脚本还会显式传入本地构建产物：
+Python 主脚本还会显式传入本地构建产物：
 
 ```bash
 --traceconv-binary "$PerfettoRoot/out/linux_clang_release/traceconv"
@@ -111,9 +113,10 @@ HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES=67108864
 ```bash
 bash 00wann/test_run_heap_profile.sh
 bash -n 00wann/run_heap_profile.sh 00wann/test_run_heap_profile.sh
+/usr/bin/python3 -m py_compile 00wann/run_heap_profile.py
 ```
 
-测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。
+测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。测试还会模拟人工 Ctrl+C，确认中断会传递给 `heap_profile.py`，并在 `heap_profile.py` 完成 trace/heap dump 本地收尾后继续完成 meminfo 抓取和 SQL 验证。
 
 ## 启动耗时评估
 
