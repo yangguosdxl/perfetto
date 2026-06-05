@@ -560,6 +560,8 @@ smaps/
   -> 采集期间周期性保存的 /proc/<pid>/smaps 快照。
   -> 文件名中的数字是采样时刻，采集脚本用设备 /proc/uptime 换算为 ns。
   -> 每个快照记录当前进程 VMA 的地址范围、pathname、Rss、Pss 等字段。
+  -> 离线分析器默认会把采集脚本生成的 uptime ns 文件名按 ns 处理，避免把
+     14 位 uptime ns 误当成 ms 放大，导致 Perfetto JSON 导入时出现负时间戳。
 ```
 
 smaps 解析逻辑：
@@ -581,6 +583,131 @@ VMA body:
 ```
 
 脚本只使用当前实现中解析到的字段；`SwapPss` 目前不并入 `pss_bytes`。
+
+### 数据结构关系
+
+核心数据结构不是一条 mmap 对一条 smaps VMA，而是“调用栈、mmap 生命周期、
+smaps 快照、VMA”之间的多对多关系：
+
+```mermaid
+classDiagram
+  class Stack {
+    id: int
+    frames: List~str~
+    title: str
+    text: str
+  }
+
+  class PerfSample {
+    ts: int
+    utid: int
+    pid: int
+    tid: int
+    callsite_id: int
+  }
+
+  class SyscallEvent {
+    ts: int
+    utid: int
+    name: str
+    syscall_id: int?
+    ret: int?
+    args: Dict~str,int~
+  }
+
+  class MmapRange {
+    pid: int
+    start: int
+    end: int
+    stack_id: int
+    mmap_ts: int
+    path: str
+  }
+
+  class Snapshot {
+    ts: int
+    pid: int
+    path: str
+    vmas: List~SmapsVma~
+  }
+
+  class SmapsVma {
+    start: int
+    end: int
+    pathname: str
+    rss_kb: int
+    pss_kb: int
+    private_dirty_kb: int
+    private_clean_kb: int
+    shared_dirty_kb: int
+    shared_clean_kb: int
+  }
+
+  class StackStat {
+    stack_id: int
+    virtual_bytes: int
+    rss_bytes: float
+    pss_bytes: float
+    private_dirty_bytes: float
+    private_clean_bytes: float
+    shared_dirty_bytes: float
+    shared_clean_bytes: float
+    range_count: int
+    paths: set
+  }
+
+  SyscallEvent --> MmapRange : mmap/munmap/mremap 推进 live ranges
+  PerfSample --> MmapRange : mmap enter 附近样本提供 stack_id
+  MmapRange --> Stack : stack_id 对应调用栈
+  Snapshot "1" *-- "many" SmapsVma : 一个 smaps 文件包含多个 VMA
+  Snapshot --> MmapRange : snapshot.ts 时刻只看仍 live 的 range
+  SmapsVma --> StackStat : 按地址重叠比例分摊 PSS/RSS
+  MmapRange --> StackStat : 按 stack_id 聚合
+  StackStat --> Stack : 输出 stack frames 和 stack_text
+```
+
+关系说明：
+
+```text
+Stack
+  -> trace_processor 的 stack_profile_callsite / stack_profile_frame /
+     stack_profile_symbol 展开结果。
+
+PerfSample
+  -> linux.perf 在 mmap enter 附近采到的调用栈样本。
+  -> sample.callsite_id 会成为 MmapRange.stack_id。
+
+SyscallEvent
+  -> ftrace syscall enter/exit 参数行分组后的事件。
+  -> mmap exit ret 决定真实 start；munmap/mremap 用于删除或迁移 live range。
+
+MmapRange
+  -> 当前时间轴上仍然存活的虚拟地址区间。
+  -> 它记录“这段地址最初由哪个 stack_id 的 mmap 建立”，但不直接记录物理页。
+
+Snapshot / SmapsVma
+  -> 某一时刻 /proc/<pid>/smaps 的完整快照。
+  -> VMA 记录当前地址段的 PSS/RSS/Private/Shared 等物理占用字段。
+
+StackStat
+  -> 某个 snapshot 上，所有 VMA 与 live mmap range 地址重叠后，
+     按 stack_id 聚合出来的物理占用结果。
+```
+
+可以把它理解成两条时间线在快照点相交：
+
+```text
+Perfetto syscall 时间线
+  -> 维护 live MmapRange 集合：哪些 mmap 地址段此刻还没被 munmap/mremap 移走。
+
+smaps 快照时间线
+  -> 周期提供 VMA 当前物理状态：这些地址段此刻有多少 PSS/RSS/PrivateDirty。
+
+归因点 snapshot.ts
+  -> 用 snapshot.ts 之前的 syscall 事件得到 live ranges。
+  -> 用 snapshot.ts 对应的 smaps VMA 得到当前物理页。
+  -> 通过地址重叠把 VMA 物理页分摊给建立这些 range 的 mmap 调用栈。
+```
 
 ### mmap 生命周期还原
 
@@ -631,6 +758,82 @@ mmap enter 时间点
 `stack_id = 0`，只用于健康检查和总量汇总。
 
 ### 快照归因流程
+
+采集脚本会按 `--smaps-interval-ms` 周期保存多份 smaps：
+
+```text
+collect_smaps()
+  -> 每轮读取设备 /proc/uptime
+  -> 用 uptime ns 作为文件名：<ts_ns>.smaps
+  -> 保存 /proc/<pid>/smaps 原文
+```
+
+离线分析器读取这些文件时，会从文件名提取时间戳，按时间排序：
+
+```text
+load_snapshots(smaps_dir)
+  -> parse_timestamp_from_name(<ts_ns>.smaps)
+  -> parse_smaps(path)
+  -> Snapshot(ts=<ts_ns>, pid=<target_pid>, path=path, vmas=[...])
+  -> 按 Snapshot.ts 升序排列
+```
+
+多个 smaps 快照的使用逻辑如下：
+
+```text
+1. 不是把所有 smaps VMA 直接相加。
+   每个 smaps 文件都是一个瞬时状态；不同文件表示不同时刻的同一进程地址空间。
+
+2. 如果只要“最新物理内存占用”，理论上只需要最后一个 smaps 快照。
+   做法是先把 mmap/munmap/mremap 生命周期推进到最后一个 snapshot.ts，
+   得到该时刻仍 live 的 mmap ranges，再与最后一个 smaps VMA 做地址重叠。
+   这就是 metadata.final_summary 和默认 Speedscope 的最终口径。
+
+3. 当前实现仍会按时间从早到晚处理每个快照。
+   对每个 snapshot.ts，只先应用 event.ts <= snapshot.ts 的 mmap/munmap/mremap
+   生命周期事件，得到该时刻仍 live 的 mmap ranges。
+
+4. 每个快照单独做一次地址重叠归因。
+   这个快照的 PSS/RSS 只用于生成该时刻的 Perfetto counter。
+   多个周期的重叠计算服务于时间线展示、增长/回落观察和采集健康诊断，
+   不是把最终物理占用算出来的必要条件。
+
+5. final_summary 和默认 Speedscope 使用最后一个 smaps 快照。
+   build_chrome_trace() 每处理一个快照都会更新 final_stats，循环结束后用最终
+   final_stats 生成 metadata.final_summary 和 Speedscope。
+
+6. memory_validation.json 的无栈 mmap 汇总也使用相同推进逻辑。
+   它会遍历所有快照，但最终报告的 mmap.pss_bytes 来自最后一个快照的 final_stats。
+```
+
+因此，你如果只关心最新时刻的真实物理内存归因，可以把逻辑简化成：
+
+```text
+last_snapshot = smaps 快照中时间戳最大的那个
+live_ranges_at_last_snapshot = 所有 event.ts <= last_snapshot.ts 的生命周期结果
+最终 PSS/RSS = live_ranges_at_last_snapshot 与 last_snapshot.vmas 地址重叠后的分摊结果
+```
+
+示意时间线：
+
+```text
+trace event:
+  t=10 mmap A [0x1000, 0x5000) stack=11
+  t=20 mmap B [0x8000, 0xa000) stack=22
+  t=30 munmap [0x2000, 0x3000)
+  t=40 mremap B -> [0xc000, 0xe000)
+
+smaps snapshots:
+  S1 t=15  -> live: A
+  S2 t=25  -> live: A + B
+  S3 t=35  -> live: A 被切成 [0x1000,0x2000)+[0x3000,0x5000), B
+  S4 t=45  -> live: A 两段, B 已迁移到 [0xc000,0xe000)
+
+输出：
+  Perfetto counter 会有 S1/S2/S3/S4 四个时刻。
+  metadata.final_summary 使用 S4 的归因结果。
+  Speedscope 权重也使用 S4 的 pss_bytes。
+```
 
 对每个 smaps 快照，分析器按时间推进 live ranges：
 
@@ -683,6 +886,130 @@ stat.private_clean_bytes += vma.private_clean_kb * 1024 * ratio
 stat.shared_dirty_bytes  += vma.shared_dirty_kb * 1024 * ratio
 stat.shared_clean_bytes  += vma.shared_clean_kb * 1024 * ratio
 ```
+
+### 单次 mmap 物理占用计算示例
+
+先看最简单的一对一场景：一次 mmap 的 live range 完全覆盖一个 smaps VMA。
+
+```text
+mmap 调用：
+  stack_id = 101
+  ret      = 0x70000000
+  length   = 0x4000  # 16 KiB
+  live range = [0x70000000, 0x70004000)
+
+同一 snapshot.ts 的 smaps VMA：
+  70000000-70004000 rw-p 00000000 00:00 0 [anon:demo]
+  Rss:              16 kB
+  Pss:              16 kB
+  Private_Dirty:    12 kB
+  Private_Clean:     4 kB
+  Shared_Dirty:      0 kB
+  Shared_Clean:      0 kB
+```
+
+计算：
+
+```text
+vma_size = 0x4000 = 16384 bytes
+overlap  = min(0x70004000, 0x70004000) - max(0x70000000, 0x70000000)
+         = 0x4000 = 16384 bytes
+
+total_overlap = 16384
+denominator   = max(vma_size, total_overlap) = 16384
+ratio         = overlap / denominator = 1.0
+
+stack_id=101:
+  virtual_bytes       += 16384 * 1.0 = 16384
+  pss_bytes           += 16 * 1024 * 1.0 = 16384
+  rss_bytes           += 16 * 1024 * 1.0 = 16384
+  private_dirty_bytes += 12 * 1024 * 1.0 = 12288
+  private_clean_bytes +=  4 * 1024 * 1.0 = 4096
+```
+
+这个结果说明：虽然 mmap 请求的是 16 KiB 虚拟地址，但 `pss_bytes` 只来自
+当前 smaps 的 `Pss`。如果这 16 KiB 从未触页，smaps 里 `Pss: 0 kB`，则
+`virtual_bytes` 仍可能是 16384，但 `pss_bytes` 会是 0。
+
+再看一个“一个 VMA 被多个 mmap range 命中”的场景。内核可能合并相邻匿名映射，
+smaps 看到的是一个 16 KiB VMA，但 Perfetto 生命周期里保留了两次 mmap 来源：
+
+```text
+mmap A:
+  stack_id = 101
+  live range = [0x70000000, 0x70002000)  # 8 KiB
+
+mmap B:
+  stack_id = 202
+  live range = [0x70002000, 0x70004000)  # 8 KiB
+
+smaps VMA:
+  70000000-70004000 rw-p 00000000 00:00 0 [anon:merged]
+  Rss:              16 kB
+  Pss:              12 kB
+  Private_Dirty:     8 kB
+  Private_Clean:     4 kB
+```
+
+计算：
+
+```text
+vma_size = 16 KiB
+
+A overlap = 8 KiB
+B overlap = 8 KiB
+total_overlap = 16 KiB
+denominator = max(16 KiB, 16 KiB) = 16 KiB
+
+A ratio = 8 / 16 = 0.5
+B ratio = 8 / 16 = 0.5
+
+stack_id=101:
+  virtual_bytes       += 16 KiB * 0.5 = 8 KiB
+  pss_bytes           += 12 KiB * 0.5 = 6 KiB
+  private_dirty_bytes +=  8 KiB * 0.5 = 4 KiB
+  private_clean_bytes +=  4 KiB * 0.5 = 2 KiB
+
+stack_id=202:
+  virtual_bytes       += 8 KiB
+  pss_bytes           += 6 KiB
+  private_dirty_bytes += 4 KiB
+  private_clean_bytes += 2 KiB
+```
+
+重点是：这个 VMA 的 `Pss: 12 kB` 只被分出去一次。两个调用栈加起来仍是
+12 KiB，不会变成 24 KiB。
+
+再看一个部分重叠场景。mmap 请求了 64 KiB，但当前 smaps 只有其中 16 KiB 的
+VMA 有驻留页：
+
+```text
+mmap:
+  stack_id = 303
+  live range = [0x71000000, 0x71010000)  # 64 KiB
+
+smaps VMA:
+  71004000-71008000 rw-p 00000000 00:00 0 [anon:partial]
+  Pss: 8 kB
+  Rss: 16 kB
+```
+
+计算：
+
+```text
+vma_size = 16 KiB
+overlap = 16 KiB
+ratio = 1.0
+
+stack_id=303:
+  virtual_bytes += 16 KiB
+  pss_bytes     += 8 KiB
+  rss_bytes     += 16 KiB
+```
+
+这里不会因为 mmap 原始 length 是 64 KiB，就把 `virtual_bytes` 记成 64 KiB。
+当前实现统计的是“live mmap range 与当前 smaps VMA 的重叠部分”，没有对应
+smaps VMA 的地址段不会贡献 PSS/RSS，也不会贡献本次归因的 `virtual_bytes`。
 
 ### raw syscall 缺少 length 的兜底
 
@@ -776,6 +1103,165 @@ Speedscope sum(weights)
 
 如果 Speedscope 或 final_summary 的 PSS 大于同一快照原始 smaps PSS，优先怀疑
 同一 VMA 被多个调用栈重复归因，或使用了不匹配的 smaps 快照和 trace 时间轴。
+
+## 多周期归因结果怎么看
+
+多周期归因结果主要看 `mmap_phys_attribution.json`，不要用默认 Speedscope 判断
+增长/回落过程。默认 Speedscope 使用最后一个 smaps 快照的 `pss_bytes` 生成火焰图，
+适合看最终时刻“哪个调用栈占得最多”；Perfetto JSON 里的 counter 才能看每个
+smaps 周期的变化。
+
+查看路径：
+
+```text
+PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+可视化关系：
+
+```text
+多个 smaps 快照
+  -> 每个快照独立做一次 live mmap range 与 smaps VMA 地址重叠
+  -> 生成一个 total mmap PSS/RSS counter 点
+  -> 每个调用栈生成一个 mmap stack PSS counter 点
+
+Perfetto UI
+  -> 看 total 曲线：整体 mmap 物理占用是否上涨/回落
+  -> 看 stack 曲线：哪个 mmap 调用栈在某段时间增长
+  -> 点开 counter 样本：看 pss_bytes、rss_bytes、live_ranges 等数值
+  -> 点开同时间点 details 事件：看 smaps 文件、paths 和完整 stack
+```
+
+### Perfetto UI 查看
+
+用 Perfetto UI 打开 `mmap_phys_attribution.json` 后，重点看进程：
+
+```text
+mmap physical attribution
+```
+
+核心 counter：
+
+```text
+total mmap PSS/RSS
+  -> 每个 smaps 周期一个总量点。
+  -> args.pss_bytes 是该时刻所有 mmap 调用栈归因后的 PSS 汇总。
+  -> args.rss_bytes 是该时刻 RSS 汇总，辅助判断共享页和驻留规模。
+  -> args.live_ranges 是该时刻仍然 live 的 mmap range 数量。
+
+mmap stack PSS
+  -> 每个调用栈一条 counter 轨道。
+  -> args.pss_bytes 是该调用栈在当前 smaps 快照时刻的 PSS。
+  -> args.virtual_bytes 是该调用栈 live range 与当前 VMA 的虚拟地址重叠大小。
+  -> args.range_count 是该调用栈命中的 range/VMA 重叠次数。
+
+mmap snapshot details
+  -> 与 total mmap PSS/RSS 同时间点的 instant 事件。
+  -> args.smaps 是该周期对应的 smaps 原始文件。
+
+mmap stack details
+  -> 与 mmap stack PSS 同时间点、同 tid 的 instant 事件。
+  -> args.paths 是命中的 smaps VMA pathname 摘要。
+  -> args.stack 是完整 mmap 调用栈。
+```
+
+注意：`total mmap PSS/RSS` 和 `mmap stack PSS` 是 Chrome JSON counter
+事件，`args` 必须只放数值。`smaps`、`paths`、`stack` 这类字符串详情放在
+同时间点的 `mmap snapshot details` / `mmap stack details` instant 事件里。
+否则 trace_processor 会把字符串当作 counter 值解析失败，并报告
+`json_parser_failure`。
+
+判断方式：
+
+```text
+total mmap PSS/RSS 上涨
+  -> 当前 smaps 快照里，更多 mmap VMA 产生了真实驻留页，或共享页分摊增加。
+
+total mmap PSS/RSS 回落
+  -> munmap/mremap 后 live range 消失，或页面被回收、共享比例变化。
+
+live_ranges 增加但 pss_bytes 不涨
+  -> 可能只是 mmap 了虚拟地址，还没有触页；也可能映射存在但当前没有 PSS。
+
+某条 mmap stack PSS 上涨
+  -> 该调用栈建立的 live range 对应 VMA 在后续 smaps 快照中出现更多 PSS。
+
+pss_bytes 大幅跳变
+  -> 点开同时间点的 mmap snapshot details，记录 args.smaps，
+     再查看同一 smaps 文件中的 VMA 原始字段。
+```
+
+### 命令行查看
+
+查看每个 smaps 周期的总量变化：
+
+```bash
+jq '.traceEvents[]
+  | select(.name=="total mmap PSS/RSS")
+  | {
+      ts,
+      pss_bytes: .args.pss_bytes,
+      rss_bytes: .args.rss_bytes,
+      live_ranges: .args.live_ranges
+    }' PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+查看每个 smaps 周期对应的原始 smaps 文件：
+
+```bash
+jq '.traceEvents[]
+  | select(.name=="mmap snapshot details")
+  | {
+      ts,
+      smaps: .args.smaps
+    }' PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+查看每个调用栈在各周期的变化：
+
+```bash
+jq '.traceEvents[]
+  | select(.name=="mmap stack PSS")
+  | {
+      ts,
+      pss_bytes: .args.pss_bytes,
+      rss_bytes: .args.rss_bytes,
+      virtual_bytes: .args.virtual_bytes,
+      range_count: .args.range_count
+    }' PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+查看调用栈详情和命中的 VMA pathname：
+
+```bash
+jq '.traceEvents[]
+  | select(.name=="mmap stack details")
+  | {
+      ts,
+      stack_id: .args.stack_id,
+      paths: .args.paths,
+      stack: .args.stack
+    }' PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+只看 PSS 非零的调用栈周期点：
+
+```bash
+jq '.traceEvents[]
+  | select(.name=="mmap stack PSS")
+  | select((.args.pss_bytes // 0) > 0)
+  | {
+      ts,
+      pss_bytes: .args.pss_bytes,
+      rss_bytes: .args.rss_bytes,
+      virtual_bytes: .args.virtual_bytes,
+      range_count: .args.range_count
+    }' PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json
+```
+
+命令行输出里的 `ts` 是 Perfetto JSON counter 时间，单位是微秒。要回查原始
+smaps，优先使用同时间点 `mmap snapshot details` 里的 `smaps` 路径，而不是手动按
+`ts` 猜文件名。
 
 ## 结果怎么看
 
@@ -1115,6 +1601,8 @@ python3 -B -m unittest -v test_mmap_phys_analyzer.py
 13. 主分析 syscall 查询会先按目标 pid 缩小 ftrace 事件，再扫描 args。
 14. mmap 主分析会按 heap_profile.py 风格把 `traceconv symbolize` 的符号包拼成 `symbolized-trace`。
 15. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
+16. smaps 文件名中的设备 uptime ns 不会在 auto 模式下被误判为 ms，避免 Chrome JSON 时间戳溢出。
+17. Chrome JSON counter 事件只输出数值 args，字符串详情放到 instant details 事件，避免 Perfetto 导入时报 `json_parser_failure`。
 ```
 
 保留单元测试落盘输出：

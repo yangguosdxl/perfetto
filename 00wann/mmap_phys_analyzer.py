@@ -601,14 +601,19 @@ def parse_timestamp_from_name(path: str, unit: str) -> int:
     return raw * 1000 * 1000
   if unit == "s":
     return raw * 1000 * 1000 * 1000
-  # auto：13 位当 ms，16 位当 us，19 位当 ns，其余按秒。
+  # auto：兼容 epoch 时间戳和 collect_smaps() 写入的设备 uptime 纳秒。
+  # 14 位 uptime ns 如果误按 ms 放大，会超过 Perfetto int64 ns 范围，
+  # Chrome JSON 导入时会溢出成负时间戳并触发 trace_sorter_negative_timestamp_dropped。
   digits = len(str(raw))
   if digits >= 18:
     return raw
   if digits >= 15:
     return raw * 1000
   if digits >= 12:
-    return raw * 1000 * 1000
+    as_ms_ns = raw * 1000 * 1000
+    if as_ms_ns <= 9_000_000_000_000_000_000:
+      return as_ms_ns
+    return raw
   return raw * 1000 * 1000 * 1000
 
 
@@ -811,6 +816,16 @@ def build_chrome_trace(snapshots: List[Snapshot],
             "pss_bytes": int(total_pss),
             "rss_bytes": int(total_rss),
             "live_ranges": len(ranges),
+        }
+    })
+    trace_events.append({
+        "ph": "i",
+        "s": "t",
+        "name": "mmap snapshot details",
+        "pid": pid,
+        "tid": 0,
+        "ts": snapshot.ts / 1000,
+        "args": {
             "smaps": snapshot.path,
         }
     })
@@ -843,6 +858,17 @@ def build_chrome_trace(snapshots: List[Snapshot],
               "shared_dirty_bytes": int(stat.shared_dirty_bytes),
               "shared_clean_bytes": int(stat.shared_clean_bytes),
               "range_count": stat.range_count,
+          }
+      })
+      trace_events.append({
+          "ph": "i",
+          "s": "t",
+          "name": "mmap stack details",
+          "pid": pid,
+          "tid": tid_by_stack[stat.stack_id],
+          "ts": snapshot.ts / 1000,
+          "args": {
+              "stack_id": stat.stack_id,
               "paths": "; ".join(sorted(stat.paths)[:8]),
               "stack": stack.text,
           }

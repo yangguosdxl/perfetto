@@ -155,6 +155,16 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         stacks[10].frames,
         ["InlineAllocator [libgame.so]", "RealMmapCaller [libgame.so]"])
 
+  def test_auto_smaps_timestamp_treats_collector_uptime_filename_as_ns(self):
+    """采集脚本写入的 uptime 纳秒文件名不能被 auto 误判为毫秒。"""
+    timestamp_ns = 50596950000000
+
+    parsed = analyzer.parse_timestamp_from_name(
+        f"/tmp/smaps/{timestamp_ns}.smaps",
+        unit="auto")
+
+    self.assertEqual(parsed, timestamp_ns)
+
   def test_symbolize_trace_concats_traceconv_symbols_like_heap_profile(self):
     """mmap 主分析应像 heap_profile.py 一样拼接 traceconv 符号包。"""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -936,8 +946,28 @@ TOTAL SWAP PSS: 7,000K
       self.assertEqual(args["rss_bytes"], 12 * 1024)
       self.assertEqual(args["virtual_bytes"], 12 * 1024)
       self.assertEqual(args["private_dirty_bytes"], 12 * 1024)
-      self.assertIn("AllocateByMmap", args["stack"])
-      self.assertIn("[anon:mmap-test]", args["paths"])
+
+      # Chrome JSON counter 事件的 args 必须保持数值，否则 Perfetto 会报
+      # json_parser_failure；字符串详情放到同时间点的 instant 事件。
+      for event in output["traceEvents"]:
+        if event.get("ph") == "C":
+          for value in event.get("args", {}).values():
+            self.assertIsInstance(value, (int, float))
+
+      details = [
+          event for event in output["traceEvents"]
+          if event.get("name") == "mmap stack details"
+      ]
+      self.assertEqual(len(details), 1)
+      self.assertIn("AllocateByMmap", details[0]["args"]["stack"])
+      self.assertIn("[anon:mmap-test]", details[0]["args"]["paths"])
+
+      snapshot_details = [
+          event for event in output["traceEvents"]
+          if event.get("name") == "mmap snapshot details"
+      ]
+      self.assertEqual(len(snapshot_details), 1)
+      self.assertEqual(snapshot_details[0]["args"]["smaps"], smaps_path)
 
       # 输出必须是 Perfetto UI 可加载的 Chrome JSON trace 基本结构。
       self.assertIn("traceEvents", output)
