@@ -52,6 +52,9 @@ Perfetto android.heapprofd
 run_mmap_phys_profile.sh
   -> 默认入口脚本，使用写死默认配置启动采集和分析。
 
+run_mmap_phys_analyze_latest.sh
+  -> 离线分析包装脚本：默认使用最近一次 mmap 采集目录，补齐 fs.ini 分类和常用输出路径。
+
 collect_mmap_phys_data.py
   -> 采集脚本：启动 Perfetto，周期拉 smaps，调用离线分析器，并生成内存总量验证报告。
 
@@ -1524,7 +1527,47 @@ meminfo.native_heap_pss_plus_swap_pss_bytes
 
 ## 离线单独分析
 
-如果已经有 trace 和 smaps，可以直接运行：
+如果已经有 trace 和 smaps，优先使用离线包装脚本分析最近一次采集：
+
+```bash
+./run_mmap_phys_analyze_latest.sh
+```
+
+包装脚本默认行为：
+
+```text
+PerfData/mmap_phys/<最近时间戳>/
+  -> 优先读取 symbolized-trace；没有时回退 mmap_trace.perfetto-trace
+  -> 读取 smaps/
+  -> 未传 --pid 时，按 MMAP_PHYS_APP 从 trace 中查询目标 pid
+  -> 输出 mmap_phys_attribution.json
+  -> 输出 mmap_phys_attribution.speedscope.json
+  -> 输出 mmap_classification_summary.xlsx
+  -> 输出 mmap_classification_summary.speedscope.json
+  -> 输出 mmap_categories/*.speedscope.json
+```
+
+默认追加给 `mmap_phys_analyzer.py` 的参数：
+
+```bash
+--classify-config heap_analyzer/fs.ini \
+--classify-speedscope-dir mmap_categories \
+--top-n 0
+```
+
+用户参数会追加在默认参数之后，因此可以覆盖本次分析口径：
+
+```bash
+./run_mmap_phys_analyze_latest.sh --pid 1234 --top-n 25
+```
+
+如果目标进程不是默认包名，可以设置环境变量让 wrapper 自动查询 pid：
+
+```bash
+MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
+```
+
+需要完全指定 trace、smaps 或输出路径时，也可以继续直接运行底层分析器：
 
 ```bash
 python3 -u -B mmap_phys_analyzer.py \
@@ -1581,6 +1624,7 @@ Python 内存中展开 stack_profile_callsite parent 链和 inline frame
 
 ```bash
 python3 -B -m unittest -v test_mmap_phys_analyzer.py
+bash test_run_mmap_phys_analyze_latest.sh
 ```
 
 覆盖内容：
@@ -1603,6 +1647,7 @@ python3 -B -m unittest -v test_mmap_phys_analyzer.py
 15. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
 16. smaps 文件名中的设备 uptime ns 不会在 auto 模式下被误判为 ms，避免 Chrome JSON 时间戳溢出。
 17. Chrome JSON counter 事件只输出数值 args，字符串详情放到 instant details 事件，避免 Perfetto 导入时报 `json_parser_failure`。
+18. run_mmap_phys_analyze_latest.sh 默认选择最近的 `symbolized-trace`，自动查询 pid，并允许用户参数覆盖默认输出口径。
 ```
 
 保留单元测试落盘输出：
