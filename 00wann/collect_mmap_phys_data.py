@@ -389,6 +389,44 @@ def pull_trace(device_trace: str, host_trace: str):
   print(f"trace 已保存: {host_trace}")
 
 
+def symbolize_trace(traceconv: Optional[str], trace_path: str, output_dir: str) -> str:
+  """按 heap_profile.py 的方式把 traceconv 符号包拼回 trace。"""
+  if not traceconv:
+    print("跳过 trace 符号化：未指定 --traceconv", file=sys.stderr)
+    return trace_path
+  binary_path = os.getenv("PERFETTO_BINARY_PATH")
+  if not binary_path:
+    print("跳过 trace 符号化：未设置 PERFETTO_BINARY_PATH，"
+          "libil2cpp.so 等业务 so 无法自动解析", file=sys.stderr)
+    return trace_path
+
+  symbols_path = os.path.join(output_dir, "symbols")
+  symbolized_path = os.path.join(output_dir, "symbolized-trace")
+  print("+ " + " ".join([traceconv, "symbolize", trace_path]) +
+        f" > {symbols_path}")
+  with open(symbols_path, "wb") as symbols:
+    ret = subprocess.call(
+        [traceconv, "symbolize", trace_path],
+        env=dict(os.environ, PERFETTO_BINARY_PATH=binary_path),
+        stdout=symbols)
+  if ret != 0:
+    print(f"WARN: traceconv symbolize 失败，退出码={ret}，继续使用原始 trace",
+          file=sys.stderr)
+    return trace_path
+
+  # Perfetto 的符号包是追加 packet；与 raw trace 拼接后 trace_processor 可直接读取。
+  with open(symbolized_path, "wb") as output:
+    for path in (trace_path, symbols_path):
+      with open(path, "rb") as source:
+        while True:
+          chunk = source.read(1024 * 1024)
+          if not chunk:
+            break
+          output.write(chunk)
+  print(f"符号化 trace 已保存: {symbolized_path}")
+  return symbolized_path
+
+
 def parse_trace_processor_csv(output: str, required_columns=("name", "idx", "value")):
   """从 trace_processor 日志混合输出里截取 CSV 查询结果。"""
   # trace_processor 的耗时日志有时会直接贴在 CSV 最后一行后面，先按日志前缀截断。
@@ -1070,6 +1108,7 @@ def parse_args():
   parser.add_argument("--no-analyze", action="store_true",
                       help="只采集 trace 和 smaps，不运行离线分析器")
   parser.add_argument("--trace-processor", help="传给 mmap_phys_analyzer.py 的 trace_processor 路径")
+  parser.add_argument("--traceconv", help="traceconv 路径；主功能用于生成 symbolized-trace")
   parser.add_argument("--analyzer", help="mmap_phys_analyzer.py 路径")
   return parser.parse_args()
 
@@ -1127,12 +1166,17 @@ def run_collection(args, start_target_after_perfetto: bool = False):
     print("跳过 meminfo 对比，dumpsys meminfo 失败:", file=sys.stderr)
     print(exc.output.decode("utf-8", errors="replace"), file=sys.stderr)
 
+  analysis_trace_path = trace_path
+  if args.mmap_callstacks:
+    analysis_trace_path = symbolize_trace(
+        getattr(args, "traceconv", None), trace_path, args.output)
+
   trace_health = None
   if args.mmap_callstacks:
     trace_health = check_trace_health(args, trace_path)
 
   if args.mmap_callstacks and not args.no_analyze:
-    run_analyzer(args, pid, trace_path, smaps_dir)
+    run_analyzer(args, pid, analysis_trace_path, smaps_dir)
   elif not args.mmap_callstacks and not args.no_analyze:
     print("跳过 mmap 调用栈分析：当前验证模式未采集 mmap 调用栈")
 

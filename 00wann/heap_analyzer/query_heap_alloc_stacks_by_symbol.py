@@ -12,16 +12,15 @@ import csv
 import gzip
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
 import time
-import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Iterable
-from xml.sax.saxutils import escape
+
+import classification as common_classification
 
 
 DEFAULT_TRACE = (
@@ -74,24 +73,9 @@ class Allocation:
   net_alloc_bytes: int
 
 
-@dataclass(frozen=True)
-class ClassificationRule:
-  name: str
-  keywords: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ClassifiedAllocation:
-  allocation: Allocation
-  stack_leaf_to_root: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class HierarchyEntry:
-  path: tuple[str, ...]
-  keywords: tuple[str, ...]
-  items: tuple[ClassifiedAllocation, ...]
-  is_leaf: bool
+ClassificationRule = common_classification.ClassificationRule
+ClassifiedAllocation = common_classification.ClassifiedItem
+HierarchyEntry = common_classification.HierarchyEntry
 
 
 def log(message: str) -> None:
@@ -301,47 +285,11 @@ def descendants(start_nodes: Iterable[int], children: dict[int | None, list[int]
 
 
 def parse_classification_config(path: str) -> list[ClassificationRule]:
-  """解析 fs.ini 分类规则。
-
-  规则格式：
-    # 分类显示名称
-    keyword1
-    keyword2
-  空行会被忽略；没有关键字的分类不会参与匹配。
-  """
-  rules: list[ClassificationRule] = []
-  current_name: str | None = None
-  current_keywords: list[str] = []
-
-  def flush_current() -> None:
-    nonlocal current_name, current_keywords
-    if current_name is not None:
-      keywords = tuple(keyword for keyword in current_keywords if keyword)
-      if keywords:
-        rules.append(ClassificationRule(current_name, keywords))
-    current_name = None
-    current_keywords = []
-
-  with open(path, encoding="utf-8-sig") as config:
-    for raw_line in config:
-      line = raw_line.strip()
-      if not line:
-        continue
-      if line.startswith("#"):
-        flush_current()
-        current_name = line[1:].strip()
-        current_keywords = []
-      elif current_name is not None:
-        current_keywords.append(line)
-      else:
-        raise ValueError(f"分类关键字缺少分类名：{line}")
-  flush_current()
-  return rules
+  return common_classification.parse_classification_config(path)
 
 
 def sanitize_filename(name: str) -> str:
-  sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
-  return sanitized.strip("._") or "category"
+  return common_classification.sanitize_filename(name)
 
 
 def default_output_dir(trace: str) -> str:
@@ -370,9 +318,7 @@ def resolve_output_dir(trace: str, path: str | None) -> str:
 
 
 def ensure_parent_dir(path: str) -> None:
-  parent = os.path.dirname(os.path.abspath(path))
-  if parent:
-    os.makedirs(parent, exist_ok=True)
+  common_classification.ensure_parent_dir(path)
 
 
 def is_explicit_arg(argv: list[str], name: str) -> bool:
@@ -410,7 +356,7 @@ def normalize_output_paths(args: argparse.Namespace) -> str:
 
 
 def category_path(name: str) -> tuple[str, ...]:
-  return tuple(part.strip() for part in name.split("/") if part.strip())
+  return common_classification.category_path(name)
 
 
 def classify_allocations(
@@ -424,25 +370,11 @@ def classify_allocations(
 
   每个 allocation 最多属于一个分类；没有命中的进入 remaining。
   """
-  remaining: list[ClassifiedAllocation] = []
-  for allocation in allocations:
-    stack = tuple(stack_labels_leaf_to_root(
-        allocation.callsite_id, callsites, frame_labels))
-    remaining.append(ClassifiedAllocation(allocation, stack))
-
-  classified: list[tuple[ClassificationRule, list[ClassifiedAllocation]]] = []
-  for rule in rules:
-    matched: list[ClassifiedAllocation] = []
-    next_remaining: list[ClassifiedAllocation] = []
-    for item in remaining:
-      stack_text = "\n".join(item.stack_leaf_to_root)
-      if any(keyword in stack_text for keyword in rule.keywords):
-        matched.append(item)
-      else:
-        next_remaining.append(item)
-    classified.append((rule, matched))
-    remaining = next_remaining
-  return classified, remaining
+  return common_classification.classify_items(
+      allocations,
+      rules,
+      lambda allocation: stack_labels_leaf_to_root(
+          allocation.callsite_id, callsites, frame_labels))
 
 
 def build_hierarchy_entries(
@@ -454,41 +386,7 @@ def build_hierarchy_entries(
   叶子节点对应 fs.ini 中的完整分类；父节点聚合所有子分类。因为分类阶段
   已经保证每个 allocation 只命中一个叶子分类，所以父节点可以直接累加子项。
   """
-  items_by_path: dict[tuple[str, ...], list[ClassifiedAllocation]] = defaultdict(list)
-  keywords_by_leaf: dict[tuple[str, ...], tuple[str, ...]] = {}
-  leaf_paths: set[tuple[str, ...]] = set()
-  ordered_paths: list[tuple[str, ...]] = []
-
-  def remember(path: tuple[str, ...]) -> None:
-    if path not in items_by_path:
-      ordered_paths.append(path)
-
-  for rule, items in classified:
-    path = category_path(rule.name)
-    if not path:
-      continue
-    leaf_paths.add(path)
-    keywords_by_leaf[path] = rule.keywords
-    for depth in range(1, len(path) + 1):
-      prefix = path[:depth]
-      remember(prefix)
-      items_by_path[prefix].extend(items)
-
-  if remaining:
-    remaining_path = ("remaining",)
-    remember(remaining_path)
-    leaf_paths.add(remaining_path)
-    items_by_path[remaining_path].extend(remaining)
-
-  return [
-      HierarchyEntry(
-          path=path,
-          keywords=keywords_by_leaf.get(path, ()),
-          items=tuple(items_by_path[path]),
-          is_leaf=path in leaf_paths,
-      )
-      for path in ordered_paths
-  ]
+  return common_classification.build_hierarchy_entries(classified, remaining)
 
 
 def sum_allocations(allocations: Iterable[Allocation]) -> tuple[int, int, int]:
@@ -614,9 +512,9 @@ def write_classification_speedscope_files(
   os.makedirs(output_dir, exist_ok=True)
   for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
-    allocations = [item.allocation for item in entry.items]
+    allocations = [item.item for item in entry.items]
     precomputed = {
-        item.allocation.callsite_id: item.stack_leaf_to_root
+        item.item.callsite_id: item.stack_leaf_to_root
         for item in entry.items
     }
     output_path = (
@@ -892,12 +790,12 @@ def build_classification_label_map(
   for rule, items in classified:
     category = rule.name
     for item in items:
-      labels_by_callsite[item.allocation.callsite_id] = {
+      labels_by_callsite[item.item.callsite_id] = {
           "category": category,
           "category_type": "classified",
       }
   for item in remaining:
-    labels_by_callsite[item.allocation.callsite_id] = {
+    labels_by_callsite[item.item.callsite_id] = {
         "category": "remaining",
         "category_type": "remaining",
     }
@@ -995,9 +893,9 @@ def write_classification_pprof_files(
   os.makedirs(output_dir, exist_ok=True)
   for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
-    allocations = [item.allocation for item in entry.items]
+    allocations = [item.item for item in entry.items]
     labels = {
-        item.allocation.callsite_id: {
+        item.item.callsite_id: {
             "category": full_name,
             "category_type": "remaining" if entry.path == ("remaining",) else "classified",
         }
@@ -1033,7 +931,7 @@ def build_classification_summary(
   classified_bytes = 0
   for index, (rule, items) in enumerate(classified, start=1):
     callsite_count, net_count, net_bytes = sum_allocations(
-        item.allocation for item in items)
+        item.item for item in items)
     classified_count += net_count
     classified_bytes += net_bytes
     categories.append({
@@ -1047,7 +945,7 @@ def build_classification_summary(
     })
 
   remaining_callsite_count, remaining_count, remaining_bytes = sum_allocations(
-      item.allocation for item in remaining)
+      item.item for item in remaining)
   return {
       "symbol": symbol,
       "all_allocations": all_allocations,
@@ -1074,175 +972,16 @@ def build_classification_summary(
 
 
 def build_summary_hierarchy_entries(summary: dict[str, object]) -> list[dict[str, object]]:
-  items_by_path: dict[tuple[str, ...], dict[str, object]] = {}
-  leaf_paths: set[tuple[str, ...]] = set()
-  ordered_paths: list[tuple[str, ...]] = []
-
-  def remember(path: tuple[str, ...]) -> dict[str, object]:
-    existing = items_by_path.get(path)
-    if existing is not None:
-      return existing
-    ordered_paths.append(path)
-    item = {
-        "path": path,
-        "keywords": [],
-        "matched_allocation_callsites": 0,
-        "net_alloc_count": 0,
-        "net_alloc_bytes": 0,
-    }
-    items_by_path[path] = item
-    return item
-
-  for category in summary["categories"]:
-    path = category_path(str(category["name"]))
-    if not path:
-      continue
-    leaf_paths.add(path)
-    for depth in range(1, len(path) + 1):
-      prefix = path[:depth]
-      item = remember(prefix)
-      item["matched_allocation_callsites"] += int(category["matched_allocation_callsites"])
-      item["net_alloc_count"] += int(category["net_alloc_count"])
-      item["net_alloc_bytes"] += int(category["net_alloc_bytes"])
-    leaf_item = items_by_path[path]
-    leaf_item["keywords"] = list(category["keywords"])
-
-  remaining = summary["remaining"]
-  remaining_path = ("remaining",)
-  leaf_paths.add(remaining_path)
-  remaining_item = remember(remaining_path)
-  remaining_item["matched_allocation_callsites"] = int(remaining["matched_allocation_callsites"])
-  remaining_item["net_alloc_count"] = int(remaining["net_alloc_count"])
-  remaining_item["net_alloc_bytes"] = int(remaining["net_alloc_bytes"])
-
-  entries = []
-  for path in ordered_paths:
-    item = items_by_path[path]
-    net_bytes = int(item["net_alloc_bytes"])
-    entries.append({
-        **item,
-        "is_leaf": path in leaf_paths,
-        "net_alloc_mib": net_bytes / 1048576.0,
-    })
-  return entries
-
-
-def excel_column_name(index: int) -> str:
-  name = ""
-  while index:
-    index, remainder = divmod(index - 1, 26)
-    name = chr(ord("A") + remainder) + name
-  return name
-
-
-def xlsx_cell(row_index: int, column_index: int, value: object) -> str:
-  ref = f"{excel_column_name(column_index)}{row_index}"
-  if value is None:
-    return f'<c r="{ref}"/>'
-  if isinstance(value, bool):
-    text = "TRUE" if value else "FALSE"
-    return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
-  if isinstance(value, (int, float)) and not isinstance(value, bool):
-    return f'<c r="{ref}"><v>{value}</v></c>'
-  text = escape(str(value))
-  return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
-
-
-def xlsx_sheet(rows: list[list[object]]) -> str:
-  row_xml = []
-  for row_index, row in enumerate(rows, start=1):
-    cells = [
-        xlsx_cell(row_index, column_index, value)
-        for column_index, value in enumerate(row, start=1)
-    ]
-    row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
-  return (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-      '<sheetData>'
-      f'{"".join(row_xml)}'
-      '</sheetData>'
-      '</worksheet>'
-  )
-
-
-def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
-  workbook_sheets = []
-  workbook_rels = []
-  overrides = [
-      '<Override PartName="/xl/workbook.xml" '
-      'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
-      '<Override PartName="/xl/styles.xml" '
-      'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+  entries = common_classification.build_summary_hierarchy_entries(
+      summary,
+      ("matched_allocation_callsites", "net_alloc_count", "net_alloc_bytes"))
+  return [
+      {
+          **entry,
+          "net_alloc_mib": int(entry["net_alloc_bytes"]) / 1048576.0,
+      }
+      for entry in entries
   ]
-  for index, (name, _rows) in enumerate(sheets, start=1):
-    safe_name = escape(name[:31])
-    workbook_sheets.append(
-        f'<sheet name="{safe_name}" sheetId="{index}" r:id="rId{index}"/>')
-    workbook_rels.append(
-        f'<Relationship Id="rId{index}" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-        f'Target="worksheets/sheet{index}.xml"/>')
-    overrides.append(
-        f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
-  styles_rid = len(sheets) + 1
-  workbook_rels.append(
-      f'<Relationship Id="rId{styles_rid}" '
-      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
-      'Target="styles.xml"/>')
-
-  content_types = (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-      '<Default Extension="xml" ContentType="application/xml"/>'
-      f'{"".join(overrides)}'
-      '</Types>'
-  )
-  root_rels = (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-      '<Relationship Id="rId1" '
-      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-      'Target="xl/workbook.xml"/>'
-      '</Relationships>'
-  )
-  workbook = (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-      '<sheets>'
-      f'{"".join(workbook_sheets)}'
-      '</sheets>'
-      '</workbook>'
-  )
-  rels = (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-      f'{"".join(workbook_rels)}'
-      '</Relationships>'
-  )
-  styles = (
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-      '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-      '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
-      '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
-      '<borders count="1"><border/></borders>'
-      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-      '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
-      '</styleSheet>'
-  )
-
-  ensure_parent_dir(path)
-  with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("[Content_Types].xml", content_types)
-    archive.writestr("_rels/.rels", root_rels)
-    archive.writestr("xl/workbook.xml", workbook)
-    archive.writestr("xl/_rels/workbook.xml.rels", rels)
-    archive.writestr("xl/styles.xml", styles)
-    for index, (_name, rows) in enumerate(sheets, start=1):
-      archive.writestr(f"xl/worksheets/sheet{index}.xml", xlsx_sheet(rows))
 
 
 def write_classification_summary(path: str, summary: dict[str, object]) -> None:
@@ -1295,7 +1034,8 @@ def write_classification_summary(path: str, summary: dict[str, object]) -> None:
         entry["net_alloc_mib"],
     ])
 
-  write_xlsx(path, [("Summary", summary_rows), ("Tree", category_rows)])
+  common_classification.write_xlsx(
+      path, [("Summary", summary_rows), ("Tree", category_rows)])
   log(f"分类统计输出完成：{path}")
 
 
@@ -1456,7 +1196,7 @@ def main() -> int:
       print(f"  rule_count: {len(rules)}")
       for index, (rule, items) in enumerate(classified, start=1):
         callsite_count, net_count, net_bytes = sum_allocations(
-            item.allocation for item in items)
+            item.item for item in items)
         classified_total_count += net_count
         classified_total_bytes += net_bytes
         print(f"  #{index} {rule.name}")
@@ -1466,7 +1206,7 @@ def main() -> int:
         print(f"    net_alloc_bytes: {net_bytes}")
         print(f"    net_alloc_mib: {net_bytes / 1048576.0:.3f}")
       remaining_callsite_count, remaining_count, remaining_bytes = sum_allocations(
-          item.allocation for item in remaining)
+          item.item for item in remaining)
       print("  remaining")
       print(f"    matched_allocation_callsites: {remaining_callsite_count}")
       print(f"    net_alloc_count: {remaining_count}")

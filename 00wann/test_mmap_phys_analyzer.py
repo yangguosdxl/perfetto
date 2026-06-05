@@ -106,6 +106,79 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(events[0].args["arg0"], 0x10000000)
     self.assertEqual(events[0].args["arg1"], 0x3000)
 
+  def test_load_syscalls_filters_target_process_before_args(self):
+    """主分析查询 syscall 时应先按目标 pid 缩小 ftrace，再扫描 args。"""
+    seen_sql = []
+
+    def fake_tp_query(_tp, _trace, sql):
+      seen_sql.append(sql)
+      return []
+
+    with mock.patch.object(analyzer, "run_tp_query", side_effect=fake_tp_query):
+      self.assertEqual(analyzer.load_syscalls("fake-tp", "fake-trace", pid=1234), [])
+
+    self.assertEqual(len(seen_sql), 1)
+    sql = seen_sql[0]
+    self.assertIn("target_ftrace_events AS", sql)
+    self.assertIn("LEFT JOIN __intrinsic_process pr ON th.upid = pr.id", sql)
+    self.assertIn("WHERE (pr.pid = 1234 OR th.tid = 1234)", sql)
+    self.assertIn("FROM target_ftrace_events tfe", sql)
+    self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id", sql)
+    self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id", sql)
+
+  def test_load_stacks_prefers_stack_profile_symbol_names(self):
+    """调用栈展示应把 symbol_set_id 的 inline 符号拆成清晰 frame。"""
+    def fake_tp_query(_tp, _trace, sql):
+      if "stack_profile_symbol" in sql:
+        return [
+            {"symbol_set_id": "77", "id": "1", "name": "InlineAllocator"},
+            {"symbol_set_id": "77", "id": "2", "name": "RealMmapCaller"},
+        ]
+      if "__intrinsic_stack_profile_callsite" in sql:
+        return [
+            {
+                "id": "10",
+                "parent_id": "-1",
+                "frame_name": "0xabc",
+                "deobfuscated_name": "",
+                "mapping_name": "/data/app/libgame.so",
+                "rel_pc": "16",
+                "symbol_set_id": "77",
+            }
+        ]
+      return []
+
+    with mock.patch.object(analyzer, "run_tp_query", side_effect=fake_tp_query):
+      stacks = analyzer.load_stacks("fake-tp", "fake-trace")
+
+    self.assertEqual(
+        stacks[10].frames,
+        ["InlineAllocator [libgame.so]", "RealMmapCaller [libgame.so]"])
+
+  def test_symbolize_trace_concats_traceconv_symbols_like_heap_profile(self):
+    """mmap 主分析应像 heap_profile.py 一样拼接 traceconv 符号包。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      raw_trace = os.path.join(tmpdir, "mmap_trace.perfetto-trace")
+      with open(raw_trace, "wb") as fd:
+        fd.write(b"raw-trace")
+
+      calls = []
+
+      def fake_call(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        kwargs["stdout"].write(b"symbol-packets")
+        return 0
+
+      with mock.patch.dict(os.environ, {"PERFETTO_BINARY_PATH": "/symbols"}), \
+          mock.patch.object(collector.subprocess, "call", side_effect=fake_call):
+        symbolized = collector.symbolize_trace("traceconv", raw_trace, tmpdir)
+
+      self.assertEqual(symbolized, os.path.join(tmpdir, "symbolized-trace"))
+      with open(symbolized, "rb") as fd:
+        self.assertEqual(fd.read(), b"raw-tracesymbol-packets")
+      self.assertEqual(calls[0][0], ["traceconv", "symbolize", raw_trace])
+      self.assertEqual(calls[0][1]["env"]["PERFETTO_BINARY_PATH"], "/symbols")
+
   def test_perfetto_config_collects_raw_syscall_enter_and_exit(self):
     """采集 mmap 归因必须同时拿到 syscall 参数和返回值。"""
     config = collector.build_perfetto_config(
@@ -254,6 +327,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           use_su=False,
           no_analyze=False,
           trace_processor="tp",
+          traceconv="traceconv",
           analyzer="analyzer.py")
       calls = []
 
@@ -272,6 +346,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           mock.patch.object(collector, "pull_trace", record("pull_trace")), \
           mock.patch.object(collector, "capture_meminfo",
                             record("capture_meminfo", os.path.join(tmpdir, "dumpsys_meminfo.txt"))), \
+          mock.patch.object(collector, "symbolize_trace",
+                            record("symbolize_trace", os.path.join(tmpdir, "symbolized-trace"))), \
           mock.patch.object(collector, "check_trace_health",
                             record("check_trace_health", {})), \
           mock.patch.object(collector, "run_analyzer", record("run_analyzer")), \
@@ -280,10 +356,59 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         self.assertEqual(collector.main(), 0)
 
     self.assertIn("capture_meminfo", calls)
+    self.assertLess(calls.index("capture_meminfo"), calls.index("symbolize_trace"))
     self.assertLess(calls.index("capture_meminfo"), calls.index("check_trace_health"))
     self.assertLess(calls.index("capture_meminfo"), calls.index("run_analyzer"))
     self.assertLess(calls.index("capture_meminfo"),
                     calls.index("collect_memory_validation"))
+
+  def test_run_collection_analyzes_symbolized_trace_when_callstacks_enabled(self):
+    """主功能生成 symbolized-trace 后，离线分析必须读取符号化 trace。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          duration_ms=75000,
+          smaps_interval_ms=1000,
+          output=tmpdir,
+          wait_timeout_s=120,
+          buffer_kb=262144,
+          perf_ring_buffer_pages=8192,
+          perf_ring_buffer_read_period_ms=100,
+          collect_malloc=True,
+          malloc_sampling_interval_bytes=4096,
+          malloc_shmem_size_bytes=8 * 1024 * 1024,
+          mmap_callstacks=True,
+          no_ftrace=False,
+          no_kernel_frames=False,
+          no_guardrails=False,
+          use_su=False,
+          no_analyze=False,
+          trace_processor="tp",
+          traceconv="traceconv",
+          analyzer="analyzer.py")
+      analyzed_traces = []
+
+      def fake_run_analyzer(_args, _pid, trace_path, _smaps_dir):
+        analyzed_traces.append(trace_path)
+
+      with mock.patch.object(collector, "wait_for_pid", return_value=1234), \
+          mock.patch.object(collector, "write_config"), \
+          mock.patch.object(collector, "start_perfetto", return_value=5678), \
+          mock.patch.object(collector, "collect_smaps"), \
+          mock.patch.object(collector, "pull_trace"), \
+          mock.patch.object(collector, "symbolize_trace",
+                            return_value=os.path.join(tmpdir, "symbolized-trace")), \
+          mock.patch.object(collector, "capture_meminfo",
+                            return_value=os.path.join(tmpdir, "dumpsys_meminfo.txt")), \
+          mock.patch.object(collector, "check_trace_health", return_value={}), \
+          mock.patch.object(collector, "run_analyzer",
+                            side_effect=fake_run_analyzer), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            return_value={"trace_health": {}}):
+        result = collector.run_collection(args)
+
+    self.assertEqual(result["status"], 0)
+    self.assertEqual(analyzed_traces, [os.path.join(tmpdir, "symbolized-trace")])
 
   def test_main_no_mmap_callstacks_restarts_app_before_validation(self):
     """无栈验证应先重启目标 App，并让 Perfetto 先于 App 启动。"""
@@ -774,8 +899,9 @@ TOTAL SWAP PSS: 7,000K
           syscalls, samples, stack_window_ns=10_000_000)
       snapshots = analyzer.load_snapshots(
           smaps_dir, pid=1234, unit="ns", offset_ns=0)
-      output, summary_items = analyzer.build_chrome_trace(
+      output, summary_items, all_summary_items = analyzer.build_chrome_trace(
           snapshots, lifecycle, stacks, top_n=10)
+      self.assertEqual(summary_items, all_summary_items)
       output_path = os.path.join(tmpdir, "mmap_phys_attribution_test.json")
       with open(output_path, "w", encoding="utf-8") as fd:
         json.dump(output, fd, ensure_ascii=False)
@@ -856,10 +982,11 @@ TOTAL SWAP PSS: 7,000K
     ]
     stacks = {10: analyzer.Stack(10, ["AllocateByRawMmap"])}
 
-    output, summary = analyzer.build_chrome_trace(
+    output, summary, all_summary = analyzer.build_chrome_trace(
         [snapshot], lifecycle, stacks, top_n=10)
 
     self.assertEqual(summary[0]["pss_bytes"], 12 * 1024)
+    self.assertEqual(summary, all_summary)
     self.assertEqual(summary[0]["rss_bytes"], 12 * 1024)
     self.assertEqual(summary[0]["virtual_bytes"], 12 * 1024)
     self.assertIn("AllocateByRawMmap", output["metadata"]["final_summary"][0]["stack"])
@@ -900,13 +1027,113 @@ TOTAL SWAP PSS: 7,000K
         11: analyzer.Stack(11, ["SecondRawMmap"]),
     }
 
-    _output, summary = analyzer.build_chrome_trace(
+    _output, summary, all_summary = analyzer.build_chrome_trace(
         [snapshot], lifecycle, stacks, top_n=10)
 
     self.assertEqual(sum(item["pss_bytes"] for item in summary), 12 * 1024)
+    self.assertEqual(summary, all_summary)
     self.assertEqual(sum(item["rss_bytes"] for item in summary), 12 * 1024)
     self.assertEqual(sum(item["virtual_bytes"] for item in summary), 12 * 1024)
     self.assertEqual({item["pss_bytes"] for item in summary}, {6 * 1024})
+
+  def test_build_chrome_trace_keeps_full_summary_for_classification(self):
+    """分类数据源应等价于 --top-n 0，不受普通输出 top_n 截断。"""
+    snapshot = analyzer.Snapshot(
+        ts=2000,
+        pid=1234,
+        path="fake.smaps",
+        vmas=[
+            analyzer.SmapsVma(
+                start=0x10000000,
+                end=0x10001000,
+                pathname="[anon:first]",
+                rss_kb=4,
+                pss_kb=4),
+            analyzer.SmapsVma(
+                start=0x20000000,
+                end=0x20002000,
+                pathname="[anon:second]",
+                rss_kb=8,
+                pss_kb=8),
+        ])
+    lifecycle = [
+        (1500, "mmap", {
+            "pid": 1234,
+            "addr": 0x10000000,
+            "size": 0x1000,
+            "stack_id": 10,
+            "path": "",
+        }),
+        (1501, "mmap", {
+            "pid": 1234,
+            "addr": 0x20000000,
+            "size": 0x2000,
+            "stack_id": 11,
+            "path": "",
+        }),
+    ]
+    stacks = {
+        10: analyzer.Stack(10, ["FirstMmap"]),
+        11: analyzer.Stack(11, ["SecondMmap"]),
+    }
+
+    output, summary, all_summary = analyzer.build_chrome_trace(
+        [snapshot], lifecycle, stacks, top_n=1)
+
+    self.assertEqual(len(summary), 1)
+    self.assertEqual(len(output["metadata"]["final_summary"]), 1)
+    self.assertEqual(len(all_summary), 2)
+    self.assertEqual(
+        {item["stack_id"] for item in all_summary},
+        {10, 11})
+
+  def test_mmap_classification_summary_matches_fs_rules(self):
+    """mmap 分类应复用 fs.ini 规则，并按 PSS/RSS 等指标输出 remaining。"""
+    rules = [
+        analyzer.ClassificationRule("il2cpp/meta", ("Class::Init",)),
+    ]
+    summary_items = [
+        {
+            "stack_id": 10,
+            "pss_bytes": 8 * 1024,
+            "rss_bytes": 9 * 1024,
+            "virtual_bytes": 10 * 1024,
+            "private_dirty_bytes": 4 * 1024,
+            "private_clean_bytes": 1 * 1024,
+            "shared_dirty_bytes": 2 * 1024,
+            "shared_clean_bytes": 3 * 1024,
+            "range_count": 2,
+            "stack": ["il2cpp::vm::Class::Init", "GameInit"],
+            "stack_text": "il2cpp::vm::Class::Init\nGameInit",
+        },
+        {
+            "stack_id": 11,
+            "pss_bytes": 4 * 1024,
+            "rss_bytes": 5 * 1024,
+            "virtual_bytes": 6 * 1024,
+            "private_dirty_bytes": 1 * 1024,
+            "private_clean_bytes": 0,
+            "shared_dirty_bytes": 0,
+            "shared_clean_bytes": 0,
+            "range_count": 1,
+            "stack": ["OtherMmap"],
+            "stack_text": "OtherMmap",
+        },
+    ]
+
+    classified, remaining = analyzer.classify_mmap_summary_items(
+        summary_items, rules)
+    summary = analyzer.build_mmap_classification_summary(
+        summary_items, classified, remaining)
+
+    self.assertEqual(summary["stack_count"], 2)
+    self.assertEqual(summary["pss_bytes"], 12 * 1024)
+    self.assertEqual(summary["categories"][0]["name"], "il2cpp/meta")
+    self.assertEqual(summary["categories"][0]["stack_count"], 1)
+    self.assertEqual(summary["categories"][0]["pss_bytes"], 8 * 1024)
+    self.assertEqual(summary["categories"][0]["rss_bytes"], 9 * 1024)
+    self.assertEqual(summary["remaining"]["stack_count"], 1)
+    self.assertEqual(summary["remaining"]["pss_bytes"], 4 * 1024)
 
   def test_attribute_snapshot_skips_ranges_that_cannot_overlap(self):
     """归因时应按地址跳过不可能重叠的 range，避免大 trace 卡在 JSON 生成。"""
@@ -979,6 +1206,9 @@ TOTAL SWAP PSS: 7,000K
           "tid": "1234",
           "callsite_id": "10",
       }]
+
+    if "stack_profile_symbol" in sql:
+      return []
 
     if "__intrinsic_stack_profile_callsite" in sql:
       return [

@@ -20,12 +20,34 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HEAP_ANALYZER_DIR = os.path.join(SCRIPT_DIR, "heap_analyzer")
+if HEAP_ANALYZER_DIR not in sys.path:
+  sys.path.insert(0, HEAP_ANALYZER_DIR)
+import classification as common_classification
 
 
 ARM64_MMAP_NR = 222
 ARM64_MUNMAP_NR = 215
 ARM64_MREMAP_NR = 216
+
+ClassificationRule = common_classification.ClassificationRule
+ClassifiedMmapItem = common_classification.ClassifiedItem
+
+MMAP_CLASSIFICATION_METRICS = (
+    "stack_count",
+    "range_count",
+    "pss_bytes",
+    "rss_bytes",
+    "virtual_bytes",
+    "private_dirty_bytes",
+    "private_clean_bytes",
+    "shared_dirty_bytes",
+    "shared_clean_bytes",
+)
 
 
 @dataclass
@@ -173,13 +195,38 @@ def load_perf_samples(tp: str, trace: str) -> List[PerfSample]:
   ]
 
 
+def load_stack_symbol_names(tp: str, trace: str) -> Dict[int, List[str]]:
+  """读取 frame.symbol_set_id 对应的 UI 符号名，失败时回退到 frame 名称。"""
+  try:
+    rows = run_tp_query(tp, trace, """
+  SELECT symbol_set_id, id, name
+  FROM stack_profile_symbol
+  ORDER BY symbol_set_id, id
+  """)
+  except RuntimeError as exc:
+    print(f"WARN: 读取 stack_profile_symbol 失败，回退到 frame 名称: {exc}",
+          file=sys.stderr)
+    return {}
+
+  symbols: Dict[int, List[str]] = {}
+  for row in rows:
+    symbol_set_id = int_or_none(row.get("symbol_set_id"))
+    name = row.get("name") or ""
+    if symbol_set_id is None or not name:
+      continue
+    symbols.setdefault(symbol_set_id, []).append(name)
+  return symbols
+
+
 def load_stacks(tp: str, trace: str) -> Dict[int, Stack]:
+  symbol_names = load_stack_symbol_names(tp, trace)
   callsite_rows = run_tp_query(tp, trace, """
   SELECT
     c.id AS id,
     IFNULL(c.parent_id, -1) AS parent_id,
     IFNULL(f.name, '') AS frame_name,
     IFNULL(f.deobfuscated_name, '') AS deobfuscated_name,
+    IFNULL(f.symbol_set_id, -1) AS symbol_set_id,
     IFNULL(m.name, '') AS mapping_name,
     IFNULL(f.rel_pc, 0) AS rel_pc
   FROM __intrinsic_stack_profile_callsite c
@@ -187,33 +234,103 @@ def load_stacks(tp: str, trace: str) -> Dict[int, Stack]:
   LEFT JOIN __intrinsic_stack_profile_mapping m ON f.mapping = m.id
   """)
   nodes = {}
+
+  def with_mapping(name: str, mapping: str) -> str:
+    if mapping:
+      return f"{name} [{os.path.basename(mapping)}]"
+    return name
+
   for row in callsite_rows:
     cid = int(row["id"])
     parent = int(row["parent_id"])
-    name = row["deobfuscated_name"] or row["frame_name"]
+    symbol_set_id = int_or_none(row.get("symbol_set_id"))
+    symbols = symbol_names.get(symbol_set_id or -1, [])
     mapping = row["mapping_name"]
-    rel_pc = int(row["rel_pc"] or 0)
-    if not name:
-      name = f"{mapping}+0x{rel_pc:x}" if mapping else f"0x{rel_pc:x}"
-    elif mapping:
-      name = f"{name} [{os.path.basename(mapping)}]"
-    nodes[cid] = (parent, name)
+    if symbols:
+      frames = [with_mapping(symbol, mapping) for symbol in symbols]
+    else:
+      name = row["deobfuscated_name"] or row["frame_name"]
+      rel_pc = int(row["rel_pc"] or 0)
+      if not name:
+        name = f"{mapping}+0x{rel_pc:x}" if mapping else f"0x{rel_pc:x}"
+      else:
+        name = with_mapping(name, mapping)
+      frames = [name]
+    nodes[cid] = (parent, frames)
 
   def build(cid: int) -> List[str]:
     frames = []
     seen = set()
     while cid in nodes and cid not in seen:
       seen.add(cid)
-      parent, frame = nodes[cid]
-      frames.append(frame)
+      parent, current_frames = nodes[cid]
+      frames.extend(current_frames)
       cid = parent
     return frames
 
   return {cid: Stack(cid, build(cid)) for cid in nodes}
 
 
-def load_syscalls(tp: str, trace: str) -> List[SyscallEvent]:
-  sql = f"""
+def build_syscalls_sql(pid: Optional[int] = None) -> str:
+  if pid is not None:
+    return f"""
+  WITH
+  target_ftrace_events AS (
+    SELECT
+      fe.id AS event_id,
+      fe.ts AS ts,
+      fe.utid AS utid,
+      fe.name AS event_name,
+      fe.arg_set_id AS arg_set_id
+    FROM __intrinsic_ftrace_event fe
+    JOIN __intrinsic_thread th ON fe.utid = th.id
+    LEFT JOIN __intrinsic_process pr ON th.upid = pr.id
+    WHERE (pr.pid = {pid} OR th.tid = {pid})
+      AND (
+        fe.name LIKE '%mmap%' OR
+        fe.name LIKE '%munmap%' OR
+        fe.name LIKE '%mremap%' OR
+        fe.name LIKE '%sys_enter%' OR
+        fe.name LIKE '%sys_exit%'
+      )
+  ),
+  named_syscall_events AS (
+    SELECT event_id
+    FROM target_ftrace_events
+    WHERE event_name LIKE '%mmap%'
+       OR event_name LIKE '%munmap%'
+       OR event_name LIKE '%mremap%'
+  ),
+  raw_syscall_events AS (
+    SELECT DISTINCT tfe.event_id
+    FROM target_ftrace_events tfe
+    JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id
+    WHERE (tfe.event_name LIKE '%sys_enter%' OR tfe.event_name LIKE '%sys_exit%')
+      AND a.key IN ('id', 'syscall_nr', 'nr')
+      AND a.int_value IN ({ARM64_MMAP_NR}, {ARM64_MUNMAP_NR}, {ARM64_MREMAP_NR})
+  ),
+  interesting_events AS (
+    SELECT event_id FROM named_syscall_events
+    UNION
+    SELECT event_id FROM raw_syscall_events
+  )
+  SELECT
+    tfe.event_id AS event_id,
+    tfe.ts AS ts,
+    tfe.utid AS utid,
+    tfe.event_name AS event_name,
+    a.id AS arg_id,
+    a.key AS key,
+    IFNULL(a.int_value, 0) AS int_value,
+    IFNULL(a.string_value, '') AS string_value,
+    a.value_type AS value_type
+  FROM target_ftrace_events tfe
+  JOIN interesting_events ie ON tfe.event_id = ie.event_id
+  JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id
+  ORDER BY tfe.ts, tfe.event_id, a.id
+  """
+
+  return f"""
   WITH interesting_events AS (
     SELECT DISTINCT fe.id AS event_id
     FROM __intrinsic_ftrace_event fe
@@ -243,6 +360,10 @@ def load_syscalls(tp: str, trace: str) -> List[SyscallEvent]:
   JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id
   ORDER BY fe.ts, fe.id, a.id
   """
+
+
+def load_syscalls(tp: str, trace: str, pid: Optional[int] = None) -> List[SyscallEvent]:
+  sql = build_syscalls_sql(pid)
   rows = run_tp_query(tp, trace, sql)
   grouped: Dict[int, SyscallEvent] = {}
   repeated_arg_count: Dict[int, int] = {}
@@ -620,10 +741,38 @@ def attribute_snapshot(snapshot: Snapshot, ranges: List[MmapRange]) -> Dict[int,
   return stats
 
 
+def build_summary_items(
+    stats: Iterable[StackStat],
+    stacks: Dict[int, Stack],
+    top_n: int,
+) -> List[dict]:
+  """把最终快照的调用栈统计转成 summary，top_n=0 表示全量。"""
+  summary_items = []
+  for stat in sorted(stats, key=lambda s: s.pss_bytes, reverse=True):
+    if top_n > 0 and len(summary_items) >= top_n:
+      break
+    stack = stacks.get(stat.stack_id, Stack(stat.stack_id, ["<unknown>"]))
+    summary_items.append({
+        "stack_id": stat.stack_id,
+        "pss_bytes": int(stat.pss_bytes),
+        "rss_bytes": int(stat.rss_bytes),
+        "virtual_bytes": int(stat.virtual_bytes),
+        "private_dirty_bytes": int(stat.private_dirty_bytes),
+        "private_clean_bytes": int(stat.private_clean_bytes),
+        "shared_dirty_bytes": int(stat.shared_dirty_bytes),
+        "shared_clean_bytes": int(stat.shared_clean_bytes),
+        "range_count": stat.range_count,
+        "paths": sorted(stat.paths),
+        "stack": stack.frames,
+        "stack_text": stack.text,
+    })
+  return summary_items
+
+
 def build_chrome_trace(snapshots: List[Snapshot],
                        lifecycle_events: List[Tuple[int, str, dict]],
                        stacks: Dict[int, Stack],
-                       top_n: int) -> Tuple[dict, List[dict]]:
+                       top_n: int) -> Tuple[dict, List[dict], List[dict]]:
   trace_events = []
   pid = 9000
   final_stats: Dict[int, StackStat] = {}
@@ -699,25 +848,8 @@ def build_chrome_trace(snapshots: List[Snapshot],
           }
       })
 
-  summary_items = []
-  for stat in sorted(final_stats.values(), key=lambda s: s.pss_bytes, reverse=True):
-    if top_n > 0 and len(summary_items) >= top_n:
-      break
-    stack = stacks.get(stat.stack_id, Stack(stat.stack_id, ["<unknown>"]))
-    summary_items.append({
-        "stack_id": stat.stack_id,
-        "pss_bytes": int(stat.pss_bytes),
-        "rss_bytes": int(stat.rss_bytes),
-        "virtual_bytes": int(stat.virtual_bytes),
-        "private_dirty_bytes": int(stat.private_dirty_bytes),
-        "private_clean_bytes": int(stat.private_clean_bytes),
-        "shared_dirty_bytes": int(stat.shared_dirty_bytes),
-        "shared_clean_bytes": int(stat.shared_clean_bytes),
-        "range_count": stat.range_count,
-        "paths": sorted(stat.paths),
-        "stack": stack.frames,
-        "stack_text": stack.text,
-    })
+  summary_items = build_summary_items(final_stats.values(), stacks, top_n)
+  all_summary_items = build_summary_items(final_stats.values(), stacks, 0)
 
   return {
       "traceEvents": trace_events,
@@ -727,7 +859,7 @@ def build_chrome_trace(snapshots: List[Snapshot],
           "description": "PSS/RSS attributed to mmap callstacks by smaps overlap",
           "final_summary": summary_items,
       }
-  }, summary_items
+  }, summary_items, all_summary_items
 
 
 def build_speedscope(summary_items: List[dict],
@@ -777,6 +909,224 @@ def build_speedscope(summary_items: List[dict],
   }
 
 
+def parse_classification_config(path: str) -> List[ClassificationRule]:
+  return common_classification.parse_classification_config(path)
+
+
+def classify_mmap_summary_items(
+    summary_items: List[dict],
+    rules: List[ClassificationRule],
+) -> Tuple[List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
+           List[ClassifiedMmapItem]]:
+  """按 fs.ini 规则顺序分类 mmap 调用栈 summary。"""
+  return common_classification.classify_items(
+      summary_items,
+      rules,
+      lambda item: item.get("stack", ()))
+
+
+def sum_mmap_summary_items(items: Iterable[dict]) -> Dict[str, int]:
+  item_list = list(items)
+  totals = {field: 0 for field in MMAP_CLASSIFICATION_METRICS}
+  totals["stack_count"] = len(item_list)
+  for item in item_list:
+    for field in MMAP_CLASSIFICATION_METRICS:
+      if field == "stack_count":
+        continue
+      totals[field] += int(item.get(field, 0))
+  return totals
+
+
+def add_mib_fields(values: Dict[str, Any]) -> Dict[str, Any]:
+  """给字节指标补充 MiB 字段，方便在表格中直接查看。"""
+  output = dict(values)
+  for field in (
+      "pss_bytes",
+      "rss_bytes",
+      "virtual_bytes",
+      "private_dirty_bytes",
+      "private_clean_bytes",
+      "shared_dirty_bytes",
+      "shared_clean_bytes",
+  ):
+    output[f"{field[:-6]}_mib"] = int(output.get(field, 0)) / 1048576.0
+  return output
+
+
+def build_mmap_classification_summary(
+    summary_items: List[dict],
+    classified: List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
+    remaining: List[ClassifiedMmapItem],
+) -> Dict[str, Any]:
+  categories = []
+  classified_totals = {field: 0 for field in MMAP_CLASSIFICATION_METRICS}
+  for index, (rule, items) in enumerate(classified, start=1):
+    totals = sum_mmap_summary_items(item.item for item in items)
+    for field in MMAP_CLASSIFICATION_METRICS:
+      classified_totals[field] += totals[field]
+    categories.append(add_mib_fields({
+        "index": index,
+        "name": rule.name,
+        "keywords": list(rule.keywords),
+        **totals,
+    }))
+
+  total = sum_mmap_summary_items(summary_items)
+  remaining_total = sum_mmap_summary_items(item.item for item in remaining)
+  return add_mib_fields({
+      **total,
+      "categories": categories,
+      "remaining": add_mib_fields(remaining_total),
+      "classified_total": add_mib_fields(classified_totals),
+  })
+
+
+def build_mmap_summary_hierarchy_entries(
+    summary: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+  entries = common_classification.build_summary_hierarchy_entries(
+      summary, MMAP_CLASSIFICATION_METRICS)
+  return [add_mib_fields(entry) for entry in entries]
+
+
+def write_mmap_classification_summary(path: str, summary: Dict[str, Any]) -> None:
+  remaining = summary["remaining"]
+  classified_total = summary["classified_total"]
+  byte_fields = [
+      "pss_bytes",
+      "rss_bytes",
+      "virtual_bytes",
+      "private_dirty_bytes",
+      "private_clean_bytes",
+      "shared_dirty_bytes",
+      "shared_clean_bytes",
+  ]
+  summary_rows = [
+      ["field", "value"],
+      ["stack_count", summary["stack_count"]],
+      ["range_count", summary["range_count"]],
+  ]
+  for field in byte_fields:
+    summary_rows.append([field, summary[field]])
+    summary_rows.append([f"{field[:-6]}_mib", summary[f"{field[:-6]}_mib"]])
+  summary_rows.extend([
+      ["classified_total_stack_count", classified_total["stack_count"]],
+      ["classified_total_range_count", classified_total["range_count"]],
+      ["classified_total_pss_bytes", classified_total["pss_bytes"]],
+      ["classified_total_pss_mib", classified_total["pss_mib"]],
+      ["remaining_stack_count", remaining["stack_count"]],
+      ["remaining_range_count", remaining["range_count"]],
+      ["remaining_pss_bytes", remaining["pss_bytes"]],
+      ["remaining_pss_mib", remaining["pss_mib"]],
+  ])
+
+  hierarchy_entries = build_mmap_summary_hierarchy_entries(summary)
+  max_depth = max((len(entry["path"]) for entry in hierarchy_entries), default=1)
+  category_rows: List[List[object]] = [[
+      *[f"level_{index}" for index in range(1, max_depth + 1)],
+      "full_name",
+      "node_type",
+      "keywords",
+      "stack_count",
+      "range_count",
+      "pss_bytes",
+      "pss_mib",
+      "rss_bytes",
+      "rss_mib",
+      "virtual_bytes",
+      "virtual_mib",
+      "private_dirty_bytes",
+      "private_dirty_mib",
+      "private_clean_bytes",
+      "private_clean_mib",
+      "shared_dirty_bytes",
+      "shared_dirty_mib",
+      "shared_clean_bytes",
+      "shared_clean_mib",
+  ]]
+  for entry in hierarchy_entries:
+    entry_path = entry["path"]
+    levels = list(entry_path) + [""] * (max_depth - len(entry_path))
+    category_rows.append([
+        *levels,
+        "/".join(entry_path),
+        "leaf" if entry["is_leaf"] else "group",
+        "\n".join(entry["keywords"]),
+        entry["stack_count"],
+        entry["range_count"],
+        entry["pss_bytes"],
+        entry["pss_mib"],
+        entry["rss_bytes"],
+        entry["rss_mib"],
+        entry["virtual_bytes"],
+        entry["virtual_mib"],
+        entry["private_dirty_bytes"],
+        entry["private_dirty_mib"],
+        entry["private_clean_bytes"],
+        entry["private_clean_mib"],
+        entry["shared_dirty_bytes"],
+        entry["shared_dirty_mib"],
+        entry["shared_clean_bytes"],
+        entry["shared_clean_mib"],
+    ])
+
+  common_classification.write_xlsx(
+      path, [("Summary", summary_rows), ("Tree", category_rows)])
+  print(f"分类统计输出完成: {path}")
+
+
+def write_mmap_summary_speedscope(
+    output_path: str,
+    summary: Dict[str, Any],
+    metric: str = "pss_bytes",
+) -> None:
+  summary_items: List[dict] = []
+  for entry in build_mmap_summary_hierarchy_entries(summary):
+    if not entry["is_leaf"]:
+      continue
+    path = tuple(str(part) for part in entry["path"])
+    if path == ("remaining",):
+      stack = ["remaining", "mmap summary"]
+    else:
+      stack = [*reversed(path), "classified", "mmap summary"]
+    summary_items.append({
+        "stack": stack,
+        metric: entry.get(metric, 0),
+    })
+  speedscope = build_speedscope(
+      summary_items,
+      metric=metric,
+      name="mmap classification summary")
+  common_classification.ensure_parent_dir(output_path)
+  with open(output_path, "w", encoding="utf-8") as fd:
+    json.dump(speedscope, fd, ensure_ascii=False)
+  print(f"分类汇总火焰图输出完成: {output_path}")
+
+
+def write_mmap_classification_speedscope_files(
+    output_dir: str,
+    classified: List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
+    remaining: List[ClassifiedMmapItem],
+    metric: str = "pss_bytes",
+) -> None:
+  os.makedirs(output_dir, exist_ok=True)
+  for index, entry in enumerate(
+      common_classification.build_hierarchy_entries(classified, remaining),
+      start=1):
+    full_name = "/".join(entry.path)
+    summary_items = [item.item for item in entry.items]
+    output_path = os.path.join(
+        output_dir,
+        f"{index:02d}_{common_classification.sanitize_filename(full_name)}.speedscope.json")
+    speedscope = build_speedscope(
+        summary_items,
+        metric=metric,
+        name=f"mmap category: {full_name}")
+    with open(output_path, "w", encoding="utf-8") as fd:
+      json.dump(speedscope, fd, ensure_ascii=False)
+    print(f"分类火焰图输出完成: {output_path}")
+
+
 def load_perfetto_root(config_dir: str) -> Optional[str]:
   config_path = os.path.join(config_dir, "config.sh")
   if not os.path.exists(config_path):
@@ -808,6 +1158,25 @@ def find_default_tp(config_dir: Optional[str] = None) -> Optional[str]:
   return None
 
 
+def default_analysis_output_dir(output_path: str) -> str:
+  return os.path.dirname(os.path.abspath(output_path))
+
+
+def resolve_analysis_output_path(output_path: str, path: Optional[str],
+                                 default_name: str) -> str:
+  if not path:
+    return os.path.join(default_analysis_output_dir(output_path), default_name)
+  if os.path.isabs(path):
+    return path
+  return os.path.join(default_analysis_output_dir(output_path), path)
+
+
+def resolve_analysis_output_dir(output_path: str, path: str) -> str:
+  if os.path.isabs(path):
+    return path
+  return os.path.join(default_analysis_output_dir(output_path), path)
+
+
 def main() -> int:
   parser = argparse.ArgumentParser(
       description="按 mmap 调用栈归因 smaps PSS/RSS，并输出 Perfetto 可加载 JSON")
@@ -816,6 +1185,16 @@ def main() -> int:
   parser.add_argument("--pid", type=int, required=True, help="目标进程 pid")
   parser.add_argument("--output", required=True, help="输出 Chrome JSON trace")
   parser.add_argument("--speedscope-output", help="额外输出 speedscope 火焰图 JSON")
+  parser.add_argument("--classify-config", help="按 fs.ini 规则对 mmap 调用栈分类")
+  parser.add_argument(
+      "--classify-summary-out",
+      help="分类统计 XLSX 输出路径；相对路径会写入 --output 同级目录")
+  parser.add_argument(
+      "--classify-summary-speedscope-out",
+      help="分类统计 speedscope JSON 输出路径；相对路径会写入 --output 同级目录")
+  parser.add_argument(
+      "--classify-speedscope-dir",
+      help="每个分类输出一个 speedscope JSON 的目录；相对路径会写入 --output 同级目录")
   parser.add_argument("--trace-processor", default=find_default_tp(), help="trace_processor_shell 路径")
   parser.add_argument("--smaps-ts-unit", choices=["auto", "ns", "us", "ms", "s"], default="auto")
   parser.add_argument("--smaps-ts-offset-ns", type=int, default=0, help="smaps 时间戳到 trace 时间轴的偏移")
@@ -836,7 +1215,7 @@ def main() -> int:
   print(f"stacks: {len(stacks)}")
 
   print("加载 syscall 事件...")
-  syscalls = load_syscalls(args.trace_processor, args.trace)
+  syscalls = load_syscalls(args.trace_processor, args.trace, pid=args.pid)
   print(f"syscall events: {len(syscalls)}")
 
   print("构建 mmap 生命周期...")
@@ -851,7 +1230,8 @@ def main() -> int:
     return 1
 
   print("生成 Perfetto 可加载 JSON...")
-  output, summary_items = build_chrome_trace(snapshots, lifecycle, stacks, args.top_n)
+  output, summary_items, all_summary_items = build_chrome_trace(
+      snapshots, lifecycle, stacks, args.top_n)
   with open(args.output, "w", encoding="utf-8") as fd:
     json.dump(output, fd, ensure_ascii=False)
   print(f"写入: {args.output}")
@@ -861,6 +1241,49 @@ def main() -> int:
     with open(args.speedscope_output, "w", encoding="utf-8") as fd:
       json.dump(speedscope, fd, ensure_ascii=False)
     print(f"写入火焰图: {args.speedscope_output}")
+
+  if args.classify_config:
+    print("生成 mmap 分类输出...")
+    rules = parse_classification_config(args.classify_config)
+    classified, remaining = classify_mmap_summary_items(all_summary_items, rules)
+    summary_data = build_mmap_classification_summary(
+        all_summary_items, classified, remaining)
+    print(f"  config: {args.classify_config}")
+    print(f"  rule_count: {len(rules)}")
+    print(f"  source_top_n: 0")
+    print(f"  stack_count: {summary_data['stack_count']}")
+    print(f"  pss_bytes: {summary_data['pss_bytes']}")
+    print(f"  pss_mib: {summary_data['pss_mib']:.3f}")
+    for index, (rule, items) in enumerate(classified, start=1):
+      totals = sum_mmap_summary_items(item.item for item in items)
+      print(f"  #{index} {rule.name}")
+      print(f"    keywords: {', '.join(rule.keywords)}")
+      print(f"    stack_count: {totals['stack_count']}")
+      print(f"    range_count: {totals['range_count']}")
+      print(f"    pss_bytes: {totals['pss_bytes']}")
+      print(f"    pss_mib: {totals['pss_bytes'] / 1048576.0:.3f}")
+    remaining_total = sum_mmap_summary_items(item.item for item in remaining)
+    print("  remaining")
+    print(f"    stack_count: {remaining_total['stack_count']}")
+    print(f"    range_count: {remaining_total['range_count']}")
+    print(f"    pss_bytes: {remaining_total['pss_bytes']}")
+    print(f"    pss_mib: {remaining_total['pss_bytes'] / 1048576.0:.3f}")
+
+    summary_out = resolve_analysis_output_path(
+        args.output, args.classify_summary_out, "mmap_classification_summary.xlsx")
+    write_mmap_classification_summary(summary_out, summary_data)
+
+    summary_speedscope_out = resolve_analysis_output_path(
+        args.output,
+        args.classify_summary_speedscope_out,
+        "mmap_classification_summary.speedscope.json")
+    write_mmap_summary_speedscope(summary_speedscope_out, summary_data)
+
+    if args.classify_speedscope_dir:
+      write_mmap_classification_speedscope_files(
+          resolve_analysis_output_dir(args.output, args.classify_speedscope_dir),
+          classified,
+          remaining)
   return 0
 
 

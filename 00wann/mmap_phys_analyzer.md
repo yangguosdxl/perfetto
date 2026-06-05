@@ -460,6 +460,15 @@ mmap_phys_attribution.json
 mmap_phys_attribution.speedscope.json
   -> 主功能输出：Speedscope 可加载的火焰图 JSON。
 
+mmap_classification_summary.xlsx
+  -> 传 --classify-config 时生成：按 fs.ini 层级分类的 PSS/RSS 汇总表。
+
+mmap_classification_summary.speedscope.json
+  -> 传 --classify-config 时生成：分类汇总 Speedscope 火焰图。
+
+mmap_categories/
+  -> 传 --classify-speedscope-dir mmap_categories 时生成：每分类 mmap 调用栈火焰图。
+
 dumpsys_meminfo.txt
   -> `adb shell dumpsys meminfo <package>` 原始输出。
   -> 在 Perfetto 采样结束并拉回 trace 后立即保存，早于 trace 健康检查和离线分析。
@@ -500,6 +509,273 @@ memory_validation.json
   dumpsys_meminfo.txt
   memory_validation.json
 ```
+
+## smaps 提取 mmap 物理占用逻辑
+
+### 口径定义
+
+这里的“mmap 分配量”不是累计 mmap 调用参数里的 `length`，也不是 malloc
+分配量。脚本统计的是：
+
+```text
+某个 smaps 快照时刻
+  -> 目标进程仍然 live 的 mmap 地址区间
+  -> 与 /proc/<pid>/smaps 当前 VMA 重叠的部分
+  -> 按 smaps 的 PSS/RSS/Private/Shared 字段换算出的当前物理占用
+```
+
+因此它回答的是“当前哪些 mmap 调用栈最终占用了多少真实物理内存”，而不是
+“从采集开始到现在累计 mmap 过多少虚拟地址空间”。
+
+核心指标：
+
+```text
+pss_bytes
+  -> 主判断口径。来自 smaps 的 Pss，按 mmap range 与 VMA 的重叠比例分摊。
+  -> 共享页会按内核 PSS 规则分摊，适合看真实物理内存归因。
+
+rss_bytes
+  -> 来自 smaps 的 Rss，同样按重叠比例分摊。
+  -> 共享页在不同进程间可能重复计数，不适合当作全局物理内存主口径。
+
+virtual_bytes
+  -> live mmap range 与 smaps VMA 的虚拟地址重叠大小。
+  -> 只代表地址空间覆盖，不代表这些页已经实际驻留。
+
+private_dirty_bytes / private_clean_bytes / shared_dirty_bytes / shared_clean_bytes
+  -> 分别来自 smaps 同名字段，按同一重叠比例分摊。
+```
+
+### 数据输入
+
+离线分析器使用两类输入：
+
+```text
+Perfetto trace
+  -> raw_syscalls/sys_enter、raw_syscalls/sys_exit 或 syscall_events。
+  -> 用来还原 mmap / munmap / mremap 生命周期。
+  -> 主功能还会用 linux.perf 在 mmap enter 附近采样调用栈，得到 stack_id。
+
+smaps/
+  -> 采集期间周期性保存的 /proc/<pid>/smaps 快照。
+  -> 文件名中的数字是采样时刻，采集脚本用设备 /proc/uptime 换算为 ns。
+  -> 每个快照记录当前进程 VMA 的地址范围、pathname、Rss、Pss 等字段。
+```
+
+smaps 解析逻辑：
+
+```text
+VMA header:
+  7100000000-7100100000 rw-p 00000000 00:00 0 [anon:test]
+    -> start = 0x7100000000
+    -> end   = 0x7100100000
+    -> pathname = [anon:test]
+
+VMA body:
+  Rss:              64 kB
+  Pss:              32 kB
+  Private_Dirty:    16 kB
+  Private_Clean:     0 kB
+  Shared_Dirty:     48 kB
+  Shared_Clean:      0 kB
+```
+
+脚本只使用当前实现中解析到的字段；`SwapPss` 目前不并入 `pss_bytes`。
+
+### mmap 生命周期还原
+
+Perfetto syscall 行会先按事件 id 分组，再规范化参数名：
+
+```text
+raw_syscalls/sys_enter
+  id / syscall_nr / nr -> syscall id
+  args[0] / arg0 / addr / start -> 起始地址参数
+  args[1] / arg1 / len / length -> 长度参数
+
+raw_syscalls/sys_exit
+  ret / retval / return_value -> syscall 返回值
+```
+
+生命周期事件生成规则：
+
+```text
+mmap
+  enter 记录 length。
+  exit ret >= 0 时，ret 是实际映射起始地址。
+  生成 live range:
+    [ret, ret + length) -> stack_id
+
+munmap
+  enter 记录 addr 和 length。
+  exit ret >= 0 时，从 live ranges 中删除 [addr, addr + length)。
+  如果只释放中间一段，会把原 range 切成前后两段。
+
+mremap
+  enter 记录 old_addr / old_size / new_size。
+  exit ret >= 0 时，删除旧 range，再加入 [ret, ret + new_size)。
+```
+
+`MAP_FIXED` 或其他覆盖场景下，新增 mmap range 前会先切掉同 pid 的重叠旧
+range，保证 live ranges 尽量保持不重叠。
+
+主功能中，mmap range 的 `stack_id` 来自 mmap enter 附近的 perf sample：
+
+```text
+mmap enter 时间点
+  -> 在同 utid 的 perf samples 里找最近样本
+  -> 默认窗口 --stack-window-ns=5000000
+  -> 命中后把 sample.callsite_id 作为该 mmap range 的 stack_id
+```
+
+无栈验证模式没有 mmap 调用栈，生命周期仍可还原，但所有 mmap range 使用
+`stack_id = 0`，只用于健康检查和总量汇总。
+
+### 快照归因流程
+
+对每个 smaps 快照，分析器按时间推进 live ranges：
+
+```text
+按时间排序的 mmap 生命周期事件
+        |
+        v
+处理所有 event.ts <= snapshot.ts 的事件
+        |
+        v
+得到 snapshot.ts 时刻仍然 live 的 mmap ranges
+        |
+        v
+把 live ranges 与当前 smaps VMA 做地址重叠
+        |
+        v
+按重叠比例把 VMA 的 PSS/RSS 等字段分摊到 stack_id
+```
+
+有限长度 range 的重叠计算：
+
+```text
+overlap = max(0, min(vma.end, range.end) - max(vma.start, range.start))
+
+如果 overlap > 0:
+  这条 mmap range 与该 VMA 有交集。
+```
+
+分摊比例：
+
+```text
+vma_size = max(1, vma.end - vma.start)
+total_overlap = 当前 VMA 命中的所有 mmap range overlap 之和
+denominator = max(vma_size, total_overlap)
+ratio = overlap / denominator
+```
+
+使用 `max(vma_size, total_overlap)` 的原因是避免同一个 VMA 被多个调用栈重复归因。
+如果多个 range 都命中同一个 VMA，PSS/RSS 会按 overlap 权重分摊，而不是每个
+range 都拿一份完整 VMA PSS。
+
+字段换算：
+
+```text
+stat.virtual_bytes       += vma_size * ratio
+stat.pss_bytes           += vma.pss_kb * 1024 * ratio
+stat.rss_bytes           += vma.rss_kb * 1024 * ratio
+stat.private_dirty_bytes += vma.private_dirty_kb * 1024 * ratio
+stat.private_clean_bytes += vma.private_clean_kb * 1024 * ratio
+stat.shared_dirty_bytes  += vma.shared_dirty_kb * 1024 * ratio
+stat.shared_clean_bytes  += vma.shared_clean_kb * 1024 * ratio
+```
+
+### raw syscall 缺少 length 的兜底
+
+部分设备或 Perfetto/ftrace 组合下，raw syscall 能拿到 mmap 返回地址，但拿不到
+可靠 length。此时脚本会把该 mmap 记录成“点 range”：
+
+```text
+start = mmap 返回地址
+end <= start
+```
+
+归因时，如果这个点落在某个 smaps VMA 内，就用该 VMA 作为归因范围：
+
+```text
+vma.start <= range.start < vma.end
+  -> candidates.append((range, vma_size))
+```
+
+这个兜底用于避免“有 mmap 返回地址但没有 length”时完全丢失物理归因。它比有限
+长度 range 粗糙：同一 VMA 内多个未知长度 mmap 会按候选数量和重叠权重分摊，
+不会让 Speedscope 总 PSS 超过 smaps 原始 PSS，但调用栈粒度会受 VMA 合并影响。
+
+### 输出和 top_n 的关系
+
+每个快照都会输出一个总量 counter：
+
+```text
+total mmap PSS/RSS
+  -> 当前 snapshot 中所有 stack_id 的 PSS/RSS 汇总
+  -> 不受 --top-n 截断影响
+```
+
+每个调用栈的明细 counter 和最终 `metadata.final_summary` 会按 PSS 排序后受
+`--top-n` 控制：
+
+```text
+--top-n 50
+  -> 每个快照只输出 PSS 最大的前 50 个调用栈明细。
+  -> metadata.final_summary 也只保留最终快照前 50 个调用栈。
+
+--top-n 0
+  -> 不截断，输出全部调用栈明细。
+  -> 适合总量核对或直接排查长尾调用栈。
+```
+
+内置 fs.ini 分类输出不直接复用被 `--top-n` 截断的 `metadata.final_summary`。启用
+`--classify-config` 时，分析器会在同一次最终快照上额外构造一份全量 summary，
+等价于分类数据源内部强制使用 `--top-n 0`。因此：
+
+```text
+普通 Perfetto JSON / 默认 Speedscope
+  -> 仍受 --top-n 控制，避免输出过大。
+
+分类 summary / 分类 Speedscope
+  -> 使用全量调用栈 summary，不受 --top-n 截断。
+  -> 只要最终快照中有该调用栈，分类统计就会覆盖到。
+```
+
+### 局限和校验
+
+需要注意的边界：
+
+```text
+smaps 是快照
+  -> 只能表示采样时刻的当前驻留/分摊状态。
+  -> 不能表示历史累计 mmap length，也不能表示已经 munmap 的历史区间。
+
+PSS 是物理占用口径
+  -> 只统计当前 smaps Pss 中可见的驻留分摊。
+  -> 当前脚本没有把 SwapPss 并入 pss_bytes。
+
+VMA 可能被内核拆分或合并
+  -> mmap 调用栈和 smaps VMA 不是一对一关系。
+  -> 脚本通过地址重叠和比例分摊处理多对多关系。
+
+时间戳需要对齐
+  -> 采集脚本默认用设备 /proc/uptime 生成 smaps 文件名。
+  -> 离线重跑时如发现 smaps 与 trace 时间轴偏移，可用 --smaps-ts-offset-ns 调整。
+```
+
+基本校验：
+
+```text
+sum(metadata.final_summary[].pss_bytes)
+  <= 最终快照 total mmap PSS/RSS counter 中的 pss_bytes
+  <= 同一 smaps 文件原始 PSS 总和
+
+Speedscope sum(weights)
+  <= sum(metadata.final_summary[].pss_bytes)
+```
+
+如果 Speedscope 或 final_summary 的 PSS 大于同一快照原始 smaps PSS，优先怀疑
+同一 VMA 被多个调用栈重复归因，或使用了不匹配的 smaps 快照和 trace 时间轴。
 
 ## 结果怎么看
 
@@ -592,6 +868,75 @@ Speedscope total_weight
 ```
 
 如果 Speedscope 总权重大于目标进程 smaps 原始 PSS，说明归因重复计数，不能把该火焰图当作物理内存结果。
+
+### fs.ini 分类输出
+
+`mmap_phys_analyzer.py` 可以复用 heap 分析脚本同一套 fs.ini 分类规则。规则格式：
+
+```ini
+# il2cpp/meta
+Class::Init
+MetadataCache
+
+# graphics/gpu
+libGLES
+libvulkan
+```
+
+分类规则按文件顺序匹配。某条 mmap 调用栈命中一个分类后，不会再进入后续分类；
+未命中的调用栈进入 `remaining`。分类名中的 `/` 会生成父子层级，父节点聚合所有
+子分类。
+
+离线分析示例：
+
+```bash
+python3 -u -B mmap_phys_analyzer.py \
+  --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
+  --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
+  --pid <pid> \
+  --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
+  --speedscope-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json \
+  --classify-config 00wann/heap_analyzer/fs.ini \
+  --classify-speedscope-dir mmap_categories \
+  --top-n 50
+```
+
+上例中普通 JSON 和默认 Speedscope 只保留前 50 个调用栈；分类输出仍使用全量最终
+summary，相当于分类口径使用 `--top-n 0`。
+
+分类输出文件：
+
+```text
+mmap_classification_summary.xlsx
+  -> 默认写到 --output 同级目录。
+  -> Summary sheet 输出全量、classified_total、remaining 的 PSS/RSS/virtual 汇总。
+  -> Tree sheet 按 fs.ini 的 / 层级输出父分类、叶子分类和 remaining。
+
+mmap_classification_summary.speedscope.json
+  -> 默认写到 --output 同级目录。
+  -> 每个叶子分类和 remaining 作为一个 sample，权重是 pss_bytes。
+
+mmap_categories/*.speedscope.json
+  -> 只有传 --classify-speedscope-dir 时生成。
+  -> 每个分类叶子、父分类和 remaining 各输出一个 mmap 调用栈火焰图。
+```
+
+可选路径参数：
+
+```text
+--classify-summary-out
+  -> 指定分类 xlsx 路径；相对路径写到 --output 同级目录。
+
+--classify-summary-speedscope-out
+  -> 指定分类汇总 speedscope 路径；相对路径写到 --output 同级目录。
+
+--classify-speedscope-dir
+  -> 指定每分类 speedscope 目录；相对路径写到 --output 同级目录。
+```
+
+分类主指标仍是 `pss_bytes`。`rss_bytes`、`virtual_bytes`、
+`private_dirty_bytes`、`private_clean_bytes`、`shared_dirty_bytes` 和
+`shared_clean_bytes` 会一起写入 xlsx，便于和原始 smaps 口径对账。
 
 ### 验证报告 memory_validation.json
 
@@ -697,13 +1042,52 @@ meminfo.native_heap_pss_plus_swap_pss_bytes
 
 ```bash
 python3 -u -B mmap_phys_analyzer.py \
-  --trace PerfData/mmap_phys/<时间戳>/mmap_trace.perfetto-trace \
+  --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <目标 pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
   --speedscope-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json \
   --trace-processor $PerfettoRoot/out/linux_clang_release/trace_processor_shell
 ```
+
+如果目录中没有 `symbolized-trace`，可以退回使用 `mmap_trace.perfetto-trace`，
+但 `libil2cpp.so` 等业务 so 可能只显示地址或不完整函数名。
+
+## 性能实现说明
+
+`collect_mmap_phys_data.py --no-mmap-callstacks` 的无栈验证只查询目标进程
+mmap/munmap/mremap syscall 和 `stats` 健康信息，不读取
+`stack_profile_callsite`、`stack_profile_frame`、`stack_profile_symbol` 或
+`__intrinsic_perf_sample`，避免把调用栈开销带回无栈验证。
+
+默认主功能启用 mmap 调用栈时，采集后会调用 `mmap_phys_analyzer.py` 做离线分析。
+这里先复用 `heap_profile.py` 的符号化流程：使用 `traceconv symbolize` 按
+`PERFETTO_BINARY_PATH` 生成 `symbols`，再把原始 `mmap_trace.perfetto-trace`
+和 `symbols` 拼成 `symbolized-trace`。离线分析器读取 `symbolized-trace`，
+这样 `libil2cpp.so` 等业务 so 才能按 `workspace/allsymbols/arm64-v8a`
+中的符号文件解析。
+
+离线分析阶段再复用 Native heap 符号查询脚本的性能思路：
+
+```text
+traceconv symbolize 生成 symbolized-trace
+        |
+        v
+trace_processor query 导出基础表
+        |
+        v
+按目标 pid 先缩小 ftrace syscall 事件，再读取 args
+        |
+        v
+Python 内存中展开 stack_profile_callsite parent 链和 inline frame
+        |
+        v
+优先使用 frame.symbol_set_id -> stack_profile_symbol.name 作为 UI 一致符号名，
+每个 inline 符号作为独立 frame 输出到 Speedscope
+```
+
+这样避免在 trace_processor SQL 里递归展开调用栈；同时 syscall 查询不会先全量扫描
+所有进程的 `__intrinsic_args`。
 
 ## 单元测试
 
@@ -728,6 +1112,9 @@ python3 -B -m unittest -v test_mmap_phys_analyzer.py
 10. mmap 验证 SQL 不读取调用栈表，也不读取 heap_profile_allocation。
 11. memory_validation.json 会输出 mmap 事件健康状态，不输出 malloc/native heap 口径校验。
 12. 默认采集时长是 75000 ms，且 dumpsys meminfo 早于 trace 健康检查和离线分析保存。
+13. 主分析 syscall 查询会先按目标 pid 缩小 ftrace 事件，再扫描 args。
+14. mmap 主分析会按 heap_profile.py 风格把 `traceconv symbolize` 的符号包拼成 `symbolized-trace`。
+15. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
 ```
 
 保留单元测试落盘输出：
