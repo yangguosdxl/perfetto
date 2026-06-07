@@ -44,10 +44,6 @@ TRACE_HEALTH_STATS = (
     "ftrace_cpu_dropped_events_delta",
     "ftrace_cpu_has_data_loss",
     "ftrace_cpu_read_events_delta",
-    "heapprofd_buffer_overran",
-    "heapprofd_client_error",
-    "heapprofd_missing_packet",
-    "heapprofd_non_finalized_profile",
 )
 
 
@@ -145,9 +141,6 @@ def build_perfetto_config(name: str,
                           kernel_frames: bool,
                           perf_ring_buffer_pages: int = 4096,
                           perf_ring_buffer_read_period_ms: int = 100,
-                          include_malloc: bool = False,
-                          malloc_sampling_interval_bytes: int = 4096,
-                          malloc_shmem_size_bytes: int = 8 * 1024 * 1024,
                           include_mmap_callstacks: bool = True) -> str:
   kernel_frames_value = "true" if kernel_frames else "false"
   perf_ring_buffer_block = ""
@@ -196,21 +189,6 @@ data_sources {
   }
 }
 """
-  malloc_block = ""
-  if include_malloc:
-    malloc_block = f"""
-data_sources {{
-  config {{
-    name: "android.heapprofd"
-    heapprofd_config {{
-      shmem_size_bytes: {malloc_shmem_size_bytes}
-      sampling_interval_bytes: {malloc_sampling_interval_bytes}
-      process_cmdline: "{name}"
-      heaps: "libc.malloc"
-    }}
-  }}
-}}
-"""
   perf_block = ""
   if include_mmap_callstacks:
     perf_block = f"""
@@ -244,7 +222,6 @@ data_sources {{
 
 {ftrace_block}
 {process_stats_block}
-{malloc_block}
 {perf_block}
 
 duration_ms: {duration_ms}
@@ -508,14 +485,6 @@ def summarize_trace_health(rows):
       "ftrace_read_events": sum_stats({
           "ftrace_cpu_read_events_delta",
       }),
-      "heapprofd_data_loss": sum_stats({
-          "heapprofd_buffer_overran",
-          "heapprofd_missing_packet",
-          "heapprofd_non_finalized_profile",
-      }),
-      "heapprofd_errors": sum_stats({
-          "heapprofd_client_error",
-      }),
   }
 
 
@@ -523,7 +492,7 @@ def format_mib(value: int) -> str:
   return f"{value / 1024 / 1024:.1f} MiB"
 
 
-def print_trace_health(summary, include_heapprofd: bool = True):
+def print_trace_health(summary):
   print("Perfetto buffer 健康检查:")
   print(f"  顶层 trace buffer: size={format_mib(summary['buffer_size_bytes'])}, "
         f"bytes_written={format_mib(summary['bytes_written'])}")
@@ -543,14 +512,6 @@ def print_trace_health(summary, include_heapprofd: bool = True):
     print(f"  WARN: linux.perf 每 CPU ring buffer 丢样本计数="
           f"{summary['perf_data_loss']}，建议增大 --perf-ring-buffer-pages "
           "或降低采样压力")
-  if not include_heapprofd:
-    print("  heapprofd: 未启用，跳过 malloc profile 健康检查")
-  elif summary.get("heapprofd_data_loss", 0) == 0 and summary.get("heapprofd_errors", 0) == 0:
-    print("  OK: heapprofd 未报告共享内存截断或客户端错误")
-  else:
-    print(f"  WARN: heapprofd 异常计数 data_loss={summary.get('heapprofd_data_loss', 0)}, "
-          f"errors={summary.get('heapprofd_errors', 0)}，建议增大 "
-          "--malloc-shmem-size-bytes 或提高 --malloc-sampling-interval-bytes")
 
 
 def check_trace_health(args, trace_path: str):
@@ -562,9 +523,7 @@ def check_trace_health(args, trace_path: str):
     print("跳过 Perfetto buffer 健康检查：stats 查询无结果", file=sys.stderr)
     return None
   summary = summarize_trace_health(rows)
-  print_trace_health(
-      summary,
-      include_heapprofd=args.collect_malloc and args.mmap_callstacks)
+  print_trace_health(summary)
   return summary
 
 
@@ -953,10 +912,6 @@ def build_memory_validation_status(mmap_summary, trace_health):
       mmap_summary.get("syscall_events")) == 0:
     issues.append("mmap_syscall_events_missing")
   if trace_health:
-    if int_value(trace_health.get("heapprofd_data_loss")) > 0:
-      issues.append("heapprofd_data_loss")
-    if int_value(trace_health.get("heapprofd_errors")) > 0:
-      issues.append("heapprofd_errors")
     if int_value(trace_health.get("perfetto_data_loss")) > 0:
       issues.append("perfetto_data_loss")
     if int_value(trace_health.get("ftrace_data_loss")) > 0:
@@ -976,8 +931,8 @@ def write_memory_validation_report(output_dir: str, mmap_summary, meminfo_path: 
   report = {
       "units": "bytes",
       "note": (
-          "无栈验证只检查 mmap syscall events + smaps 的采集健康；"
-          "不启用 heapprofd malloc，也不做 Native Heap Alloc 对比。"),
+          "验证只检查 mmap syscall events + smaps 的采集健康；"
+          "不采集 malloc profile，也不做 Native Heap Alloc 对比。"),
       "mmap": mmap_summary,
       "trace_health": trace_health or {},
       "validation": build_memory_validation_status(mmap_summary, trace_health),
@@ -993,7 +948,6 @@ def write_memory_validation_report(output_dir: str, mmap_summary, meminfo_path: 
     json.dump(report, fd, ensure_ascii=False, indent=2)
     fd.write("\n")
   print("内存验证:")
-  print("  malloc 验证: 已移除（无栈验证不启用 heapprofd）")
   print(f"  mmap PSS: {format_mib(report['mmap'].get('pss_bytes', 0))}")
   print(f"  meminfo Native Heap PSS: "
         f"{format_mib(meminfo['native_heap_pss_bytes'])}")
@@ -1020,9 +974,7 @@ def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str
     if trace_health is None:
       trace_health = combined_inputs.get("trace_health")
       if trace_health:
-        print_trace_health(
-            trace_health,
-            include_heapprofd=args.collect_malloc and args.mmap_callstacks)
+        print_trace_health(trace_health)
     mmap_summary = build_mmap_summary_from_syscalls(
         combined_inputs["syscalls"], pid, os.path.join(args.output, "smaps"))
   else:
@@ -1062,6 +1014,11 @@ def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
   ]
   if args.trace_processor:
     cmd.extend(["--trace-processor", args.trace_processor])
+  if getattr(args, "classify_config", None):
+    cmd.extend(["--classify-config", args.classify_config])
+  top_n = getattr(args, "top_n", None)
+  if top_n is not None:
+    cmd.extend(["--top-n", str(top_n)])
   subprocess.check_call(cmd)
 
 
@@ -1082,15 +1039,6 @@ def parse_args():
                       help="linux.perf 每 CPU ring buffer 页数；0 表示使用 Perfetto 默认值")
   parser.add_argument("--perf-ring-buffer-read-period-ms", type=int, default=100,
                       help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
-  parser.add_argument("--malloc", dest="collect_malloc", action="store_true",
-                      default=True,
-                      help="主功能采集 libc.malloc Native heap profile；无栈验证会忽略该参数")
-  parser.add_argument("--no-malloc", dest="collect_malloc", action="store_false",
-                      help="不采集 libc.malloc 堆快照")
-  parser.add_argument("--malloc-sampling-interval-bytes", type=int, default=4096,
-                      help="heapprofd libc.malloc 采样间隔；1 表示尽量精确")
-  parser.add_argument("--malloc-shmem-size-bytes", type=int, default=32 * 1024 * 1024,
-                      help="heapprofd 共享内存大小，必须是 4096 的倍数且为 2 的幂")
   parser.add_argument("--mmap-callstacks", dest="mmap_callstacks",
                       action="store_true", default=True,
                       help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
@@ -1109,6 +1057,9 @@ def parse_args():
                       help="只采集 trace 和 smaps，不运行离线分析器")
   parser.add_argument("--trace-processor", help="传给 mmap_phys_analyzer.py 的 trace_processor 路径")
   parser.add_argument("--traceconv", help="traceconv 路径；主功能用于生成 symbolized-trace")
+  parser.add_argument("--classify-config", help="传给 mmap_phys_analyzer.py 的 fs.ini 分类配置")
+  parser.add_argument("--top-n", type=int, default=None,
+                      help="传给 mmap_phys_analyzer.py 的调用栈输出数量；0 表示全部")
   parser.add_argument("--analyzer", help="mmap_phys_analyzer.py 路径")
   return parser.parse_args()
 
@@ -1137,9 +1088,6 @@ def run_collection(args, start_target_after_perfetto: bool = False):
       kernel_frames=not args.no_kernel_frames,
       perf_ring_buffer_pages=args.perf_ring_buffer_pages,
       perf_ring_buffer_read_period_ms=args.perf_ring_buffer_read_period_ms,
-      include_malloc=args.collect_malloc and args.mmap_callstacks,
-      malloc_sampling_interval_bytes=args.malloc_sampling_interval_bytes,
-      malloc_shmem_size_bytes=args.malloc_shmem_size_bytes,
       include_mmap_callstacks=args.mmap_callstacks)
   write_config(config, args.output)
   if start_target_after_perfetto:

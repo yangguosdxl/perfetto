@@ -32,9 +32,6 @@ Perfetto linux.process_stats + sched_switch
 Perfetto linux.perf
   -> 在 mmap syscall enter 附近采样调用栈
 
-Perfetto android.heapprofd
-  -> 采集 libc.malloc Native heap profile，用于内存分配调用栈分析和 native heap 口径校验
-
 /proc/<pid>/smaps
   -> 提供每个 VMA 当前真实物理占用：PSS / RSS / PrivateDirty
 
@@ -73,6 +70,16 @@ test_mmap_phys_analyzer.py
 ./run_mmap_phys_profile.sh
 ```
 
+默认入口会给离线分析器追加：
+
+```bash
+--classify-config heap_analyzer/fs.ini --top-n 0
+```
+
+因此默认结果会启用 `fs.ini` 分类，并让普通 Perfetto JSON / 默认 Speedscope 也保留全部
+mmap 调用栈。显式传入新的 `--classify-config` 或 `--top-n` 时，用户参数会排在默认值
+之后生效，只改变本次运行的输出口径。
+
 默认目标进程：
 
 ```text
@@ -100,9 +107,6 @@ linux.ftrace raw_syscalls
 linux.perf callstack_sampling
   -> 在 mmap syscall enter 附近采目标进程调用栈。
 
-android.heapprofd libc.malloc
-  -> 采 libc.malloc Native heap profile；默认开启，用于内存分配分析和附带的总量验证。
-
 /proc/<pid>/smaps
   -> 周期拉取 PSS / RSS / PrivateDirty 快照。
 
@@ -119,6 +123,12 @@ mmap_phys_attribution.json
 mmap_phys_attribution.speedscope.json
   -> Speedscope 可加载的 mmap PSS 火焰图。
 
+mmap_classification_summary.xlsx
+  -> 默认 fs.ini 分类生成的 PSS/RSS/virtual 汇总表。
+
+mmap_classification_summary.speedscope.json
+  -> 默认 fs.ini 分类生成的分类汇总 Speedscope 火焰图。
+
 memory_validation.json
   -> 随采集生成的验证报告；只作为量级校验，不是主功能结果。
 ```
@@ -133,7 +143,7 @@ memory_validation.json
 ./run_mmap_phys_profile.sh --no-mmap-callstacks
 ```
 
-该模式不采 `android.heapprofd`，也不传 `--malloc`、`--malloc-sampling-interval-bytes`、`--malloc-shmem-size-bytes` 或 heapprofd 自动调参参数。malloc 总量验证已经从无栈验证中删除；需要验证 Perfetto malloc 统计能力时，使用独立 heapprofd malloc APK demo。
+该模式不采 `android.heapprofd`。malloc 总量验证已经从无栈验证中删除；需要验证 Perfetto malloc 统计能力时，使用独立 heapprofd malloc APK demo。
 运行无栈验证时脚本会先 `am force-stop` 目标 App，再启动 Perfetto，最后拉起目标 App，确保启动期 mmap syscall 不会在 Perfetto 就绪前漏掉。
 
 验证模式采集和汇总内容：
@@ -197,128 +207,11 @@ mmap_trace.perfetto-trace 和 smaps/
 --no-mmap-callstacks
   -> 进入验证模式：不采 mmap 调用栈，只运行 mmap 事件健康检查。
 
---malloc / --no-malloc
-  -> 主功能是否采集 libc.malloc Native heap profile；默认开启。
-  -> 无栈验证模式会忽略 malloc 采集，不启用 heapprofd。
-
---malloc-sampling-interval-bytes
-  -> heapprofd libc.malloc 采样间隔，默认 4096 bytes。
-  -> 含义不是“只记录大于 4096 bytes 的分配”，也不是“每条调用栈精确代表 4096 bytes”；
-     它是统计抽样的平均间隔。
-  -> heapprofd 会为下一次样本抽一个随机剩余距离 next_sample_bytes。
-     每次 malloc 发生时，用分配大小扣减这个距离；扣到 0 以下时，这次 malloc 被采样。
-  -> 被采样的调用栈来自“触发过阈值的这一次 malloc”，记账量通常按
-     sampling_interval_bytes * 命中次数估算；如果单次分配大于等于采样间隔，
-     实现会直接按该 allocation 的实际大小记账。
-  -> 数值越小，样本越密，malloc live/allocated/freed 的估算越细，但写入共享内存和 unwind 压力越大。
-  -> 数值越大，样本越稀，开销和 heapprofd 截断风险更低，但小分配热点的精度会下降。
-
---malloc-shmem-size-bytes
-  -> heapprofd 共享内存大小，默认 33554432 bytes。
-  -> 目标进程先把 heapprofd 样本写入这块共享内存；如果写入速度超过 heapprofd 消费速度，
-     trace_processor 的 stats 会出现 heapprofd_buffer_overran，说明 malloc profile 已截断。
-
 --no-ftrace
   -> 不采 raw syscall 参数；只能调试 perf 调用栈，不适合最终归因。
 ```
 
 说明：默认情况下，如果普通权限读取 smaps 得到 `Permission denied` 这类无效内容，采集脚本会自动尝试 `su 0`。
-
-### heapprofd malloc 采样机制
-
-`sampling_interval_bytes: 4096` 是“平均每 4096 bytes 分配量采一个样本”的统计参数。真实实现不是固定每累计 4096 bytes 必采一次，而是用指数分布抽出下一次样本到来的字节距离，这样可以避免固定周期刚好错过有规律的分配模式。
-
-流程图：
-
-```plantuml
-@startuml
-title heapprofd sampling_interval_bytes 采样流程
-start
-:配置 sampling_interval_bytes = 4096;
-:抽取 next_sample_bytes\n平均值约为 4096;
-repeat
-  :目标线程执行 malloc(size);
-  if (size >= sampling_interval_bytes?) then (是)
-    :直接采样这次 malloc;
-    :sample_size = size;
-    :记录这次 malloc 的调用栈;
-  else (否)
-    :next_sample_bytes -= size;
-    if (next_sample_bytes <= 0?) then (是)
-      :这次 malloc 跨过采样阈值;
-      :命中次数 samples += 1;
-      :sample_size = 4096 * samples;
-      :记录这次 malloc 的调用栈;
-      :重新抽取并累加下一段\nnext_sample_bytes;
-    else (否)
-      :不记录调用栈;
-    endif
-  endif
-repeat while (继续采集?) is (是)
-stop
-@enduml
-```
-
-数据流图：
-
-```plantuml
-@startuml
-title heapprofd malloc 样本数据流
-rectangle "目标进程 libc.malloc" as malloc
-rectangle "Sampler\nsampling_interval_bytes=4096\nnext_sample_bytes 计数器" as sampler
-rectangle "被采中的 malloc" as sampled
-rectangle "Unwinder\n采这一次 malloc 的调用栈" as unwind
-database "heapprofd shmem\nsample_size + alloc_size + callstack" as shmem
-rectangle "heapprofd producer\n消费 shmem 并写 TracePacket" as producer
-database "trace_processor\nheap_profile_allocation" as tp
-
-malloc --> sampler : alloc_size
-sampler --> sampled : sample_size > 0
-sampled --> unwind : 当前线程栈
-sampled --> shmem : alloc_size / sample_size / address
-unwind --> shmem : callstack_id / frames
-shmem --> producer
-producer --> tp : callsite_id, size, count
-@enduml
-```
-
-调用栈和 4096 的关系：
-
-```text
-采样间隔 4096
-  -> 是统计权重/平均间隔，不是某条调用栈真实分配量。
-
-被采样调用栈
-  -> 属于“跨过采样阈值的那一次 malloc”。
-
-heap_profile_allocation.size
-  -> trace_processor 里最终可查询的估算字节数。
-  -> 对小分配样本，通常按 4096 * 命中次数记账。
-  -> 对单次 size >= 4096 的大分配，heapprofd 实现会按实际 alloc_size 记账。
-```
-
-例子：
-
-```text
-sampling_interval_bytes = 4096
-下一次样本距离假设抽到 3500
-
-malloc A: size=1000, stack=A
-  next_sample_bytes = 2500
-  不采样，A 这次没有调用栈记录。
-
-malloc B: size=2000, stack=B
-  next_sample_bytes = 500
-  不采样，B 这次没有调用栈记录。
-
-malloc C: size=800, stack=C
-  next_sample_bytes = -300
-  C 跨过阈值，被采样。
-  记录 stack=C。
-  小分配估算 sample_size 约为 4096。
-```
-
-这个例子里，`stack=C` 不是说 C 真实分配了 4096 bytes；C 真实只分配了 800 bytes。它表示在统计抽样里，C 这次 malloc 被选中代表这一段分配流。很多样本聚合以后，按调用栈汇总的 `heap_profile_allocation.size` 才是可用于量级判断的估算内存量。
 
 ## Perfetto 采集配置
 
@@ -345,18 +238,6 @@ data_sources {
     name: "linux.process_stats"
     process_stats_config {
       scan_all_processes_on_start: true
-    }
-  }
-}
-
-data_sources {
-  config {
-    name: "android.heapprofd"
-    heapprofd_config {
-      shmem_size_bytes: 33554432
-      sampling_interval_bytes: 4096
-      process_cmdline: "com.tencent.dhwdxkty.trunk.profiler"
-      heaps: "libc.malloc"
     }
   }
 }
@@ -427,7 +308,7 @@ linux.perf / tracepoint / raw_syscalls:sys_enter / filter: "id == 222"
   -> 目标是无栈 mmap 事件健康检查，优先避免 mmap 事件缺失。
 ```
 
-验证模式保留 `linux.ftrace` 和 `linux.process_stats`，不会生成 `android.heapprofd` 或 `linux.perf` 的 `callstack_sampling` 配置；因此验证模式不会采 mmap 调用栈、不会展开 malloc 调用栈，也不会运行 mmap 调用栈归因分析。
+验证模式保留 `linux.ftrace` 和 `linux.process_stats`，不会生成 `linux.perf` 的 `callstack_sampling` 配置；因此验证模式不会采 mmap 调用栈，也不会运行 mmap 调用栈归因分析。当前 mmap 采集路径不生成 `android.heapprofd` 配置；需要验证 Perfetto malloc 统计能力时，使用独立 heapprofd malloc APK demo。
 
 arm64 syscall id：
 
@@ -1385,7 +1266,7 @@ python3 -u -B mmap_phys_analyzer.py \
   --pid <pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
   --speedscope-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json \
-  --classify-config 00wann/heap_analyzer/fs.ini \
+  --classify-config heap_analyzer/fs.ini \
   --classify-speedscope-dir mmap_categories \
   --top-n 50
 ```
@@ -1624,6 +1505,7 @@ Python 内存中展开 stack_profile_callsite parent 链和 inline frame
 
 ```bash
 python3 -B -m unittest -v test_mmap_phys_analyzer.py
+bash test_run_mmap_phys_profile.sh
 bash test_run_mmap_phys_analyze_latest.sh
 ```
 
@@ -1632,13 +1514,13 @@ bash test_run_mmap_phys_analyze_latest.sh
 ```text
 1. trace_processor stderr 日志不会污染 CSV。
 2. raw_syscalls repeated args 会按顺序展开成 arg0 / arg1。
-3. 默认主功能和验证模式都包含 raw_syscalls/sys_enter、raw_syscalls/sys_exit、sched_switch 和 linux.process_stats；验证模式不采 linux.perf 调用栈和 android.heapprofd。
+3. 默认主功能和验证模式都包含 raw_syscalls/sys_enter、raw_syscalls/sys_exit、sched_switch 和 linux.process_stats；验证模式不采 linux.perf 调用栈。
 4. smaps 普通读取无效时会自动尝试 su 0。
 5. mmap + perf sample + munmap 会正确归因到 smaps PSS。
 6. raw syscall 缺少 mmap length 时，用返回地址所在 VMA 归因。
 7. partial munmap 会切分 live range。
-8. 默认主功能会采 mmap 调用栈和 libc.malloc Native heap profile。
-9. 显式验证模式不会采 mmap 调用栈，也不会启用 heapprofd malloc。
+8. 默认主功能会采 mmap 调用栈，但不启用 heapprofd malloc profile。
+9. 显式验证模式不会采 mmap 调用栈，也不会启用 heapprofd。
 10. mmap 验证 SQL 不读取调用栈表，也不读取 heap_profile_allocation。
 11. memory_validation.json 会输出 mmap 事件健康状态，不输出 malloc/native heap 口径校验。
 12. 默认采集时长是 75000 ms，且 dumpsys meminfo 早于 trace 健康检查和离线分析保存。
@@ -1647,7 +1529,8 @@ bash test_run_mmap_phys_analyze_latest.sh
 15. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
 16. smaps 文件名中的设备 uptime ns 不会在 auto 模式下被误判为 ms，避免 Chrome JSON 时间戳溢出。
 17. Chrome JSON counter 事件只输出数值 args，字符串详情放到 instant details 事件，避免 Perfetto 导入时报 `json_parser_failure`。
-18. run_mmap_phys_analyze_latest.sh 默认选择最近的 `symbolized-trace`，自动查询 pid，并允许用户参数覆盖默认输出口径。
+18. run_mmap_phys_profile.sh 默认启用 `--classify-config heap_analyzer/fs.ini --top-n 0`，采集脚本会把这两个参数转交给离线分析器。
+19. run_mmap_phys_analyze_latest.sh 默认选择最近的 `symbolized-trace`，自动查询 pid，并允许用户参数覆盖默认输出口径。
 ```
 
 保留单元测试落盘输出：

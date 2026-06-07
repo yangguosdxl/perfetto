@@ -8,6 +8,8 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 cp "$script_dir/run_mmap_phys_profile.sh" "$tmpdir/run_mmap_phys_profile.sh"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 cp "$script_dir/FSBootCmdLine.cfg" "$tmpdir/FSBootCmdLine.cfg"
+mkdir -p "$tmpdir/heap_analyzer"
+cp "$script_dir/heap_analyzer/fs.ini" "$tmpdir/heap_analyzer/fs.ini"
 
 cat >"$tmpdir/config.sh" <<EOF
 PerfettoRoot="$tmpdir/perfetto"
@@ -33,6 +35,23 @@ export PATH="$tmpdir/bin:$PATH"
 export TEST_LOG="$tmpdir/commands.log"
 
 cd "$tmpdir"
+./run_mmap_phys_profile.sh >"$tmpdir/default.out"
+
+if ! grep -Fq -- "--classify-config heap_analyzer/fs.ini --top-n 0" "$TEST_LOG"; then
+  echo "默认入口应启用 fs.ini 分类并输出全部调用栈"
+  cat "$TEST_LOG"
+  exit 1
+fi
+
+: >"$TEST_LOG"
+./run_mmap_phys_profile.sh --top-n 25 >"$tmpdir/override.out"
+if ! grep -Fq -- "--classify-config heap_analyzer/fs.ini --top-n 0 --top-n 25" "$TEST_LOG"; then
+  echo "显式 --top-n 应保留在默认值之后传给采集脚本，允许 argparse 使用最后一次取值"
+  cat "$TEST_LOG"
+  exit 1
+fi
+
+: >"$TEST_LOG"
 ./run_mmap_phys_profile.sh --no-mmap-callstacks >"$tmpdir/test.out"
 
 if grep -Fq -- "--malloc" "$TEST_LOG"; then

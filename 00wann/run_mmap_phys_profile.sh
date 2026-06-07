@@ -10,6 +10,8 @@ export PATH="$PerfettoRoot/buildtools/linux64/clang/bin:$PATH"
 app=${MMAP_PHYS_APP:-com.tencent.dhwdxkty.trunk.profiler}
 trace_processor=${TRACE_PROCESSOR:-$PerfettoRoot/out/linux_clang_release/trace_processor_shell}
 traceconv=${TRACECONV:-$PerfettoRoot/out/linux_clang_release/traceconv}
+# 默认启用 fs.ini 分类，并输出全部调用栈，方便直接生成完整归因结果。
+default_analyzer_args=(--classify-config heap_analyzer/fs.ini --top-n 0)
 
 source fsbootcmd_push_to_phone.sh
 adb push debugconfig.txt /sdcard/Android/data/$app/files
@@ -18,4 +20,5 @@ python3 collect_mmap_phys_data.py \
   --name "$app" \
   --trace-processor "$trace_processor" \
   --traceconv "$traceconv" \
+  "${default_analyzer_args[@]}" \
   "$@"

@@ -247,31 +247,29 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
             "/data/misc/perfetto-traces/test-trace",
             no_guardrails=False)
 
-  def test_default_config_collects_mmap_and_malloc_callstacks(self):
-    """默认主功能应采 mmap 和内存分配调用栈。"""
+  def test_default_config_collects_mmap_callstacks_without_heapprofd(self):
+    """默认主功能只采 mmap 调用栈，不再启用 heapprofd。"""
     config = collector.build_perfetto_config(
         name="com.example.app",
         duration_ms=1000,
         buffer_kb=1024,
         include_ftrace=True,
-        kernel_frames=True,
-        include_malloc=True)
+        kernel_frames=True)
 
     self.assertIn('ftrace_events: "raw_syscalls/sys_enter"', config)
-    self.assertIn('name: "android.heapprofd"', config)
+    self.assertNotIn('name: "android.heapprofd"', config)
     self.assertIn('name: "linux.perf"', config)
     self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("callstack_sampling", config)
 
   def test_validation_config_does_not_collect_mmap_callstacks(self):
-    """显式验证模式不采 mmap 调用栈，也不启用 heapprofd malloc。"""
+    """显式验证模式不采 mmap 调用栈，也不启用 heapprofd。"""
     config = collector.build_perfetto_config(
         name="com.example.app",
         duration_ms=1000,
         buffer_kb=1024,
         include_ftrace=True,
         kernel_frames=True,
-        include_malloc=False,
         include_mmap_callstacks=False)
 
     self.assertIn('syscall_events: "sys_mmap"', config)
@@ -285,35 +283,60 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertNotIn('name: "linux.perf"', config)
     self.assertNotIn("callstack_sampling", config)
 
-  def test_perfetto_config_collects_malloc_without_allocation_stream(self):
-    """malloc 验证只需要堆快照，不应开启逐次分配流。"""
-    config = collector.build_perfetto_config(
-        name="com.example.app",
-        duration_ms=1000,
-        buffer_kb=1024,
-        include_ftrace=True,
-        kernel_frames=True,
-        perf_ring_buffer_pages=4096,
-        perf_ring_buffer_read_period_ms=100,
-        include_malloc=True,
-        malloc_sampling_interval_bytes=4096,
-        malloc_shmem_size_bytes=8 * 1024 * 1024)
-
-    self.assertIn('name: "android.heapprofd"', config)
-    self.assertIn('process_cmdline: "com.example.app"', config)
-    self.assertIn('heaps: "libc.malloc"', config)
-    self.assertIn("sampling_interval_bytes: 4096", config)
-    self.assertIn("shmem_size_bytes: 8388608", config)
-    self.assertNotIn("stream_allocations", config)
-
   def test_collect_defaults_to_75_seconds(self):
     """默认 mmap 物理内存采集时长应为 1 分 15 秒。"""
     with mock.patch.object(sys, "argv", ["collect_mmap_phys_data.py", "--name", "app"]):
       args = collector.parse_args()
 
     self.assertEqual(args.duration_ms, 75000)
-    self.assertTrue(args.collect_malloc)
     self.assertTrue(args.mmap_callstacks)
+
+  def test_collect_accepts_analyzer_classification_args(self):
+    """采集入口应接受离线分析分类参数，供包装脚本设置默认值。"""
+    with mock.patch.object(sys, "argv", [
+        "collect_mmap_phys_data.py", "--name", "app", "--classify-config",
+        "heap_analyzer/fs.ini", "--top-n", "0"
+    ]):
+      args = collector.parse_args()
+
+    self.assertEqual(args.classify_config, "heap_analyzer/fs.ini")
+    self.assertEqual(args.top_n, 0)
+
+  def test_run_analyzer_forwards_classify_config_and_top_n(self):
+    """采集完成后应把分类配置和 top_n 转交给 mmap 离线分析器。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      analyzer_path = os.path.join(tmpdir, "mmap_phys_analyzer.py")
+      with open(analyzer_path, "w", encoding="utf-8") as fd:
+        fd.write("#!/usr/bin/env python3\n")
+      args = collector.argparse.Namespace(
+          output=tmpdir,
+          trace_processor="tp",
+          analyzer=analyzer_path,
+          classify_config="heap_analyzer/fs.ini",
+          top_n=0)
+      with mock.patch.object(collector.subprocess, "check_call") as check_call:
+        collector.run_analyzer(args, 1234, "symbolized-trace", "smaps")
+
+    cmd = check_call.call_args.args[0]
+    self.assertIn("--classify-config", cmd)
+    self.assertIn("heap_analyzer/fs.ini", cmd)
+    self.assertIn("--top-n", cmd)
+    self.assertIn("0", cmd)
+
+  def test_collect_cli_no_longer_exposes_malloc_collection(self):
+    """mmap 采集脚本不再暴露 malloc/heapprofd 采集参数。"""
+    with mock.patch.object(sys, "argv", ["collect_mmap_phys_data.py", "--name", "app"]):
+      args = collector.parse_args()
+
+    self.assertFalse(hasattr(args, "collect_malloc"))
+    self.assertFalse(hasattr(args, "malloc_sampling_interval_bytes"))
+    self.assertFalse(hasattr(args, "malloc_shmem_size_bytes"))
+
+    with mock.patch.object(sys, "argv", [
+        "collect_mmap_phys_data.py", "--name", "app", "--malloc"
+    ]):
+      with self.assertRaises(SystemExit):
+        collector.parse_args()
 
   def test_main_captures_meminfo_before_trace_analysis(self):
     """采样结束后应先保存 meminfo，再运行 trace 健康检查和离线分析。"""
@@ -327,9 +350,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           buffer_kb=262144,
           perf_ring_buffer_pages=8192,
           perf_ring_buffer_read_period_ms=100,
-          collect_malloc=True,
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=8 * 1024 * 1024,
           mmap_callstacks=True,
           no_ftrace=False,
           no_kernel_frames=False,
@@ -384,9 +404,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           buffer_kb=262144,
           perf_ring_buffer_pages=8192,
           perf_ring_buffer_read_period_ms=100,
-          collect_malloc=True,
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=8 * 1024 * 1024,
           mmap_callstacks=True,
           no_ftrace=False,
           no_kernel_frames=False,
@@ -432,9 +449,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           buffer_kb=262144,
           perf_ring_buffer_pages=8192,
           perf_ring_buffer_read_period_ms=100,
-          collect_malloc=True,
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=32 * 1024 * 1024,
           mmap_callstacks=False,
           no_ftrace=False,
           no_kernel_frames=False,
@@ -473,9 +487,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           buffer_kb=262144,
           perf_ring_buffer_pages=8192,
           perf_ring_buffer_read_period_ms=100,
-          collect_malloc=True,
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=32 * 1024 * 1024,
           mmap_callstacks=False,
           no_ftrace=False,
           no_kernel_frames=False,
@@ -512,7 +523,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertLess(calls.index("wait_for_pid"), calls.index("collect_smaps"))
 
   def test_no_mmap_callstacks_does_not_enable_heapprofd(self):
-    """无栈验证即使保留默认 collect_malloc，也不能生成 heapprofd 配置。"""
+    """无栈验证不能生成 heapprofd 配置。"""
     with tempfile.TemporaryDirectory() as tmpdir:
       args = collector.argparse.Namespace(
           name="com.example.app",
@@ -523,9 +534,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           buffer_kb=262144,
           perf_ring_buffer_pages=8192,
           perf_ring_buffer_read_period_ms=100,
-          collect_malloc=True,
-          malloc_sampling_interval_bytes=4096,
-          malloc_shmem_size_bytes=32 * 1024 * 1024,
           mmap_callstacks=False,
           no_ftrace=False,
           no_kernel_frames=False,
@@ -575,8 +583,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(summary["buffer_size_bytes"], 256 * 1024 * 1024)
     self.assertEqual(summary["bytes_written"], 32 * 1024 * 1024)
 
-  def test_trace_health_summary_flags_heapprofd_overrun(self):
-    """健康检查需要暴露 heapprofd 截断，避免 malloc 结果被当成完整数据。"""
+  def test_trace_health_summary_ignores_heapprofd_rows(self):
+    """mmap 采集健康检查不再把 heapprofd 统计纳入结果。"""
     rows = [
         {"name": "heapprofd_buffer_overran", "idx": "7045", "value": "1"},
         {"name": "heapprofd_client_error", "idx": "7045", "value": "1"},
@@ -586,12 +594,12 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     summary = collector.summarize_trace_health(rows)
 
-    self.assertEqual(summary["heapprofd_data_loss"], 1)
-    self.assertEqual(summary["heapprofd_errors"], 1)
     self.assertEqual(summary["ftrace_read_events"], 50)
+    self.assertNotIn("heapprofd_data_loss", summary)
+    self.assertNotIn("heapprofd_errors", summary)
 
-  def test_trace_health_prints_warning_for_heapprofd_overrun(self):
-    """heapprofd 数据截断时，终端健康检查必须输出 WARN。"""
+  def test_trace_health_print_does_not_mention_heapprofd(self):
+    """终端健康检查只输出 mmap 采集相关 buffer 状态。"""
     out = io.StringIO()
     summary = {
         "buffer_size_bytes": 256 * 1024 * 1024,
@@ -599,34 +607,12 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         "perfetto_data_loss": 0,
         "ftrace_data_loss": 0,
         "perf_data_loss": 0,
-        "heapprofd_data_loss": 1,
-        "heapprofd_errors": 0,
     }
 
     with mock.patch.object(sys, "stdout", out):
       collector.print_trace_health(summary)
 
-    self.assertIn("WARN: heapprofd", out.getvalue())
-    self.assertIn("data_loss=1", out.getvalue())
-
-  def test_trace_health_skips_heapprofd_when_malloc_is_disabled(self):
-    """无栈验证未启用 heapprofd 时，不应输出 heapprofd OK 造成误导。"""
-    out = io.StringIO()
-    summary = {
-        "buffer_size_bytes": 256 * 1024 * 1024,
-        "bytes_written": 16 * 1024 * 1024,
-        "perfetto_data_loss": 0,
-        "ftrace_data_loss": 0,
-        "perf_data_loss": 0,
-        "heapprofd_data_loss": 0,
-        "heapprofd_errors": 0,
-    }
-
-    with mock.patch.object(sys, "stdout", out):
-      collector.print_trace_health(summary, include_heapprofd=False)
-
-    self.assertIn("heapprofd: 未启用", out.getvalue())
-    self.assertNotIn("OK: heapprofd", out.getvalue())
+    self.assertNotIn("heapprofd", out.getvalue())
 
   def test_wait_status_includes_elapsed_seconds(self):
     """等待应用启动的进度需要在同一行展示累计秒数。"""
