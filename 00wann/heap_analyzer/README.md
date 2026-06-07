@@ -7,11 +7,39 @@
 | 文件 | 作用 |
 | --- | --- |
 | `query_heap_alloc_stacks_by_symbol.py` | 推荐入口。用 `trace_processor query` 导出基础表，在 Python 内存中建调用栈图并汇总分配，避免 SQL 递归超时。 |
+| `../run_heap_alloc_stacks_by_symbol_latest.sh` | 最新 trace wrapper。自动选择 `PerfData/mem` 下最近一次 trace，并默认执行 `fs.ini` 全量分类。 |
 | `heap_alloc_stacks_by_symbol.sql` | SQL 语义参考。完整递归展开调用栈，在大 trace 上可能超时。 |
 
 ## 使用方式
 
-推荐在 `/home/dianhun/disk2/work/fsprofiler` 目录执行优化脚本：
+推荐在工程根目录 `/home/dianhun/disk2/perfetto/00wann` 执行 wrapper；
+直接调用 Python 脚本时也建议在工程根目录执行，确保
+`heap_analyzer/fs.ini` 等相对路径生效：
+
+如果只需要分析最近一次 Native heap trace，优先使用 wrapper：
+
+```bash
+./run_heap_alloc_stacks_by_symbol_latest.sh
+```
+
+wrapper 会自动选择 `PerfData/mem` 下最近一次 trace，优先使用同目录的
+`symbolized-trace`，并默认追加：
+
+```bash
+--classify-config heap_analyzer/fs.ini --all-allocations --limit 0
+```
+
+用户参数会追加在默认参数之后，因此可以覆盖默认值：
+
+```bash
+./run_heap_alloc_stacks_by_symbol_latest.sh --limit 25
+./run_heap_alloc_stacks_by_symbol_latest.sh --trace /path/to/symbolized-trace
+./run_heap_alloc_stacks_by_symbol_latest.sh --symbol malloc --limit 50
+```
+
+显式传入 `--symbol` 时，wrapper 不会强制追加默认 `--all-allocations`，
+这样仍可按符号筛选调用栈；如需符号参数同时保留全量模式，可显式传入
+`--all-allocations`。
 
 ```bash
 python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
