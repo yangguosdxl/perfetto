@@ -351,6 +351,8 @@ speedscope 文件也按同一棵分类树输出：父节点文件聚合所有子
 
 `summary.speedscope.json` 是 summary 的分类树视图：每个 sample 对应一个叶子分类或 `remaining`，调用栈形态为 `Native heap summary / classified / 大分类 / 子分类`。父分类由 speedscope 聚合显示，因此不会重复计入父子节点的字节数。
 
+每次重跑分类明细输出时，脚本会先清理 `pprof_categories/*.pprof.pb.gz`，以及通过 `--classify-speedscope-dir` 指定目录里的 `*.speedscope.json`。这样调整 `fs.ini` 顺序或关键字后，旧编号分类文件不会继续混在新结果里。例如 `UIManager` 已先命中 `fsui` 时，旧的 `07_hybridclr.pprof.pb.gz` 会在重跑时删除，不会再误导为 `hybridclr` 分类结果。
+
 如果只想先确认符号是否存在，优先运行上面的快速查询；如果快速查询能命中，再运行完整分配栈查询。
 
 如果完整查询超时，可以先降低输出规模：

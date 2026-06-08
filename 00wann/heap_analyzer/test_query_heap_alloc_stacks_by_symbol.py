@@ -128,6 +128,49 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
     self.assertIn("meta", result.stdout)
     self.assertIn("category:[il2cpp/meta]", result.stdout)
 
+  def test_write_classification_pprof_files_removes_stale_category_files(self):
+    """重跑分类输出前应删除旧分类文件，避免旧 hybridclr 结果污染新 UI 分类。"""
+    callsites = {
+        1: analyzer.Callsite(parent_id=None, frame_id=10, depth=0),
+        2: analyzer.Callsite(parent_id=1, frame_id=20, depth=1),
+        3: analyzer.Callsite(parent_id=1, frame_id=30, depth=1),
+    }
+    frame_labels = {
+        10: "Root",
+        20: "UIManager",
+        30: "hybridclr::metadata",
+    }
+    ui_alloc = analyzer.Allocation(7, "libc.malloc", 2, 1, 4096)
+    hybrid_alloc = analyzer.Allocation(7, "libc.malloc", 3, 1, 8192)
+    classified = [
+        (
+            analyzer.ClassificationRule("fsui", ("UIManager",)),
+            [analyzer.ClassifiedAllocation(ui_alloc, ("UIManager", "Root"))],
+        ),
+        (
+            analyzer.ClassificationRule("hybridclr/other", ("hybridclr",)),
+            [analyzer.ClassifiedAllocation(
+                hybrid_alloc, ("hybridclr::metadata", "Root"))],
+        ),
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      stale_path = os.path.join(tmpdir, "01_hybridclr.pprof.pb.gz")
+      with open(stale_path, "wb") as output:
+        output.write(b"old hybridclr result with UIManager")
+
+      analyzer.write_classification_pprof_files(
+          tmpdir,
+          classified,
+          remaining=[],
+          callsites=callsites,
+          frame_labels=frame_labels,
+          processes={7: (1234, "game")})
+
+      self.assertFalse(os.path.exists(stale_path))
+      self.assertTrue(os.path.exists(os.path.join(tmpdir, "01_fsui.pprof.pb.gz")))
+      self.assertTrue(os.path.exists(os.path.join(tmpdir, "02_hybridclr.pprof.pb.gz")))
+
   def test_write_pprof_outputs_profile_readable_by_go_pprof(self):
     """pprof 输出必须能被 go tool pprof 读取，并保留正负净值口径。"""
     callsites = {

@@ -321,6 +321,18 @@ def ensure_parent_dir(path: str) -> None:
   common_classification.ensure_parent_dir(path)
 
 
+def remove_stale_generated_files(output_dir: str, suffix: str) -> None:
+  """清理旧生成文件，避免分类规则顺序变化后残留旧编号结果。"""
+  if not os.path.isdir(output_dir):
+    return
+  for name in os.listdir(output_dir):
+    if not name.endswith(suffix):
+      continue
+    path = os.path.join(output_dir, name)
+    if os.path.isfile(path):
+      os.remove(path)
+
+
 def is_explicit_arg(argv: list[str], name: str) -> bool:
   """判断用户是否显式传入某个 argparse 长参数。"""
   return any(arg == name or arg.startswith(f"{name}=") for arg in argv)
@@ -510,6 +522,7 @@ def write_classification_speedscope_files(
   import os
 
   os.makedirs(output_dir, exist_ok=True)
+  remove_stale_generated_files(output_dir, ".speedscope.json")
   for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
     allocations = [item.item for item in entry.items]
@@ -891,6 +904,7 @@ def write_classification_pprof_files(
 ) -> None:
   """为分类树每个节点输出一个 pprof 明细文件。"""
   os.makedirs(output_dir, exist_ok=True)
+  remove_stale_generated_files(output_dir, ".pprof.pb.gz")
   for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
     allocations = [item.item for item in entry.items]

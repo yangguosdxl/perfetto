@@ -47,6 +47,32 @@ class ClassificationTest(unittest.TestCase):
         [item.item["id"] for item in entry_by_path[("remaining",)].items],
         [3])
 
+  def test_first_matching_rule_wins_when_ui_and_hybridclr_keywords_overlap(self):
+    """同时命中 UIManager 和 hybridclr 时，应按 fs.ini 顺序优先归入 UI。"""
+    rules = [
+        classification.ClassificationRule("fsui", ("UIManager",)),
+        classification.ClassificationRule("hybridclr/other", ("hybridclr",)),
+    ]
+    items = [
+        {
+            "id": 1,
+            "stack": (
+                "Game.UI.UIManager::Open",
+                "hybridclr::metadata::Image::Load",
+                "Root",
+            ),
+        },
+    ]
+
+    classified, remaining = classification.classify_items(
+        items,
+        rules,
+        lambda item: item["stack"])
+
+    self.assertEqual([item.item["id"] for item in classified[0][1]], [1])
+    self.assertEqual(classified[1][1], [])
+    self.assertEqual(remaining, [])
+
   def test_sanitize_filename_keeps_portable_category_name(self):
     """分类名写文件前应替换路径和空白等不可移植字符。"""
     self.assertEqual(
