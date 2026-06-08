@@ -975,9 +975,9 @@ SymbolizeResult LocalSymbolizer::Symbolize(
     // symbol elfs always seem to have the text segment's `p_offset` zeroed out.
     // Whereas with libunwindstack, `p_offset` should always be greater than
     // zero.
-    //addr_correction = (binary->p_vaddr - binary->p_offset) - load_bias;
-    PERFETTO_DLOG("wann Correcting load bias by %" PRIu64 " for %s", addr_correction,
-                  mapping_name.c_str());
+    // addr_correction = (binary->p_vaddr - binary->p_offset) - load_bias;
+    PERFETTO_DLOG("wann Correcting load bias by %" PRIu64 " for %s",
+                  addr_correction, mapping_name.c_str());
   }
   SymbolizeResult result;
   result.frames.reserve(addresses.size());

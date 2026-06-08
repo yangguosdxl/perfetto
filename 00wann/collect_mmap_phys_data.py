@@ -20,7 +20,6 @@ import time
 from datetime import datetime
 from typing import Optional
 
-
 ARM64_MMAP_NR = 222
 ARM64_MUNMAP_NR = 215
 ARM64_MREMAP_NR = 216
@@ -60,18 +59,21 @@ def run(args, **kwargs):
 def check_output(args, log: bool = True, **kwargs) -> str:
   if log:
     print("+ " + " ".join(args))
-  return subprocess.check_output(args, **kwargs).decode("utf-8", errors="replace")
+  return subprocess.check_output(args, **kwargs).decode(
+      "utf-8", errors="replace")
 
 
 def adb_shell(cmd: str, log: bool = True) -> str:
-  return check_output(["adb", "shell", cmd], log=log, stderr=subprocess.STDOUT).strip()
+  return check_output(["adb", "shell", cmd], log=log,
+                      stderr=subprocess.STDOUT).strip()
 
 
 def format_wait_status(name: str, elapsed_s: float) -> str:
   return f"等待应用启动: {name} 已等待 {elapsed_s:.1f}s"
 
 
-def format_smaps_progress_line(path: str, size_bytes: int, remaining_s: float) -> str:
+def format_smaps_progress_line(path: str, size_bytes: int,
+                               remaining_s: float) -> str:
   return f"smaps 快照: {path} ({size_bytes} bytes) 剩余: {max(0.0, remaining_s):.1f}s"
 
 
@@ -91,8 +93,7 @@ def force_stop_app(name: str, timeout_s: float = 5.0):
     if not out:
       return
     time.sleep(0.2)
-  print(f"WARN: force-stop 后目标进程仍存在，将继续尝试重新采集: {name}",
-        file=sys.stderr)
+  print(f"WARN: force-stop 后目标进程仍存在，将继续尝试重新采集: {name}", file=sys.stderr)
 
 
 class TwoLineProgress:
@@ -148,7 +149,8 @@ def build_perfetto_config(name: str,
     perf_ring_buffer_block += f"      ring_buffer_pages: {perf_ring_buffer_pages}\n"
   if perf_ring_buffer_read_period_ms > 0:
     perf_ring_buffer_block += (
-        f"      ring_buffer_read_period_ms: {perf_ring_buffer_read_period_ms}\n")
+        f"      ring_buffer_read_period_ms: {perf_ring_buffer_read_period_ms}\n"
+    )
   ftrace_block = ""
   if include_ftrace:
     # 部分设备没有 per-syscall tracefs 目录，syscall_events 会产出 0 个事件；
@@ -241,18 +243,14 @@ def write_config(config: str, output_dir: str) -> str:
 
 def start_perfetto(config: str, device_trace: str, no_guardrails: bool) -> int:
   cmd = [
-      "adb", "shell", "perfetto", "--txt", "-c", "-",
-      "-o", device_trace, "-d"
+      "adb", "shell", "perfetto", "--txt", "-c", "-", "-o", device_trace, "-d"
   ]
   if no_guardrails:
     cmd.append("--no-guardrails")
   print("+ " + " ".join(cmd) + " < mmap_phys_config.pbtxt")
   try:
     out = check_output(
-        cmd,
-        log=False,
-        input=config.encode("utf-8"),
-        stderr=subprocess.STDOUT)
+        cmd, log=False, input=config.encode("utf-8"), stderr=subprocess.STDOUT)
   except subprocess.CalledProcessError as exc:
     output = exc.output.decode("utf-8", errors="replace") if exc.output else ""
     raise RuntimeError(
@@ -271,10 +269,9 @@ def device_time_ns(log: bool = True) -> int:
 
 
 def is_process_alive(pid: int) -> bool:
-  return subprocess.call(
-      ["adb", "shell", f"[ -d /proc/{pid} ]"],
-      stdout=subprocess.DEVNULL,
-      stderr=subprocess.DEVNULL) == 0
+  return subprocess.call(["adb", "shell", f"[ -d /proc/{pid} ]"],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL) == 0
 
 
 def is_valid_smaps(data: bytes) -> bool:
@@ -297,14 +294,15 @@ def read_smaps_with_run_as(pid: int, package: str) -> bytes:
   return subprocess.check_output(cmd, stderr=subprocess.STDOUT)
 
 
-def read_smaps(pid: int, use_su: bool, run_as_package: Optional[str] = None) -> bytes:
+def read_smaps(pid: int,
+               use_su: bool,
+               run_as_package: Optional[str] = None) -> bytes:
   data = read_smaps_with_mode(pid, use_su)
   if is_valid_smaps(data):
     return data
   if not use_su:
     if run_as_package:
-      print(f"普通权限读取 smaps 无效，自动尝试 run-as {run_as_package}",
-            file=sys.stderr)
+      print(f"普通权限读取 smaps 无效，自动尝试 run-as {run_as_package}", file=sys.stderr)
       data = read_smaps_with_run_as(pid, run_as_package)
       if is_valid_smaps(data):
         return data
@@ -342,8 +340,9 @@ def collect_smaps(pid: int,
       progress.update("+ adb shell cat /proc/uptime",
                       format_smaps_progress_line(path, len(data), remaining_s))
     except subprocess.CalledProcessError as exc:
-      print(f"读取 smaps 失败: {exc.output.decode('utf-8', errors='replace')}",
-            file=sys.stderr)
+      print(
+          f"读取 smaps 失败: {exc.output.decode('utf-8', errors='replace')}",
+          file=sys.stderr)
     except RuntimeError as exc:
       print(f"读取 smaps 失败: {exc}", file=sys.stderr)
     time.sleep(interval_s)
@@ -366,7 +365,8 @@ def pull_trace(device_trace: str, host_trace: str):
   print(f"trace 已保存: {host_trace}")
 
 
-def symbolize_trace(traceconv: Optional[str], trace_path: str, output_dir: str) -> str:
+def symbolize_trace(traceconv: Optional[str], trace_path: str,
+                    output_dir: str) -> str:
   """按 heap_profile.py 的方式把 traceconv 符号包拼回 trace。"""
   if not traceconv:
     print("跳过 trace 符号化：未指定 --traceconv", file=sys.stderr)
@@ -374,7 +374,8 @@ def symbolize_trace(traceconv: Optional[str], trace_path: str, output_dir: str) 
   binary_path = os.getenv("PERFETTO_BINARY_PATH")
   if not binary_path:
     print("跳过 trace 符号化：未设置 PERFETTO_BINARY_PATH，"
-          "libil2cpp.so 等业务 so 无法自动解析", file=sys.stderr)
+          "libil2cpp.so 等业务 so 无法自动解析",
+          file=sys.stderr)
     return trace_path
 
   symbols_path = os.path.join(output_dir, "symbols")
@@ -382,13 +383,13 @@ def symbolize_trace(traceconv: Optional[str], trace_path: str, output_dir: str) 
   print("+ " + " ".join([traceconv, "symbolize", trace_path]) +
         f" > {symbols_path}")
   with open(symbols_path, "wb") as symbols:
-    ret = subprocess.call(
-        [traceconv, "symbolize", trace_path],
-        env=dict(os.environ, PERFETTO_BINARY_PATH=binary_path),
-        stdout=symbols)
+    ret = subprocess.call([traceconv, "symbolize", trace_path],
+                          env=dict(
+                              os.environ, PERFETTO_BINARY_PATH=binary_path),
+                          stdout=symbols)
   if ret != 0:
-    print(f"WARN: traceconv symbolize 失败，退出码={ret}，继续使用原始 trace",
-          file=sys.stderr)
+    print(
+        f"WARN: traceconv symbolize 失败，退出码={ret}，继续使用原始 trace", file=sys.stderr)
     return trace_path
 
   # Perfetto 的符号包是追加 packet；与 raw trace 拼接后 trace_processor 可直接读取。
@@ -404,11 +405,13 @@ def symbolize_trace(traceconv: Optional[str], trace_path: str, output_dir: str) 
   return symbolized_path
 
 
-def parse_trace_processor_csv(output: str, required_columns=("name", "idx", "value")):
+def parse_trace_processor_csv(output: str,
+                              required_columns=("name", "idx", "value")):
   """从 trace_processor 日志混合输出里截取 CSV 查询结果。"""
   # trace_processor 的耗时日志有时会直接贴在 CSV 最后一行后面，先按日志前缀截断。
-  lines = [re.sub(r"\[\d+\.\d+\]\s+.*$", "", line)
-           for line in output.splitlines()]
+  lines = [
+      re.sub(r"\[\d+\.\d+\]\s+.*$", "", line) for line in output.splitlines()
+  ]
   header_index = None
   for i, line in enumerate(lines):
     try:
@@ -429,17 +432,15 @@ def parse_trace_processor_csv(output: str, required_columns=("name", "idx", "val
 
 def query_trace_health(trace_processor: str, trace_path: str):
   quoted_names = ", ".join(f"'{name}'" for name in TRACE_HEALTH_STATS)
-  sql = (
-      "select name, idx, value from stats "
-      f"where name in ({quoted_names}) "
-      "order by name, idx")
+  sql = ("select name, idx, value from stats "
+         f"where name in ({quoted_names}) "
+         "order by name, idx")
   print("+ " + " ".join([trace_processor, "query", trace_path, sql]))
-  proc = subprocess.run(
-      [trace_processor, "query", trace_path, sql],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      check=False)
+  proc = subprocess.run([trace_processor, "query", trace_path, sql],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False)
   if proc.returncode != 0:
     print("Perfetto buffer 健康检查失败:", file=sys.stderr)
     print(proc.stdout, file=sys.stderr)
@@ -448,43 +449,52 @@ def query_trace_health(trace_processor: str, trace_path: str):
 
 
 def summarize_trace_health(rows):
+
   def sum_stats(names):
     return sum(
-        int(row["value"]) for row in rows
+        int(row["value"])
+        for row in rows
         if row.get("name") in names and row.get("value") not in ("", None))
 
   def max_stat(name):
     values = [
-        int(row["value"]) for row in rows
+        int(row["value"])
+        for row in rows
         if row.get("name") == name and row.get("value") not in ("", None)
     ]
     return max(values) if values else 0
 
   # 分开统计三类 buffer，便于定位应该调哪个配置项。
   return {
-      "buffer_size_bytes": max_stat("traced_buf_buffer_size"),
-      "bytes_written": max_stat("traced_buf_bytes_written"),
-      "perfetto_data_loss": sum_stats({
-          "traced_buf_bytes_overwritten",
-          "traced_buf_chunks_overwritten",
-          "traced_buf_chunks_discarded",
-          "traced_buf_trace_writer_packet_loss",
-          "traced_buf_patches_failed",
-          "traced_buf_abi_violations",
-      }),
-      "perf_data_loss": sum_stats({
-          "perf_cpu_lost_records",
-          "perf_aux_lost",
-      }),
-      "ftrace_data_loss": sum_stats({
-          "ftrace_cpu_overrun_delta",
-          "ftrace_cpu_commit_overrun_delta",
-          "ftrace_cpu_dropped_events_delta",
-          "ftrace_cpu_has_data_loss",
-      }),
-      "ftrace_read_events": sum_stats({
-          "ftrace_cpu_read_events_delta",
-      }),
+      "buffer_size_bytes":
+          max_stat("traced_buf_buffer_size"),
+      "bytes_written":
+          max_stat("traced_buf_bytes_written"),
+      "perfetto_data_loss":
+          sum_stats({
+              "traced_buf_bytes_overwritten",
+              "traced_buf_chunks_overwritten",
+              "traced_buf_chunks_discarded",
+              "traced_buf_trace_writer_packet_loss",
+              "traced_buf_patches_failed",
+              "traced_buf_abi_violations",
+          }),
+      "perf_data_loss":
+          sum_stats({
+              "perf_cpu_lost_records",
+              "perf_aux_lost",
+          }),
+      "ftrace_data_loss":
+          sum_stats({
+              "ftrace_cpu_overrun_delta",
+              "ftrace_cpu_commit_overrun_delta",
+              "ftrace_cpu_dropped_events_delta",
+              "ftrace_cpu_has_data_loss",
+          }),
+      "ftrace_read_events":
+          sum_stats({
+              "ftrace_cpu_read_events_delta",
+          }),
   }
 
 
@@ -543,8 +553,7 @@ def parse_meminfo_summary(text: str):
 
   def numbers_in(line: str):
     return [
-        int(item.replace(",", ""))
-        for item in re.findall(r"-?[\d,]+", line)
+        int(item.replace(",", "")) for item in re.findall(r"-?[\d,]+", line)
     ]
 
   for raw_line in text.splitlines():
@@ -574,24 +583,24 @@ def capture_meminfo(name: str, output_dir: str) -> str:
   return path
 
 
-def query_mmap_validation_syscalls(trace_processor: str, trace_path: str, pid: int):
+def query_mmap_validation_syscalls(trace_processor: str, trace_path: str,
+                                   pid: int):
   """只查询目标进程 mmap/munmap/mremap syscall，不读取调用栈表。"""
   import mmap_phys_analyzer as analyzer
 
   sql = build_mmap_validation_syscalls_sql(pid)
   print("+ " + " ".join([trace_processor, "query", trace_path, sql]))
-  proc = subprocess.run(
-      [trace_processor, "query", trace_path, sql],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      check=False)
+  proc = subprocess.run([trace_processor, "query", trace_path, sql],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False)
   if proc.returncode != 0:
     raise RuntimeError("查询 mmap syscall 失败:\n" + proc.stdout)
   rows = parse_trace_processor_csv(
       proc.stdout,
-      required_columns=("event_id", "ts", "utid", "event_name", "arg_id",
-                        "key", "int_value", "string_value", "value_type"))
+      required_columns=("event_id", "ts", "utid", "event_name", "arg_id", "key",
+                        "int_value", "string_value", "value_type"))
   return build_syscall_events_from_rows(rows, analyzer)
 
 
@@ -760,49 +769,47 @@ ORDER BY sort_section, sort_ts, sort_id, sort_arg
 """
 
 
-def query_memory_validation_inputs(trace_processor: str, trace_path: str, pid: int):
+def query_memory_validation_inputs(trace_processor: str, trace_path: str,
+                                   pid: int):
   """一次冷加载 trace，拿齐无栈 mmap 健康检查输入。"""
   import mmap_phys_analyzer as analyzer
 
   sql = build_memory_validation_inputs_sql(pid)
   print("+ " + " ".join([trace_processor, "query", trace_path, sql]))
-  proc = subprocess.run(
-      [trace_processor, "query", trace_path, sql],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.STDOUT,
-      text=True,
-      check=False)
+  proc = subprocess.run([trace_processor, "query", trace_path, sql],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False)
   if proc.returncode != 0:
     raise RuntimeError("查询内存验证输入失败:\n" + proc.stdout)
   rows = parse_trace_processor_csv(
       proc.stdout,
       required_columns=("section", "c0", "c1", "c2", "c3", "c4", "c5", "c6",
                         "c7", "c8", "c9"))
-  health_rows = [
-      {"name": row.get("c0", ""), "idx": row.get("c1", ""), "value": row.get("c2", "")}
-      for row in rows
-      if row.get("section") == "health"
-  ]
-  syscall_rows = [
-      {
-          "event_id": row.get("c0", ""),
-          "ts": row.get("c1", ""),
-          "utid": row.get("c2", ""),
-          "event_name": row.get("c3", ""),
-          "arg_id": row.get("c4", ""),
-          "key": row.get("c5", ""),
-          "int_value": row.get("c6", ""),
-          "string_value": row.get("c7", ""),
-          "value_type": row.get("c8", ""),
-      }
-      for row in rows
-      if row.get("section") == "syscall" and all(
-          row.get(key) not in ("", None)
-          for key in ("c0", "c1", "c2", "c3", "c4", "c5"))
-  ]
+  health_rows = [{
+      "name": row.get("c0", ""),
+      "idx": row.get("c1", ""),
+      "value": row.get("c2", "")
+  } for row in rows if row.get("section") == "health"]
+  syscall_rows = [{
+      "event_id": row.get("c0", ""),
+      "ts": row.get("c1", ""),
+      "utid": row.get("c2", ""),
+      "event_name": row.get("c3", ""),
+      "arg_id": row.get("c4", ""),
+      "key": row.get("c5", ""),
+      "int_value": row.get("c6", ""),
+      "string_value": row.get("c7", ""),
+      "value_type": row.get("c8", ""),
+  } for row in rows if row.get("section") == "syscall" and all(
+      row.get(key) not in ("", None)
+      for key in ("c0", "c1", "c2", "c3", "c4", "c5"))]
   return {
-      "trace_health": summarize_trace_health(health_rows) if health_rows else None,
-      "syscalls": build_syscall_events_from_rows(syscall_rows, analyzer),
+      "trace_health":
+          summarize_trace_health(health_rows) if health_rows else None,
+      "syscalls":
+          build_syscall_events_from_rows(syscall_rows, analyzer),
   }
 
 
@@ -874,16 +881,23 @@ def build_mmap_summary_from_syscalls(syscalls, pid: int, smaps_dir: str):
   import mmap_phys_analyzer as analyzer
 
   lifecycle = build_mmap_validation_lifecycle(syscalls, pid)
-  snapshots = analyzer.load_snapshots(smaps_dir, pid=pid, unit="auto", offset_ns=0)
+  snapshots = analyzer.load_snapshots(
+      smaps_dir, pid=pid, unit="auto", offset_ns=0)
   if not snapshots:
-    return {"pss_bytes": 0, "rss_bytes": 0, "virtual_bytes": 0,
-            "syscall_events": len(syscalls), "lifecycle_events": len(lifecycle)}
+    return {
+        "pss_bytes": 0,
+        "rss_bytes": 0,
+        "virtual_bytes": 0,
+        "syscall_events": len(syscalls),
+        "lifecycle_events": len(lifecycle)
+    }
 
   ranges = []
   event_index = 0
   final_stats = {}
   for snapshot in snapshots:
-    while event_index < len(lifecycle) and lifecycle[event_index][0] <= snapshot.ts:
+    while event_index < len(
+        lifecycle) and lifecycle[event_index][0] <= snapshot.ts:
       ranges = analyzer.apply_event(ranges, lifecycle[event_index])
       event_index += 1
     final_stats = analyzer.attribute_snapshot(snapshot, ranges)
@@ -924,15 +938,16 @@ def build_memory_validation_status(mmap_summary, trace_health):
   }
 
 
-def write_memory_validation_report(output_dir: str, mmap_summary, meminfo_path: str,
+def write_memory_validation_report(output_dir: str,
+                                   mmap_summary,
+                                   meminfo_path: str,
                                    trace_health=None) -> str:
   with open(meminfo_path, "r", encoding="utf-8") as fd:
     meminfo = parse_meminfo_summary(fd.read())
   report = {
       "units": "bytes",
-      "note": (
-          "验证只检查 mmap syscall events + smaps 的采集健康；"
-          "不采集 malloc profile，也不做 Native Heap Alloc 对比。"),
+      "note": ("验证只检查 mmap syscall events + smaps 的采集健康；"
+               "不采集 malloc profile，也不做 Native Heap Alloc 对比。"),
       "mmap": mmap_summary,
       "trace_health": trace_health or {},
       "validation": build_memory_validation_status(mmap_summary, trace_health),
@@ -958,15 +973,18 @@ def write_memory_validation_report(output_dir: str, mmap_summary, meminfo_path: 
   return path
 
 
-def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str,
+def collect_memory_validation(args,
+                              pid: int,
+                              trace_path: str,
+                              meminfo_path: str,
                               trace_health=None):
   mmap_summary = {"pss_bytes": 0, "rss_bytes": 0, "virtual_bytes": 0}
   combined_inputs = None
 
   if args.trace_processor:
     try:
-      combined_inputs = query_memory_validation_inputs(
-          args.trace_processor, trace_path, pid)
+      combined_inputs = query_memory_validation_inputs(args.trace_processor,
+                                                       trace_path, pid)
     except RuntimeError as exc:
       print(str(exc), file=sys.stderr)
 
@@ -984,16 +1002,16 @@ def collect_memory_validation(args, pid: int, trace_path: str, meminfo_path: str
     print("跳过 meminfo 对比：采样结束后未成功保存 dumpsys meminfo", file=sys.stderr)
     return {"trace_health": trace_health, "report_path": ""}
 
-  report_path = write_memory_validation_report(
-      args.output, mmap_summary, meminfo_path, trace_health)
+  report_path = write_memory_validation_report(args.output, mmap_summary,
+                                               meminfo_path, trace_health)
   return {"trace_health": trace_health, "report_path": report_path}
 
 
 def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
   analyzer = args.analyzer
   if not analyzer:
-    analyzer = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "mmap_phys_analyzer.py")
+    analyzer = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "mmap_phys_analyzer.py")
   if not os.path.exists(analyzer):
     print(f"跳过分析：找不到 {analyzer}", file=sys.stderr)
     return
@@ -1026,40 +1044,68 @@ def parse_args():
   parser = argparse.ArgumentParser(
       description="采集 mmap/perf/smaps 数据，并生成 mmap 物理内存归因结果")
   parser.add_argument("-n", "--name", required=True, help="目标进程名/包名")
-  parser.add_argument("-d", "--duration-ms", type=int, default=75000,
-                      help="Perfetto 采集时长，单位 ms")
-  parser.add_argument("--smaps-interval-ms", type=int, default=1000,
-                      help="smaps 采样间隔，单位 ms")
+  parser.add_argument(
+      "-d",
+      "--duration-ms",
+      type=int,
+      default=75000,
+      help="Perfetto 采集时长，单位 ms")
+  parser.add_argument(
+      "--smaps-interval-ms", type=int, default=1000, help="smaps 采样间隔，单位 ms")
   parser.add_argument("-o", "--output", default=None, help="输出目录")
-  parser.add_argument("--wait-timeout-s", type=int, default=120,
-                      help="等待目标进程启动的超时时间；0 表示无限等待")
-  parser.add_argument("--buffer-kb", type=int, default=262144,
-                      help="Perfetto ring buffer 大小，单位 KiB")
-  parser.add_argument("--perf-ring-buffer-pages", type=int, default=8192,
-                      help="linux.perf 每 CPU ring buffer 页数；0 表示使用 Perfetto 默认值")
-  parser.add_argument("--perf-ring-buffer-read-period-ms", type=int, default=100,
-                      help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
-  parser.add_argument("--mmap-callstacks", dest="mmap_callstacks",
-                      action="store_true", default=True,
-                      help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
-  parser.add_argument("--no-mmap-callstacks", dest="mmap_callstacks",
-                      action="store_false",
-                      help="不采集 mmap 调用栈；仅运行无栈 mmap 事件健康检查")
-  parser.add_argument("--no-ftrace", action="store_true",
-                      help="不启用 linux.ftrace syscall_events；会跳过无栈 mmap 验证")
-  parser.add_argument("--no-kernel-frames", action="store_true",
-                      help="mmap 调用栈不采内核帧")
-  parser.add_argument("--no-guardrails", action="store_true",
-                      help="传递给 perfetto 的 --no-guardrails")
-  parser.add_argument("--use-su", action="store_true",
-                      help="通过 su 0 读取 /proc/<pid>/smaps")
-  parser.add_argument("--no-analyze", action="store_true",
-                      help="只采集 trace 和 smaps，不运行离线分析器")
-  parser.add_argument("--trace-processor", help="传给 mmap_phys_analyzer.py 的 trace_processor 路径")
-  parser.add_argument("--traceconv", help="traceconv 路径；主功能用于生成 symbolized-trace")
-  parser.add_argument("--classify-config", help="传给 mmap_phys_analyzer.py 的 fs.ini 分类配置")
-  parser.add_argument("--top-n", type=int, default=None,
-                      help="传给 mmap_phys_analyzer.py 的调用栈输出数量；0 表示全部")
+  parser.add_argument(
+      "--wait-timeout-s", type=int, default=120, help="等待目标进程启动的超时时间；0 表示无限等待")
+  parser.add_argument(
+      "--buffer-kb",
+      type=int,
+      default=262144,
+      help="Perfetto ring buffer 大小，单位 KiB")
+  parser.add_argument(
+      "--perf-ring-buffer-pages",
+      type=int,
+      default=8192,
+      help="linux.perf 每 CPU ring buffer 页数；0 表示使用 Perfetto 默认值")
+  parser.add_argument(
+      "--perf-ring-buffer-read-period-ms",
+      type=int,
+      default=100,
+      help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
+  parser.add_argument(
+      "--mmap-callstacks",
+      dest="mmap_callstacks",
+      action="store_true",
+      default=True,
+      help="额外采集 mmap 调用栈并运行 mmap 物理归因火焰图分析")
+  parser.add_argument(
+      "--no-mmap-callstacks",
+      dest="mmap_callstacks",
+      action="store_false",
+      help="不采集 mmap 调用栈；仅运行无栈 mmap 事件健康检查")
+  parser.add_argument(
+      "--no-ftrace",
+      action="store_true",
+      help="不启用 linux.ftrace syscall_events；会跳过无栈 mmap 验证")
+  parser.add_argument(
+      "--no-kernel-frames", action="store_true", help="mmap 调用栈不采内核帧")
+  parser.add_argument(
+      "--no-guardrails",
+      action="store_true",
+      help="传递给 perfetto 的 --no-guardrails")
+  parser.add_argument(
+      "--use-su", action="store_true", help="通过 su 0 读取 /proc/<pid>/smaps")
+  parser.add_argument(
+      "--no-analyze", action="store_true", help="只采集 trace 和 smaps，不运行离线分析器")
+  parser.add_argument(
+      "--trace-processor", help="传给 mmap_phys_analyzer.py 的 trace_processor 路径")
+  parser.add_argument(
+      "--traceconv", help="traceconv 路径；主功能用于生成 symbolized-trace")
+  parser.add_argument(
+      "--classify-config", help="传给 mmap_phys_analyzer.py 的 fs.ini 分类配置")
+  parser.add_argument(
+      "--top-n",
+      type=int,
+      default=None,
+      help="传给 mmap_phys_analyzer.py 的调用栈输出数量；0 表示全部")
   parser.add_argument("--analyzer", help="mmap_phys_analyzer.py 路径")
   return parser.parse_args()
 
@@ -1100,8 +1146,14 @@ def run_collection(args, start_target_after_perfetto: bool = False):
     perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
 
   try:
-    collect_smaps(pid, perfetto_pid, smaps_dir, args.smaps_interval_ms, args.use_su,
-                  args.duration_ms, run_as_package=args.name)
+    collect_smaps(
+        pid,
+        perfetto_pid,
+        smaps_dir,
+        args.smaps_interval_ms,
+        args.use_su,
+        args.duration_ms,
+        run_as_package=args.name)
   finally:
     if IS_INTERRUPTED:
       stop_perfetto(perfetto_pid)
@@ -1150,7 +1202,8 @@ def main() -> int:
 
   if not args.mmap_callstacks:
     force_stop_app(args.name)
-    return int(run_collection(args, start_target_after_perfetto=True).get("status", 1))
+    return int(
+        run_collection(args, start_target_after_perfetto=True).get("status", 1))
 
   return int(run_collection(args).get("status", 1))
 

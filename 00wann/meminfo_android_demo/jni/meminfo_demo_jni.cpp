@@ -60,8 +60,9 @@ std::string to_string(JNIEnv* env, jstring value) {
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_meminfodemo_MainActivity_nativeAllocateMalloc(
-    JNIEnv*, jclass, jint mb) {
+Java_com_example_meminfodemo_MainActivity_nativeAllocateMalloc(JNIEnv*,
+                                                               jclass,
+                                                               jint mb) {
   const size_t size = mb_to_bytes(mb);
   void* ptr = malloc(size);
   if (ptr == nullptr) {
@@ -75,8 +76,9 @@ Java_com_example_meminfodemo_MainActivity_nativeAllocateMalloc(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_meminfodemo_MainActivity_nativeAllocateAnonMmap(
-    JNIEnv*, jclass, jint mb) {
+Java_com_example_meminfodemo_MainActivity_nativeAllocateAnonMmap(JNIEnv*,
+                                                                 jclass,
+                                                                 jint mb) {
   const size_t size = mb_to_bytes(mb);
   void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -93,8 +95,10 @@ Java_com_example_meminfodemo_MainActivity_nativeAllocateAnonMmap(
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_example_meminfodemo_MainActivity_nativeAllocateFileMmap(
-    JNIEnv* env, jclass, jstring path, jint mb) {
+Java_com_example_meminfodemo_MainActivity_nativeAllocateFileMmap(JNIEnv* env,
+                                                                 jclass,
+                                                                 jstring path,
+                                                                 jint mb) {
   const size_t size = mb_to_bytes(mb);
   const std::string file_path = to_string(env, path);
   int fd = open(file_path.c_str(), O_CREAT | O_RDWR, 0600);

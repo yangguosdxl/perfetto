@@ -82,11 +82,11 @@ def classify_items(
     items: Iterable[Any],
     rules: list[ClassificationRule],
     stack_getter: Callable[[Any], Iterable[str]],
-) -> tuple[list[tuple[ClassificationRule, list[ClassifiedItem]]], list[ClassifiedItem]]:
+) -> tuple[list[tuple[ClassificationRule, list[ClassifiedItem]]],
+           list[ClassifiedItem]]:
   """按规则顺序分类，命中后从后续规则中过滤。"""
   remaining: list[ClassifiedItem] = [
-      ClassifiedItem(item, tuple(stack_getter(item)))
-      for item in items
+      ClassifiedItem(item, tuple(stack_getter(item))) for item in items
   ]
 
   classified: list[tuple[ClassificationRule, list[ClassifiedItem]]] = []
@@ -142,8 +142,7 @@ def build_hierarchy_entries(
           keywords=keywords_by_leaf.get(path, ()),
           items=tuple(items_by_path[path]),
           is_leaf=path in leaf_paths,
-      )
-      for path in ordered_paths
+      ) for path in ordered_paths
   ]
 
 
@@ -185,13 +184,10 @@ def build_summary_hierarchy_entries(
   for field in metric_fields:
     remaining_item[field] = remaining.get(field, 0)
 
-  return [
-      {
-          **items_by_path[path],
-          "is_leaf": path in leaf_paths,
-      }
-      for path in ordered_paths
-  ]
+  return [{
+      **items_by_path[path],
+      "is_leaf": path in leaf_paths,
+  } for path in ordered_paths]
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -235,8 +231,7 @@ def xlsx_sheet(rows: list[list[object]]) -> str:
       '<sheetData>'
       f'{"".join(row_xml)}'
       '</sheetData>'
-      '</worksheet>'
-  )
+      '</worksheet>')
 
 
 def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
@@ -258,7 +253,8 @@ def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
         f'Target="worksheets/sheet{index}.xml"/>')
     overrides.append(
         f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+    )
   styles_rid = len(sheets) + 1
   workbook_rels.append(
       f'<Relationship Id="rId{styles_rid}" '
@@ -271,16 +267,14 @@ def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
       '<Default Extension="xml" ContentType="application/xml"/>'
       f'{"".join(overrides)}'
-      '</Types>'
-  )
+      '</Types>')
   root_rels = (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
       '<Relationship Id="rId1" '
       'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
       'Target="xl/workbook.xml"/>'
-      '</Relationships>'
-  )
+      '</Relationships>')
   workbook = (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
       '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
@@ -288,14 +282,12 @@ def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
       '<sheets>'
       f'{"".join(workbook_sheets)}'
       '</sheets>'
-      '</workbook>'
-  )
+      '</workbook>')
   rels = (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
       f'{"".join(workbook_rels)}'
-      '</Relationships>'
-  )
+      '</Relationships>')
   styles = (
       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
       '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
@@ -304,8 +296,7 @@ def write_xlsx(path: str, sheets: list[tuple[str, list[list[object]]]]) -> None:
       '<borders count="1"><border/></borders>'
       '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
       '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
-      '</styleSheet>'
-  )
+      '</styleSheet>')
 
   ensure_parent_dir(path)
   with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

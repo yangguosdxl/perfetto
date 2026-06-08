@@ -20,7 +20,9 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
         f.write("export PerfettoRoot='perfetto-root'\n")
 
       expected = os.path.abspath(
-          os.path.join(tmpdir, "perfetto-root/out/linux_clang_release/trace_processor_shell"))
+          os.path.join(
+              tmpdir,
+              "perfetto-root/out/linux_clang_release/trace_processor_shell"))
 
       self.assertEqual(analyzer.default_trace_processor(script_dir), expected)
 
@@ -32,9 +34,10 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
 
     self.assertEqual(output_dir, "/tmp/perfetto-case/heap_analyze")
 
-
-  def test_classify_config_defaults_to_all_allocations_without_explicit_symbol(self):
+  def test_classify_config_defaults_to_all_allocations_without_explicit_symbol(
+      self):
     """分类统计默认应覆盖全部 allocation，而不是被默认 symbol 过滤。"""
+
     class Args:
       all_allocations = False
       classify_config = "heap_analyzer/fs.ini"
@@ -46,6 +49,7 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
 
   def test_default_outputs_enable_pprof_under_trace_heap_analyze(self):
     """默认输出应启用 pprof，并写入 trace 同级 heap_analyze。"""
+
     class Args:
       trace = "/tmp/perfetto-case/symbolized-trace"
       speedscope_out = None
@@ -58,10 +62,8 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
 
     analyzer.normalize_output_paths(args)
 
-    self.assertEqual(
-        args.pprof_out,
-        "/tmp/perfetto-case/heap_analyze/native_heap.pprof.pb.gz")
-
+    self.assertEqual(args.pprof_out,
+                     "/tmp/perfetto-case/heap_analyze/native_heap.pprof.pb.gz")
 
   def test_write_pprof_keeps_classification_category_labels(self):
     """总 pprof 在分类模式下应保留 category 标签。"""
@@ -81,13 +83,14 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
           callsites,
           frame_labels,
           processes={7: (1234, "game")},
-          extra_labels_by_callsite={2: {"category": "il2cpp/meta"}})
+          extra_labels_by_callsite={2: {
+              "category": "il2cpp/meta"
+          }})
 
-      result = subprocess.run(
-          ["go", "tool", "pprof", "-raw", output_path],
-          text=True,
-          capture_output=True,
-          check=False)
+      result = subprocess.run(["go", "tool", "pprof", "-raw", output_path],
+                              text=True,
+                              capture_output=True,
+                              check=False)
 
     self.assertEqual(result.returncode, 0, result.stderr)
     self.assertIn("category:[il2cpp/meta]", result.stdout)
@@ -95,16 +98,14 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
   def test_write_classification_summary_pprof_is_readable(self):
     """分类 summary pprof 应把叶子分类写成可读调用栈。"""
     summary = {
-        "categories": [
-            {
-                "name": "il2cpp/meta",
-                "keywords": ["Class::Init"],
-                "matched_allocation_callsites": 2,
-                "net_alloc_count": 3,
-                "net_alloc_bytes": 4096,
-                "net_alloc_mib": 4096 / 1048576.0,
-            }
-        ],
+        "categories": [{
+            "name": "il2cpp/meta",
+            "keywords": ["Class::Init"],
+            "matched_allocation_callsites": 2,
+            "net_alloc_count": 3,
+            "net_alloc_bytes": 4096,
+            "net_alloc_mib": 4096 / 1048576.0,
+        }],
         "remaining": {
             "matched_allocation_callsites": 1,
             "net_alloc_count": -1,
@@ -116,11 +117,10 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmpdir:
       output_path = os.path.join(tmpdir, "category_summary.pprof.pb.gz")
       analyzer.write_classification_summary_pprof(output_path, summary)
-      result = subprocess.run(
-          ["go", "tool", "pprof", "-raw", output_path],
-          text=True,
-          capture_output=True,
-          check=False)
+      result = subprocess.run(["go", "tool", "pprof", "-raw", output_path],
+                              text=True,
+                              capture_output=True,
+                              check=False)
 
     self.assertEqual(result.returncode, 0, result.stderr)
     self.assertIn("Native heap summary", result.stdout)
@@ -149,8 +149,10 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
         ),
         (
             analyzer.ClassificationRule("hybridclr/other", ("hybridclr",)),
-            [analyzer.ClassifiedAllocation(
-                hybrid_alloc, ("hybridclr::metadata", "Root"))],
+            [
+                analyzer.ClassifiedAllocation(hybrid_alloc,
+                                              ("hybridclr::metadata", "Root"))
+            ],
         ),
     ]
 
@@ -168,8 +170,10 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
           processes={7: (1234, "game")})
 
       self.assertFalse(os.path.exists(stale_path))
-      self.assertTrue(os.path.exists(os.path.join(tmpdir, "01_fsui.pprof.pb.gz")))
-      self.assertTrue(os.path.exists(os.path.join(tmpdir, "02_hybridclr.pprof.pb.gz")))
+      self.assertTrue(
+          os.path.exists(os.path.join(tmpdir, "01_fsui.pprof.pb.gz")))
+      self.assertTrue(
+          os.path.exists(os.path.join(tmpdir, "02_hybridclr.pprof.pb.gz")))
 
   def test_write_pprof_outputs_profile_readable_by_go_pprof(self):
     """pprof 输出必须能被 go tool pprof 读取，并保留正负净值口径。"""
@@ -208,11 +212,10 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
           frame_labels,
           processes={7: (1234, "game")})
 
-      result = subprocess.run(
-          ["go", "tool", "pprof", "-raw", output_path],
-          text=True,
-          capture_output=True,
-          check=False)
+      result = subprocess.run(["go", "tool", "pprof", "-raw", output_path],
+                              text=True,
+                              capture_output=True,
+                              check=False)
 
     self.assertEqual(result.returncode, 0, result.stderr)
     self.assertRegex(result.stdout, r"Mappings\n1: .*native_heap")

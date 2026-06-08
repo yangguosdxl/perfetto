@@ -23,14 +23,21 @@ class ClassificationTest(unittest.TestCase):
       rules = classification.parse_classification_config(config_path)
 
     items = [
-        {"id": 1, "stack": ("Leaf", "il2cpp::vm::Class::Init")},
-        {"id": 2, "stack": ("Leaf", "android::AudioTrack")},
-        {"id": 3, "stack": ("Leaf", "Other")},
+        {
+            "id": 1,
+            "stack": ("Leaf", "il2cpp::vm::Class::Init")
+        },
+        {
+            "id": 2,
+            "stack": ("Leaf", "android::AudioTrack")
+        },
+        {
+            "id": 3,
+            "stack": ("Leaf", "Other")
+        },
     ]
     classified, remaining = classification.classify_items(
-        items,
-        rules,
-        lambda item: item["stack"])
+        items, rules, lambda item: item["stack"])
 
     self.assertEqual([rule.name for rule, _items in classified],
                      ["il2cpp/meta", "il2cpp/audio"])
@@ -41,13 +48,12 @@ class ClassificationTest(unittest.TestCase):
     entries = classification.build_hierarchy_entries(classified, remaining)
     entry_by_path = {entry.path: entry for entry in entries}
     self.assertEqual(
-        [item.item["id"] for item in entry_by_path[("il2cpp",)].items],
-        [1, 2])
+        [item.item["id"] for item in entry_by_path[("il2cpp",)].items], [1, 2])
     self.assertEqual(
-        [item.item["id"] for item in entry_by_path[("remaining",)].items],
-        [3])
+        [item.item["id"] for item in entry_by_path[("remaining",)].items], [3])
 
-  def test_first_matching_rule_wins_when_ui_and_hybridclr_keywords_overlap(self):
+  def test_first_matching_rule_wins_when_ui_and_hybridclr_keywords_overlap(
+      self):
     """同时命中 UIManager 和 hybridclr 时，应按 fs.ini 顺序优先归入 UI。"""
     rules = [
         classification.ClassificationRule("fsui", ("UIManager",)),
@@ -55,7 +61,8 @@ class ClassificationTest(unittest.TestCase):
     ]
     items = [
         {
-            "id": 1,
+            "id":
+                1,
             "stack": (
                 "Game.UI.UIManager::Open",
                 "hybridclr::metadata::Image::Load",
@@ -65,9 +72,7 @@ class ClassificationTest(unittest.TestCase):
     ]
 
     classified, remaining = classification.classify_items(
-        items,
-        rules,
-        lambda item: item["stack"])
+        items, rules, lambda item: item["stack"])
 
     self.assertEqual([item.item["id"] for item in classified[0][1]], [1])
     self.assertEqual(classified[1][1], [])

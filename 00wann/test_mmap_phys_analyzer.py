@@ -23,7 +23,9 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         f.write("export PerfettoRoot='perfetto-root'\n")
 
       expected = os.path.abspath(
-          os.path.join(tmpdir, "perfetto-root/out/linux_clang_release/trace_processor_shell"))
+          os.path.join(
+              tmpdir,
+              "perfetto-root/out/linux_clang_release/trace_processor_shell"))
       os.makedirs(os.path.dirname(expected))
       with open(expected, "w", encoding="utf-8") as f:
         f.write("#!/usr/bin/env bash\n")
@@ -33,6 +35,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
   def test_trace_processor_stderr_does_not_pollute_csv(self):
     """trace_processor 的日志不能拼进 CSV 字段。"""
+
     def fake_run(_cmd, **kwargs):
       stdout = '"ts","utid"\n"214992732002882","7"'
       stderr = "[482.196] query.cc:159 Query execution time: 13 ms\n"
@@ -115,7 +118,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       return []
 
     with mock.patch.object(analyzer, "run_tp_query", side_effect=fake_tp_query):
-      self.assertEqual(analyzer.load_syscalls("fake-tp", "fake-trace", pid=1234), [])
+      self.assertEqual(
+          analyzer.load_syscalls("fake-tp", "fake-trace", pid=1234), [])
 
     self.assertEqual(len(seen_sql), 1)
     sql = seen_sql[0]
@@ -123,29 +127,38 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn("LEFT JOIN __intrinsic_process pr ON th.upid = pr.id", sql)
     self.assertIn("WHERE (pr.pid = 1234 OR th.tid = 1234)", sql)
     self.assertIn("FROM target_ftrace_events tfe", sql)
-    self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id", sql)
-    self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id", sql)
+    self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id",
+                  sql)
+    self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id",
+                     sql)
 
   def test_load_stacks_prefers_stack_profile_symbol_names(self):
     """调用栈展示应把 symbol_set_id 的 inline 符号拆成清晰 frame。"""
+
     def fake_tp_query(_tp, _trace, sql):
       if "stack_profile_symbol" in sql:
         return [
-            {"symbol_set_id": "77", "id": "1", "name": "InlineAllocator"},
-            {"symbol_set_id": "77", "id": "2", "name": "RealMmapCaller"},
+            {
+                "symbol_set_id": "77",
+                "id": "1",
+                "name": "InlineAllocator"
+            },
+            {
+                "symbol_set_id": "77",
+                "id": "2",
+                "name": "RealMmapCaller"
+            },
         ]
       if "__intrinsic_stack_profile_callsite" in sql:
-        return [
-            {
-                "id": "10",
-                "parent_id": "-1",
-                "frame_name": "0xabc",
-                "deobfuscated_name": "",
-                "mapping_name": "/data/app/libgame.so",
-                "rel_pc": "16",
-                "symbol_set_id": "77",
-            }
-        ]
+        return [{
+            "id": "10",
+            "parent_id": "-1",
+            "frame_name": "0xabc",
+            "deobfuscated_name": "",
+            "mapping_name": "/data/app/libgame.so",
+            "rel_pc": "16",
+            "symbol_set_id": "77",
+        }]
       return []
 
     with mock.patch.object(analyzer, "run_tp_query", side_effect=fake_tp_query):
@@ -160,8 +173,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     timestamp_ns = 50596950000000
 
     parsed = analyzer.parse_timestamp_from_name(
-        f"/tmp/smaps/{timestamp_ns}.smaps",
-        unit="auto")
+        f"/tmp/smaps/{timestamp_ns}.smaps", unit="auto")
 
     self.assertEqual(parsed, timestamp_ns)
 
@@ -203,7 +215,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     self.assertIn('ftrace_events: "raw_syscalls/sys_enter"', config)
     self.assertIn('ftrace_events: "raw_syscalls/sys_exit"', config)
-    self.assertIn('tracepoint {\n          name: "raw_syscalls:sys_enter"', config)
+    self.assertIn('tracepoint {\n          name: "raw_syscalls:sys_enter"',
+                  config)
     self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("ring_buffer_pages: 4096", config)
     self.assertIn("ring_buffer_read_period_ms: 100", config)
@@ -216,8 +229,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       calls.append((cmd, kwargs))
       return b"12345\n"
 
-    with mock.patch.object(collector.subprocess, "check_output",
-                           side_effect=fake_check_output):
+    with mock.patch.object(
+        collector.subprocess, "check_output", side_effect=fake_check_output):
       pid = collector.start_perfetto(
           "buffers {}\n",
           "/data/misc/perfetto-traces/test-trace",
@@ -225,22 +238,23 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     self.assertEqual(pid, 12345)
     self.assertEqual(calls[0][0], [
-        "adb", "shell", "perfetto", "--txt", "-c", "-",
-        "-o", "/data/misc/perfetto-traces/test-trace", "-d"
+        "adb", "shell", "perfetto", "--txt", "-c", "-", "-o",
+        "/data/misc/perfetto-traces/test-trace", "-d"
     ])
     self.assertEqual(calls[0][1]["input"], b"buffers {}\n")
     self.assertEqual(calls[0][1]["stderr"], collector.subprocess.STDOUT)
 
   def test_start_perfetto_reports_device_error_output(self):
     """Perfetto 启动失败时应输出设备侧错误，便于直接定位原因。"""
+
     def fake_check_output(cmd, **_kwargs):
       raise collector.subprocess.CalledProcessError(
           1,
           cmd,
           output=b"Could not open config (errno: 13, Permission denied)\n")
 
-    with mock.patch.object(collector.subprocess, "check_output",
-                           side_effect=fake_check_output):
+    with mock.patch.object(
+        collector.subprocess, "check_output", side_effect=fake_check_output):
       with self.assertRaisesRegex(RuntimeError, "Permission denied"):
         collector.start_perfetto(
             "buffers {}\n",
@@ -285,7 +299,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
   def test_collect_defaults_to_75_seconds(self):
     """默认 mmap 物理内存采集时长应为 1 分 15 秒。"""
-    with mock.patch.object(sys, "argv", ["collect_mmap_phys_data.py", "--name", "app"]):
+    with mock.patch.object(sys, "argv",
+                           ["collect_mmap_phys_data.py", "--name", "app"]):
       args = collector.parse_args()
 
     self.assertEqual(args.duration_ms, 75000)
@@ -325,16 +340,17 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
   def test_collect_cli_no_longer_exposes_malloc_collection(self):
     """mmap 采集脚本不再暴露 malloc/heapprofd 采集参数。"""
-    with mock.patch.object(sys, "argv", ["collect_mmap_phys_data.py", "--name", "app"]):
+    with mock.patch.object(sys, "argv",
+                           ["collect_mmap_phys_data.py", "--name", "app"]):
       args = collector.parse_args()
 
     self.assertFalse(hasattr(args, "collect_malloc"))
     self.assertFalse(hasattr(args, "malloc_sampling_interval_bytes"))
     self.assertFalse(hasattr(args, "malloc_shmem_size_bytes"))
 
-    with mock.patch.object(sys, "argv", [
-        "collect_mmap_phys_data.py", "--name", "app", "--malloc"
-    ]):
+    with mock.patch.object(
+        sys, "argv",
+        ["collect_mmap_phys_data.py", "--name", "app", "--malloc"]):
       with self.assertRaises(SystemExit):
         collector.parse_args()
 
@@ -362,9 +378,11 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       calls = []
 
       def record(name, result=None):
+
         def inner(*_args, **_kwargs):
           calls.append(name)
           return result
+
         return inner
 
       with mock.patch.object(collector, "parse_args", return_value=args), \
@@ -386,13 +404,17 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         self.assertEqual(collector.main(), 0)
 
     self.assertIn("capture_meminfo", calls)
-    self.assertLess(calls.index("capture_meminfo"), calls.index("symbolize_trace"))
-    self.assertLess(calls.index("capture_meminfo"), calls.index("check_trace_health"))
+    self.assertLess(
+        calls.index("capture_meminfo"), calls.index("symbolize_trace"))
+    self.assertLess(
+        calls.index("capture_meminfo"), calls.index("check_trace_health"))
     self.assertLess(calls.index("capture_meminfo"), calls.index("run_analyzer"))
-    self.assertLess(calls.index("capture_meminfo"),
-                    calls.index("collect_memory_validation"))
+    self.assertLess(
+        calls.index("capture_meminfo"),
+        calls.index("collect_memory_validation"))
 
-  def test_run_collection_analyzes_symbolized_trace_when_callstacks_enabled(self):
+  def test_run_collection_analyzes_symbolized_trace_when_callstacks_enabled(
+      self):
     """主功能生成 symbolized-trace 后，离线分析必须读取符号化 trace。"""
     with tempfile.TemporaryDirectory() as tmpdir:
       args = collector.argparse.Namespace(
@@ -435,7 +457,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         result = collector.run_collection(args)
 
     self.assertEqual(result["status"], 0)
-    self.assertEqual(analyzed_traces, [os.path.join(tmpdir, "symbolized-trace")])
+    self.assertEqual(analyzed_traces,
+                     [os.path.join(tmpdir, "symbolized-trace")])
 
   def test_main_no_mmap_callstacks_restarts_app_before_validation(self):
     """无栈验证应先重启目标 App，并让 Perfetto 先于 App 启动。"""
@@ -498,9 +521,11 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       calls = []
 
       def record(name, result=None):
+
         def inner(*_args, **_kwargs):
           calls.append(name)
           return result
+
         return inner
 
       with mock.patch.object(collector, "write_config", record("write_config")), \
@@ -516,7 +541,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
           mock.patch.object(collector, "collect_memory_validation",
                             record("collect_memory_validation",
                                    {"trace_health": {}})):
-        result = collector.run_collection(args, start_target_after_perfetto=True)
+        result = collector.run_collection(
+            args, start_target_after_perfetto=True)
 
     self.assertEqual(result["status"], 0)
     self.assertLess(calls.index("start_perfetto"), calls.index("wait_for_pid"))
@@ -564,15 +590,51 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
   def test_trace_health_summary_flags_perf_lost_records(self):
     """健康检查需要区分 Perfetto buffer 和 perf 内核 buffer 丢数。"""
     rows = [
-        {"name": "traced_buf_buffer_size", "idx": "0", "value": str(256 * 1024 * 1024)},
-        {"name": "traced_buf_bytes_written", "idx": "0", "value": str(32 * 1024 * 1024)},
-        {"name": "traced_buf_bytes_overwritten", "idx": "0", "value": "0"},
-        {"name": "traced_buf_chunks_overwritten", "idx": "0", "value": "0"},
-        {"name": "traced_buf_trace_writer_packet_loss", "idx": "0", "value": "0"},
-        {"name": "ftrace_cpu_overrun_delta", "idx": "0", "value": "0"},
-        {"name": "ftrace_cpu_dropped_events_delta", "idx": "0", "value": "0"},
-        {"name": "perf_cpu_lost_records", "idx": "0", "value": "12"},
-        {"name": "perf_cpu_lost_records", "idx": "1", "value": "8"},
+        {
+            "name": "traced_buf_buffer_size",
+            "idx": "0",
+            "value": str(256 * 1024 * 1024)
+        },
+        {
+            "name": "traced_buf_bytes_written",
+            "idx": "0",
+            "value": str(32 * 1024 * 1024)
+        },
+        {
+            "name": "traced_buf_bytes_overwritten",
+            "idx": "0",
+            "value": "0"
+        },
+        {
+            "name": "traced_buf_chunks_overwritten",
+            "idx": "0",
+            "value": "0"
+        },
+        {
+            "name": "traced_buf_trace_writer_packet_loss",
+            "idx": "0",
+            "value": "0"
+        },
+        {
+            "name": "ftrace_cpu_overrun_delta",
+            "idx": "0",
+            "value": "0"
+        },
+        {
+            "name": "ftrace_cpu_dropped_events_delta",
+            "idx": "0",
+            "value": "0"
+        },
+        {
+            "name": "perf_cpu_lost_records",
+            "idx": "0",
+            "value": "12"
+        },
+        {
+            "name": "perf_cpu_lost_records",
+            "idx": "1",
+            "value": "8"
+        },
     ]
 
     summary = collector.summarize_trace_health(rows)
@@ -586,10 +648,26 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
   def test_trace_health_summary_ignores_heapprofd_rows(self):
     """mmap 采集健康检查不再把 heapprofd 统计纳入结果。"""
     rows = [
-        {"name": "heapprofd_buffer_overran", "idx": "7045", "value": "1"},
-        {"name": "heapprofd_client_error", "idx": "7045", "value": "1"},
-        {"name": "ftrace_cpu_read_events_delta", "idx": "0", "value": "20"},
-        {"name": "ftrace_cpu_read_events_delta", "idx": "1", "value": "30"},
+        {
+            "name": "heapprofd_buffer_overran",
+            "idx": "7045",
+            "value": "1"
+        },
+        {
+            "name": "heapprofd_client_error",
+            "idx": "7045",
+            "value": "1"
+        },
+        {
+            "name": "ftrace_cpu_read_events_delta",
+            "idx": "0",
+            "value": "20"
+        },
+        {
+            "name": "ftrace_cpu_read_events_delta",
+            "idx": "1",
+            "value": "30"
+        },
     ]
 
     summary = collector.summarize_trace_health(rows)
@@ -636,13 +714,11 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       pid = collector.wait_for_pid("com.example.app", timeout_s=5)
 
     self.assertEqual(pid, 4321)
-    self.assertEqual(
-        shell_calls,
-        [
-            "pidof 'com.example.app' || true",
-            "monkey -p 'com.example.app' 1",
-            "pidof 'com.example.app' || true",
-        ])
+    self.assertEqual(shell_calls, [
+        "pidof 'com.example.app' || true",
+        "monkey -p 'com.example.app' 1",
+        "pidof 'com.example.app' || true",
+    ])
 
   def test_wait_for_pid_does_not_launch_when_already_running(self):
     """目标进程已存在时，不应额外发送 monkey 启动命令。"""
@@ -663,12 +739,13 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     out = io.StringIO()
     progress = collector.TwoLineProgress(stream=out)
 
-    progress.update("+ adb shell cat /proc/uptime", "smaps 快照: first.smaps (10 bytes)")
-    progress.update("+ adb shell cat /proc/uptime", "smaps 快照: second.smaps (20 bytes)")
+    progress.update("+ adb shell cat /proc/uptime",
+                    "smaps 快照: first.smaps (10 bytes)")
+    progress.update("+ adb shell cat /proc/uptime",
+                    "smaps 快照: second.smaps (20 bytes)")
 
     self.assertEqual(
-        out.getvalue(),
-        "\r\033[K+ adb shell cat /proc/uptime\n"
+        out.getvalue(), "\r\033[K+ adb shell cat /proc/uptime\n"
         "\r\033[Ksmaps 快照: first.smaps (10 bytes)\n"
         "\033[2F"
         "\r\033[K+ adb shell cat /proc/uptime\n"
@@ -676,7 +753,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
   def test_smaps_progress_line_includes_remaining_time(self):
     """smaps 快照输出应同时展示本次采集的剩余时间。"""
-    line = collector.format_smaps_progress_line("snapshot.smaps", 5345265, 12.34)
+    line = collector.format_smaps_progress_line("snapshot.smaps", 5345265,
+                                                12.34)
 
     self.assertEqual(line, "smaps 快照: snapshot.smaps (5345265 bytes) 剩余: 12.3s")
 
@@ -690,13 +768,14 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         return b"1000-2000 rw-p 00000000 00:00 0 [anon:test]\nRss: 4 kB\nPss: 4 kB\n"
       return b"cat: /proc/1234/smaps: Permission denied\n"
 
-    with mock.patch.object(collector.subprocess, "check_output",
-                           side_effect=fake_check_output):
+    with mock.patch.object(
+        collector.subprocess, "check_output", side_effect=fake_check_output):
       data = collector.read_smaps(1234, use_su=False)
 
     self.assertIn(b"1000-2000", data)
     self.assertEqual(calls[0], ["adb", "exec-out", "cat", "/proc/1234/smaps"])
-    self.assertEqual(calls[1], ["adb", "exec-out", "su", "0", "cat", "/proc/1234/smaps"])
+    self.assertEqual(calls[1],
+                     ["adb", "exec-out", "su", "0", "cat", "/proc/1234/smaps"])
 
   def test_read_smaps_falls_back_to_run_as_before_su(self):
     """无 root 调试包应先用 run-as 读取自身 smaps，再考虑 su。"""
@@ -708,16 +787,16 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
         return b"1000-2000 rw-p 00000000 00:00 0 [anon:test]\nRss: 4 kB\nPss: 4 kB\n"
       return b"cat: /proc/1234/smaps: Permission denied\n"
 
-    with mock.patch.object(collector.subprocess, "check_output",
-                           side_effect=fake_check_output):
+    with mock.patch.object(
+        collector.subprocess, "check_output", side_effect=fake_check_output):
       data = collector.read_smaps(
           1234, use_su=False, run_as_package="com.example.app")
 
     self.assertIn(b"1000-2000", data)
     self.assertEqual(calls[0], ["adb", "exec-out", "cat", "/proc/1234/smaps"])
     self.assertEqual(calls[1], [
-        "adb", "exec-out", "run-as", "com.example.app",
-        "cat", "/proc/1234/smaps"
+        "adb", "exec-out", "run-as", "com.example.app", "cat",
+        "/proc/1234/smaps"
     ])
     self.assertEqual(len(calls), 2)
 
@@ -768,9 +847,9 @@ TOTAL SWAP PSS: 7,000K
           "fake-tp", "fake-trace", 1234)
 
     self.assertEqual(syscalls, [])
-    self.assertFalse(any("stack_profile" in sql or "callsite" in sql or
-                         "__intrinsic_perf_sample" in sql
-                         for sql in seen_sql))
+    self.assertFalse(
+        any("stack_profile" in sql or "callsite" in sql or
+            "__intrinsic_perf_sample" in sql for sql in seen_sql))
 
   def test_query_memory_validation_inputs_loads_trace_once_without_malloc(self):
     """无栈健康检查应一次查询拿齐 mmap 输入，但不读取 malloc 表。"""
@@ -795,8 +874,8 @@ TOTAL SWAP PSS: 7,000K
           stderr=None)
 
     with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
-      inputs = collector.query_memory_validation_inputs(
-          "fake-tp", "fake-trace", 1234)
+      inputs = collector.query_memory_validation_inputs("fake-tp", "fake-trace",
+                                                        1234)
 
     self.assertEqual(len(calls), 1)
     self.assertEqual(inputs["trace_health"]["buffer_size_bytes"], 1024)
@@ -806,7 +885,8 @@ TOTAL SWAP PSS: 7,000K
     self.assertNotIn("heap_profile_allocation", calls[0][-1])
     self.assertNotIn("latest_dump", calls[0][-1])
 
-  def test_memory_validation_syscall_sql_filters_target_events_before_args(self):
+  def test_memory_validation_syscall_sql_filters_target_events_before_args(
+      self):
     """raw syscall 量大时，SQL 应先下推目标 pid 和事件名，再扫描 args。"""
     sql = collector.build_memory_validation_inputs_sql(1234)
 
@@ -815,8 +895,10 @@ TOTAL SWAP PSS: 7,000K
     self.assertIn("WHERE (pr.pid = 1234 OR th.tid = 1234)", sql)
     self.assertIn("raw_syscall_events AS", sql)
     self.assertIn("FROM target_ftrace_events tfe", sql)
-    self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id", sql)
-    self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id", sql)
+    self.assertIn("JOIN __intrinsic_args a ON tfe.arg_set_id = a.arg_set_id",
+                  sql)
+    self.assertNotIn("JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id",
+                     sql)
 
   def test_write_memory_validation_report_omits_malloc_when_disabled(self):
     """无栈验证报告不输出 malloc 与 Native Heap Alloc 对比。"""
@@ -858,7 +940,11 @@ TOTAL SWAP PSS: 7,000K
 
       report_path = collector.write_memory_validation_report(
           output_dir=tmpdir,
-          mmap_summary={"pss_bytes": 0, "syscall_events": 0, "smaps_snapshots": 3},
+          mmap_summary={
+              "pss_bytes": 0,
+              "syscall_events": 0,
+              "smaps_snapshots": 3
+          },
           meminfo_path=meminfo_path,
           trace_health={"ftrace_data_loss": 1})
 
@@ -876,17 +962,17 @@ TOTAL SWAP PSS: 7,000K
       os.mkdir(smaps_dir)
       smaps_path = os.path.join(smaps_dir, "2000.smaps")
       with open(smaps_path, "w", encoding="utf-8") as fd:
-        fd.write(
-            "10001000-10004000 rw-p 00000000 00:00 0 [anon:mmap-test]\n"
-            "Size:                 12 kB\n"
-            "Rss:                  12 kB\n"
-            "Pss:                  12 kB\n"
-            "Private_Clean:         0 kB\n"
-            "Private_Dirty:        12 kB\n"
-            "Shared_Clean:          0 kB\n"
-            "Shared_Dirty:          0 kB\n")
+        fd.write("10001000-10004000 rw-p 00000000 00:00 0 [anon:mmap-test]\n"
+                 "Size:                 12 kB\n"
+                 "Rss:                  12 kB\n"
+                 "Pss:                  12 kB\n"
+                 "Private_Clean:         0 kB\n"
+                 "Private_Dirty:        12 kB\n"
+                 "Shared_Clean:          0 kB\n"
+                 "Shared_Dirty:          0 kB\n")
 
-      with mock.patch.object(analyzer, "run_tp_query", side_effect=self._fake_tp_query):
+      with mock.patch.object(
+          analyzer, "run_tp_query", side_effect=self._fake_tp_query):
         samples = analyzer.load_perf_samples("fake-tp", "fake-trace")
         stacks = analyzer.load_stacks("fake-tp", "fake-trace")
         syscalls = analyzer.load_syscalls("fake-tp", "fake-trace")
@@ -903,7 +989,8 @@ TOTAL SWAP PSS: 7,000K
         json.dump(output, fd, ensure_ascii=False)
 
       speedscope = analyzer.build_speedscope(summary_items)
-      speedscope_path = os.path.join(tmpdir, "mmap_phys_attribution_test.speedscope.json")
+      speedscope_path = os.path.join(
+          tmpdir, "mmap_phys_attribution_test.speedscope.json")
       with open(speedscope_path, "w", encoding="utf-8") as fd:
         json.dump(speedscope, fd, ensure_ascii=False)
 
@@ -987,25 +1074,26 @@ TOTAL SWAP PSS: 7,000K
                 pss_kb=12,
                 private_dirty_kb=12)
         ])
-    lifecycle = [
-        (1500, "mmap", {
-            "pid": 1234,
-            "addr": 0x10000000,
-            "size": 0,
-            "stack_id": 10,
-            "path": "",
-        })
-    ]
+    lifecycle = [(1500, "mmap", {
+        "pid": 1234,
+        "addr": 0x10000000,
+        "size": 0,
+        "stack_id": 10,
+        "path": "",
+    })]
     stacks = {10: analyzer.Stack(10, ["AllocateByRawMmap"])}
 
-    output, summary, all_summary = analyzer.build_chrome_trace(
-        [snapshot], lifecycle, stacks, top_n=10)
+    output, summary, all_summary = analyzer.build_chrome_trace([snapshot],
+                                                               lifecycle,
+                                                               stacks,
+                                                               top_n=10)
 
     self.assertEqual(summary[0]["pss_bytes"], 12 * 1024)
     self.assertEqual(summary, all_summary)
     self.assertEqual(summary[0]["rss_bytes"], 12 * 1024)
     self.assertEqual(summary[0]["virtual_bytes"], 12 * 1024)
-    self.assertIn("AllocateByRawMmap", output["metadata"]["final_summary"][0]["stack"])
+    self.assertIn("AllocateByRawMmap",
+                  output["metadata"]["final_summary"][0]["stack"])
 
   def test_multiple_unknown_length_mmaps_in_one_vma_do_not_duplicate_pss(self):
     """同一个 VMA 被多个未知长度 mmap 命中时，PSS 总和不能超过 smaps。"""
@@ -1043,8 +1131,10 @@ TOTAL SWAP PSS: 7,000K
         11: analyzer.Stack(11, ["SecondRawMmap"]),
     }
 
-    _output, summary, all_summary = analyzer.build_chrome_trace(
-        [snapshot], lifecycle, stacks, top_n=10)
+    _output, summary, all_summary = analyzer.build_chrome_trace([snapshot],
+                                                                lifecycle,
+                                                                stacks,
+                                                                top_n=10)
 
     self.assertEqual(sum(item["pss_bytes"] for item in summary), 12 * 1024)
     self.assertEqual(summary, all_summary)
@@ -1093,15 +1183,15 @@ TOTAL SWAP PSS: 7,000K
         11: analyzer.Stack(11, ["SecondMmap"]),
     }
 
-    output, summary, all_summary = analyzer.build_chrome_trace(
-        [snapshot], lifecycle, stacks, top_n=1)
+    output, summary, all_summary = analyzer.build_chrome_trace([snapshot],
+                                                               lifecycle,
+                                                               stacks,
+                                                               top_n=1)
 
     self.assertEqual(len(summary), 1)
     self.assertEqual(len(output["metadata"]["final_summary"]), 1)
     self.assertEqual(len(all_summary), 2)
-    self.assertEqual(
-        {item["stack_id"] for item in all_summary},
-        {10, 11})
+    self.assertEqual({item["stack_id"] for item in all_summary}, {10, 11})
 
   def test_mmap_classification_summary_matches_fs_rules(self):
     """mmap 分类应复用 fs.ini 规则，并按 PSS/RSS 等指标输出 remaining。"""
@@ -1172,15 +1262,15 @@ TOTAL SWAP PSS: 7,000K
             start=0x20000000 + index * 0x2000,
             end=0x20001000 + index * 0x2000,
             stack_id=20,
-            mmap_ts=1000)
-        for index in range(1000)
+            mmap_ts=1000) for index in range(1000)
     ]
-    ranges.append(analyzer.MmapRange(
-        pid=1234,
-        start=0x10000000,
-        end=0x10001000,
-        stack_id=10,
-        mmap_ts=1000))
+    ranges.append(
+        analyzer.MmapRange(
+            pid=1234,
+            start=0x10000000,
+            end=0x10001000,
+            stack_id=10,
+            mmap_ts=1000))
 
     checked_pairs = 0
     original_overlap_size = analyzer.overlap_size
@@ -1209,9 +1299,8 @@ TOTAL SWAP PSS: 7,000K
     ranges = analyzer.remove_overlap(
         ranges, pid=1234, start=0x10001000, size=0x1000)
 
-    self.assertEqual(
-        [(item.start, item.end) for item in ranges],
-        [(0x10000000, 0x10001000), (0x10002000, 0x10004000)])
+    self.assertEqual([(item.start, item.end) for item in ranges],
+                     [(0x10000000, 0x10001000), (0x10002000, 0x10004000)])
 
   def _fake_tp_query(self, _tp, _trace, sql):
     if "__intrinsic_perf_sample" in sql:

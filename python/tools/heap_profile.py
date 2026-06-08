@@ -36,6 +36,7 @@ from perfetto.prebuilts.manifests.trace_processor_shell import *
 from perfetto.prebuilts.manifests.tracebox import *
 from perfetto.prebuilts.manifests.traceconv import *
 from perfetto.prebuilts.perfetto_prebuilts import *
+from perfetto.common.repo_utils import *
 
 NULL = open(os.devnull)
 
@@ -54,8 +55,7 @@ PACKAGES_LIST_CFG = '''data_sources {
 '''
 
 CFG_INDENT = '      '
-ROOT_DIR = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT_DIR = repo_dir('')
 CFG = '''buffers {{
   size_kb: 63488
 }}

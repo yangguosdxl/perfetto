@@ -77,7 +77,8 @@ MAIN_ROW_RE = re.compile(
     r"(?P<private_clean>-?\d+)\s+"
     r"(?P<swap_dirty>-?\d+)\s+"
     r"(?P<rss>-?\d+)"
-    r"(?:\s+(?P<heap_size>-?\d+)\s+(?P<heap_alloc>-?\d+)\s+(?P<heap_free>-?\d+))?\s*$")
+    r"(?:\s+(?P<heap_size>-?\d+)\s+(?P<heap_alloc>-?\d+)\s+(?P<heap_free>-?\d+))?\s*$"
+)
 SUMMARY_RE = re.compile(
     r"^\s*(?P<label>[A-Za-z ]+):\s+(?P<pss>\d+)(?:\s+(?P<rss>\d+))?\s*$")
 UNKNOWN_RSS_RE = re.compile(r"^\s*Unknown:\s+(?P<rss>\d+)\s*$")
@@ -173,15 +174,16 @@ def parse_meminfo(text: str) -> ParsedMeminfo:
     if in_databases:
       db_match = DATABASE_ROW_RE.match(line)
       if db_match:
-        databases.append(DatabaseRow(
-            page_size_kb=int(db_match.group("pgsz")),
-            db_size_kb=int(db_match.group("dbsz")),
-            lookaside_slots=int(db_match.group("lookaside")),
-            cache_hits=int(db_match.group("hits")),
-            cache_misses=int(db_match.group("misses")),
-            cache_size=int(db_match.group("cache")),
-            db_name=db_match.group("name"),
-        ))
+        databases.append(
+            DatabaseRow(
+                page_size_kb=int(db_match.group("pgsz")),
+                db_size_kb=int(db_match.group("dbsz")),
+                lookaside_slots=int(db_match.group("lookaside")),
+                cache_hits=int(db_match.group("hits")),
+                cache_misses=int(db_match.group("misses")),
+                cache_size=int(db_match.group("cache")),
+                db_name=db_match.group("name"),
+            ))
 
   if pid < 0:
     raise ValueError("未找到 MEMINFO pid 头部")
@@ -196,29 +198,35 @@ def parse_meminfo(text: str) -> ParsedMeminfo:
   )
 
 
-def delta(after: ParsedMeminfo, before: ParsedMeminfo, row: str, field: str) -> int:
+def delta(after: ParsedMeminfo, before: ParsedMeminfo, row: str,
+          field: str) -> int:
   """读取主表指定字段的前后差值。"""
   return getattr(after.table.get(row, MemRow()), field) - getattr(
       before.table.get(row, MemRow()), field)
 
 
-def build_growth_checks(before: ParsedMeminfo, after: ParsedMeminfo) -> List[GrowthCheck]:
+def build_growth_checks(before: ParsedMeminfo,
+                        after: ParsedMeminfo) -> List[GrowthCheck]:
   """构造 demo 预期增长项，阈值按 demo 默认分配量保守设置。"""
   before_sql_memory = before.sql.get("MEMORY_USED", 0)
   after_sql_memory = after.sql.get("MEMORY_USED", 0)
   before_db_size = sum(row.db_size_kb for row in before.databases)
   after_db_size = sum(row.db_size_kb for row in after.databases)
   return [
-      GrowthCheck("Native Heap Private Dirty", before.table.get(
-          "Native Heap", MemRow()).private_dirty, after.table.get(
-              "Native Heap", MemRow()).private_dirty, 32 * 1024),
-      GrowthCheck("Other mmap PSS", before.table.get("Other mmap", MemRow()).pss,
+      GrowthCheck("Native Heap Private Dirty",
+                  before.table.get("Native Heap", MemRow()).private_dirty,
+                  after.table.get("Native Heap", MemRow()).private_dirty,
+                  32 * 1024),
+      GrowthCheck("Other mmap PSS",
+                  before.table.get("Other mmap", MemRow()).pss,
                   after.table.get("Other mmap", MemRow()).pss, 8 * 1024),
-      GrowthCheck("Unknown PSS", before.table.get("Unknown", MemRow()).pss,
+      GrowthCheck("Unknown PSS",
+                  before.table.get("Unknown", MemRow()).pss,
                   after.table.get("Unknown", MemRow()).pss, 16 * 1024),
       GrowthCheck("Graphics Summary PSS", before.summary_pss.get("Graphics", 0),
                   after.summary_pss.get("Graphics", 0), 16 * 1024, False),
-      GrowthCheck("SQLite MEMORY_USED", before_sql_memory, after_sql_memory, 64),
+      GrowthCheck("SQLite MEMORY_USED", before_sql_memory, after_sql_memory,
+                  64),
       GrowthCheck("SQLite database size", before_db_size, after_db_size, 1024),
   ]
 
@@ -246,7 +254,8 @@ def _read(path: str) -> str:
 
 def main(argv: List[str]) -> int:
   parser = argparse.ArgumentParser(description="校验 Android meminfo demo 前后变化。")
-  parser.add_argument("--baseline", required=True, help="baseline dumpsys meminfo 文本")
+  parser.add_argument(
+      "--baseline", required=True, help="baseline dumpsys meminfo 文本")
   parser.add_argument("--after", required=True, help="after dumpsys meminfo 文本")
   args = parser.parse_args(argv)
 

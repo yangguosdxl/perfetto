@@ -22,11 +22,8 @@ from typing import Iterable
 
 import classification as common_classification
 
-
-DEFAULT_TRACE = (
-    "/home/dianhun/disk2/work/fsprofiler/PerfData/mem/"
-    "2026-06-01_18-57-13/symbolized-trace"
-)
+DEFAULT_TRACE = ("/home/dianhun/disk2/work/fsprofiler/PerfData/mem/"
+                 "2026-06-01_18-57-13/symbolized-trace")
 
 
 def load_perfetto_root(script_dir: str) -> str | None:
@@ -50,7 +47,8 @@ def default_trace_processor(script_dir: str | None = None) -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
   perfetto_root = load_perfetto_root(script_dir)
   if perfetto_root:
-    return os.path.join(perfetto_root, "out/linux_clang_release/trace_processor_shell")
+    return os.path.join(perfetto_root,
+                        "out/linux_clang_release/trace_processor_shell")
   return "trace_processor_shell"
 
 
@@ -132,7 +130,10 @@ def run_tp_query(trace_processor: str, trace: str, sql: str,
 
   rows: list[dict[str, str | None]] = []
   for row in csv.DictReader(csv_lines):
-    rows.append({key: (value if value != "[NULL]" else None) for key, value in row.items()})
+    rows.append({
+        key: (value if value != "[NULL]" else None)
+        for key, value in row.items()
+    })
   log(f"查询完成：{len(rows)} 行，用时 {time.monotonic() - start:.3f}s")
   return rows
 
@@ -185,7 +186,9 @@ def build_frame_labels(trace_processor: str, trace: str) -> dict[int, str]:
   return labels
 
 
-def build_callsites(trace_processor: str, trace: str) -> tuple[dict[int, Callsite], dict[int | None, list[int]]]:
+def build_callsites(
+    trace_processor: str,
+    trace: str) -> tuple[dict[int, Callsite], dict[int | None, list[int]]]:
   log("读取 stack_profile_callsite")
   rows = run_tp_query(
       trace_processor,
@@ -231,7 +234,10 @@ def build_allocations(trace_processor: str, trace: str) -> list[Allocation]:
       WHERE callsite_id IS NOT NULL
       GROUP BY upid, heap_name, callsite_id
       """,
-      ["upid", "heap_name", "callsite_id", "net_alloc_count", "net_alloc_bytes"],
+      [
+          "upid", "heap_name", "callsite_id", "net_alloc_count",
+          "net_alloc_bytes"
+      ],
   )
 
   allocations: list[Allocation] = []
@@ -252,7 +258,8 @@ def build_allocations(trace_processor: str, trace: str) -> list[Allocation]:
   return allocations
 
 
-def build_process_names(trace_processor: str, trace: str) -> dict[int, tuple[int | None, str | None]]:
+def build_process_names(trace_processor: str,
+                        trace: str) -> dict[int, tuple[int | None, str | None]]:
   log("读取 process")
   rows = run_tp_query(
       trace_processor,
@@ -268,11 +275,13 @@ def build_process_names(trace_processor: str, trace: str) -> dict[int, tuple[int
     upid = row["upid"]
     if upid is not None:
       pid = row["pid"]
-      processes[int(upid)] = (int(pid) if pid is not None else None, row["name"])
+      processes[int(upid)] = (int(pid) if pid is not None else None,
+                              row["name"])
   return processes
 
 
-def descendants(start_nodes: Iterable[int], children: dict[int | None, list[int]]) -> set[int]:
+def descendants(start_nodes: Iterable[int],
+                children: dict[int | None, list[int]]) -> set[int]:
   matched: set[int] = set()
   queue = deque(start_nodes)
   while queue:
@@ -338,28 +347,31 @@ def is_explicit_arg(argv: list[str], name: str) -> bool:
   return any(arg == name or arg.startswith(f"{name}=") for arg in argv)
 
 
-def should_use_all_allocations(args: argparse.Namespace, explicit_symbol: bool) -> bool:
+def should_use_all_allocations(args: argparse.Namespace,
+                               explicit_symbol: bool) -> bool:
   """分类统计默认使用全量 allocation，除非用户显式指定 symbol。"""
-  return bool(args.all_allocations or (args.classify_config and not explicit_symbol))
+  return bool(
+      args.all_allocations or (args.classify_config and not explicit_symbol))
 
 
 def normalize_output_paths(args: argparse.Namespace) -> str:
   """统一把输出路径归一化到 trace 同级 heap_analyze 目录。"""
   output_dir = default_output_dir(args.trace)
   if args.speedscope_out:
-    args.speedscope_out = resolve_output_path(
-        args.trace, args.speedscope_out, "native_heap.speedscope.json")
+    args.speedscope_out = resolve_output_path(args.trace, args.speedscope_out,
+                                              "native_heap.speedscope.json")
   if args.pprof_out is None:
     args.pprof_out = os.path.join(output_dir, "native_heap.pprof.pb.gz")
   elif args.pprof_out:
-    args.pprof_out = resolve_output_path(
-        args.trace, args.pprof_out, "native_heap.pprof.pb.gz")
+    args.pprof_out = resolve_output_path(args.trace, args.pprof_out,
+                                         "native_heap.pprof.pb.gz")
   if args.classify_speedscope_dir:
     args.classify_speedscope_dir = resolve_output_dir(
         args.trace, args.classify_speedscope_dir)
   if args.classify_summary_out:
-    args.classify_summary_out = resolve_output_path(
-        args.trace, args.classify_summary_out, "summary.xlsx")
+    args.classify_summary_out = resolve_output_path(args.trace,
+                                                    args.classify_summary_out,
+                                                    "summary.xlsx")
   if args.classify_summary_speedscope_out:
     args.classify_summary_speedscope_out = resolve_output_path(
         args.trace, args.classify_summary_speedscope_out,
@@ -383,9 +395,7 @@ def classify_allocations(
   每个 allocation 最多属于一个分类；没有命中的进入 remaining。
   """
   return common_classification.classify_items(
-      allocations,
-      rules,
-      lambda allocation: stack_labels_leaf_to_root(
+      allocations, rules, lambda allocation: stack_labels_leaf_to_root(
           allocation.callsite_id, callsites, frame_labels))
 
 
@@ -412,7 +422,8 @@ def sum_allocations(allocations: Iterable[Allocation]) -> tuple[int, int, int]:
 
 def format_stack(callsite_id: int, callsites: dict[int, Callsite],
                  frame_labels: dict[int, str]) -> str:
-  return "\n  <- ".join(stack_labels_leaf_to_root(callsite_id, callsites, frame_labels))
+  return "\n  <- ".join(
+      stack_labels_leaf_to_root(callsite_id, callsites, frame_labels))
 
 
 def stack_labels_leaf_to_root(callsite_id: int, callsites: dict[int, Callsite],
@@ -471,11 +482,10 @@ def write_speedscope(
     # Perfetto callsite 链是 leaf -> root；speedscope 栈按 root -> leaf 写入。
     leaf_to_root = (
         precomputed_stacks.get(alloc.callsite_id)
-        if precomputed_stacks is not None else None
-    )
+        if precomputed_stacks is not None else None)
     if leaf_to_root is None:
-      leaf_to_root = tuple(stack_labels_leaf_to_root(
-          alloc.callsite_id, callsites, frame_labels))
+      leaf_to_root = tuple(
+          stack_labels_leaf_to_root(alloc.callsite_id, callsites, frame_labels))
     stack = list(reversed(leaf_to_root))
     if not stack:
       continue
@@ -505,8 +515,7 @@ def write_speedscope(
   ensure_parent_dir(output_path)
   with open(output_path, "w", encoding="utf-8") as output:
     json.dump(data, output, ensure_ascii=False, separators=(",", ":"))
-  log(
-      "speedscope 输出完成："
+  log("speedscope 输出完成："
       f"{output_path}，samples={len(samples)}，frames={len(frames)}，"
       f"bytes={sum(weights)}，skipped_non_positive={skipped_non_positive}")
 
@@ -523,12 +532,12 @@ def write_classification_speedscope_files(
 
   os.makedirs(output_dir, exist_ok=True)
   remove_stale_generated_files(output_dir, ".speedscope.json")
-  for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
+  for index, entry in enumerate(
+      build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
     allocations = [item.item for item in entry.items]
     precomputed = {
-        item.item.callsite_id: item.stack_leaf_to_root
-        for item in entry.items
+        item.item.callsite_id: item.stack_leaf_to_root for item in entry.items
     }
     output_path = (
         f"{output_dir}/{index:02d}_{sanitize_filename(full_name)}.speedscope.json"
@@ -610,8 +619,7 @@ def write_summary_speedscope(
   ensure_parent_dir(output_path)
   with open(output_path, "w", encoding="utf-8") as output:
     json.dump(data, output, ensure_ascii=False, separators=(",", ":"))
-  log(
-      "summary speedscope 输出完成："
+  log("summary speedscope 输出完成："
       f"{output_path}，samples={len(samples)}，frames={len(frames)}，"
       f"bytes={sum(weights)}，skipped_non_positive={skipped_non_positive}")
 
@@ -658,13 +666,8 @@ def _pprof_line(function_id: int) -> bytes:
 
 
 def _pprof_mapping(filename_index: int) -> bytes:
-  return (
-      _pb_int(1, 1) +
-      _pb_int(5, filename_index) +
-      _pb_bool(7, True) +
-      _pb_bool(8, True) +
-      _pb_bool(9, True) +
-      _pb_bool(10, True))
+  return (_pb_int(1, 1) + _pb_int(5, filename_index) + _pb_bool(7, True) +
+          _pb_bool(8, True) + _pb_bool(9, True) + _pb_bool(10, True))
 
 
 def _pprof_label(key_index: int, value_index: int) -> bytes:
@@ -705,7 +708,8 @@ def write_pprof(
   )
   profile = bytearray()
   for sample_type, unit in sample_types:
-    profile += _pb_message(1, _pprof_value_type(intern(sample_type), intern(unit)))
+    profile += _pb_message(1,
+                           _pprof_value_type(intern(sample_type), intern(unit)))
 
   mapping_filename_index = intern("native_heap")
   location_ids: dict[str, int] = {}
@@ -720,12 +724,10 @@ def write_pprof(
     location_ids[frame_name] = location_id
     name_index = intern(frame_name)
     function_payloads.append(
-        _pb_int(1, location_id) +
-        _pb_int(2, name_index) +
+        _pb_int(1, location_id) + _pb_int(2, name_index) +
         _pb_int(3, name_index))
     location_payloads.append(
-        _pb_int(1, location_id) +
-        _pb_int(2, 1) +
+        _pb_int(1, location_id) + _pb_int(2, 1) +
         _pb_message(4, _pprof_line(location_id)))
     return location_id
 
@@ -744,8 +746,8 @@ def write_pprof(
   processes = processes or {}
   sample_count = 0
   for alloc in allocations:
-    leaf_to_root = stack_labels_leaf_to_root(
-        alloc.callsite_id, callsites, frame_labels)
+    leaf_to_root = stack_labels_leaf_to_root(alloc.callsite_id, callsites,
+                                             frame_labels)
     if not leaf_to_root:
       continue
     sample = bytearray()
@@ -767,7 +769,8 @@ def write_pprof(
     for key, value in labels.items():
       if value is None:
         continue
-      sample += _pb_message(3, _pprof_label(label_keys[key], intern(str(value))))
+      sample += _pb_message(3, _pprof_label(label_keys[key],
+                                            intern(str(value))))
     profile += _pb_message(2, bytes(sample))
     sample_count += 1
 
@@ -777,8 +780,9 @@ def write_pprof(
   for payload in function_payloads:
     profile += _pb_message(5, payload)
   profile_name_index = intern(profile_name)
-  profile += _pb_message(11, _pprof_value_type(
-      intern("positive_net_alloc_bytes"), intern("bytes")))
+  profile += _pb_message(
+      11,
+      _pprof_value_type(intern("positive_net_alloc_bytes"), intern("bytes")))
   profile += _pb_int(12, 1)
   profile += _pb_int(13, profile_name_index)
   profile += _pb_int(14, intern("positive_net_alloc_bytes"))
@@ -789,8 +793,7 @@ def write_pprof(
   ensure_parent_dir(output_path)
   with gzip.open(output_path, "wb") as output:
     output.write(bytes(profile))
-  log(
-      "pprof 输出完成："
+  log("pprof 输出完成："
       f"{output_path}，samples={sample_count}，frames={len(location_ids)}")
 
 
@@ -851,18 +854,17 @@ def write_classification_summary_pprof(
       callsite_id = next_callsite_id
       next_callsite_id += 1
       callsites[callsite_id] = Callsite(
-          parent_id=parent_id,
-          frame_id=intern_frame(frame_name),
-          depth=depth)
+          parent_id=parent_id, frame_id=intern_frame(frame_name), depth=depth)
       parent_id = callsite_id
     if parent_id is None:
       return
-    allocations.append(Allocation(
-        upid=None,
-        heap_name="classification",
-        callsite_id=parent_id,
-        net_alloc_count=net_count,
-        net_alloc_bytes=net_bytes))
+    allocations.append(
+        Allocation(
+            upid=None,
+            heap_name="classification",
+            callsite_id=parent_id,
+            net_alloc_count=net_count,
+            net_alloc_bytes=net_bytes))
     extra_labels[parent_id] = labels
 
   for entry in build_summary_hierarchy_entries(summary):
@@ -872,18 +874,17 @@ def write_classification_summary_pprof(
     net_count = int(entry["net_alloc_count"])
     net_bytes = int(entry["net_alloc_bytes"])
     if path == ("remaining",):
-      add_sample(
-          ("Native heap summary", "remaining"),
-          net_count,
-          net_bytes,
-          {"category": "remaining", "category_type": "remaining"})
+      add_sample(("Native heap summary", "remaining"), net_count, net_bytes, {
+          "category": "remaining",
+          "category_type": "remaining"
+      })
     else:
       category = "/".join(path)
-      add_sample(
-          ("Native heap summary", "classified", *path),
-          net_count,
-          net_bytes,
-          {"category": category, "category_type": "classified"})
+      add_sample(("Native heap summary", "classified", *path), net_count,
+                 net_bytes, {
+                     "category": category,
+                     "category_type": "classified"
+                 })
 
   write_pprof(
       output_path,
@@ -905,27 +906,22 @@ def write_classification_pprof_files(
   """为分类树每个节点输出一个 pprof 明细文件。"""
   os.makedirs(output_dir, exist_ok=True)
   remove_stale_generated_files(output_dir, ".pprof.pb.gz")
-  for index, entry in enumerate(build_hierarchy_entries(classified, remaining), start=1):
+  for index, entry in enumerate(
+      build_hierarchy_entries(classified, remaining), start=1):
     full_name = "/".join(entry.path)
     allocations = [item.item for item in entry.items]
     labels = {
         item.item.callsite_id: {
-            "category": full_name,
-            "category_type": "remaining" if entry.path == ("remaining",) else "classified",
-        }
-        for item in entry.items
+            "category":
+                full_name,
+            "category_type":
+                "remaining" if entry.path == ("remaining",) else "classified",
+        } for item in entry.items
     }
     output_path = (
-        f"{output_dir}/{index:02d}_{sanitize_filename(full_name)}.pprof.pb.gz"
-    )
-    write_pprof(
-        output_path,
-        f"Native heap category: {full_name}",
-        allocations,
-        callsites,
-        frame_labels,
-        processes,
-        labels)
+        f"{output_dir}/{index:02d}_{sanitize_filename(full_name)}.pprof.pb.gz")
+    write_pprof(output_path, f"Native heap category: {full_name}", allocations,
+                callsites, frame_labels, processes, labels)
 
 
 def build_classification_summary(
@@ -985,17 +981,15 @@ def build_classification_summary(
   }
 
 
-def build_summary_hierarchy_entries(summary: dict[str, object]) -> list[dict[str, object]]:
+def build_summary_hierarchy_entries(
+    summary: dict[str, object]) -> list[dict[str, object]]:
   entries = common_classification.build_summary_hierarchy_entries(
       summary,
       ("matched_allocation_callsites", "net_alloc_count", "net_alloc_bytes"))
-  return [
-      {
-          **entry,
-          "net_alloc_mib": int(entry["net_alloc_bytes"]) / 1048576.0,
-      }
-      for entry in entries
-  ]
+  return [{
+      **entry,
+      "net_alloc_mib": int(entry["net_alloc_bytes"]) / 1048576.0,
+  } for entry in entries]
 
 
 def write_classification_summary(path: str, summary: dict[str, object]) -> None:
@@ -1017,13 +1011,17 @@ def write_classification_summary(path: str, summary: dict[str, object]) -> None:
       ["classified_total_net_alloc_count", classified_total["net_alloc_count"]],
       ["classified_total_net_alloc_bytes", classified_total["net_alloc_bytes"]],
       ["classified_total_net_alloc_mib", classified_total["net_alloc_mib"]],
-      ["remaining_matched_allocation_callsites", remaining["matched_allocation_callsites"]],
+      [
+          "remaining_matched_allocation_callsites",
+          remaining["matched_allocation_callsites"]
+      ],
       ["remaining_net_alloc_count", remaining["net_alloc_count"]],
       ["remaining_net_alloc_bytes", remaining["net_alloc_bytes"]],
       ["remaining_net_alloc_mib", remaining["net_alloc_mib"]],
   ]
   hierarchy_entries = build_summary_hierarchy_entries(summary)
-  max_depth = max((len(entry["path"]) for entry in hierarchy_entries), default=1)
+  max_depth = max((len(entry["path"]) for entry in hierarchy_entries),
+                  default=1)
   category_rows: list[list[object]] = [[
       *[f"level_{index}" for index in range(1, max_depth + 1)],
       "full_name",
@@ -1048,15 +1046,15 @@ def write_classification_summary(path: str, summary: dict[str, object]) -> None:
         entry["net_alloc_mib"],
     ])
 
-  common_classification.write_xlsx(
-      path, [("Summary", summary_rows), ("Tree", category_rows)])
+  common_classification.write_xlsx(path, [("Summary", summary_rows),
+                                          ("Tree", category_rows)])
   log(f"分类统计输出完成：{path}")
 
 
 def main() -> int:
-  parser = argparse.ArgumentParser(
-      description="查询调用栈中包含指定符号的 Native heap 分配栈。")
-  parser.add_argument("--trace", default=DEFAULT_TRACE, help="symbolized trace 路径")
+  parser = argparse.ArgumentParser(description="查询调用栈中包含指定符号的 Native heap 分配栈。")
+  parser.add_argument(
+      "--trace", default=DEFAULT_TRACE, help="symbolized trace 路径")
   parser.add_argument(
       "--symbol",
       default="il2cpp::vm::Class::Init",
@@ -1130,20 +1128,20 @@ def main() -> int:
       matched_allocations = list(allocations)
     else:
       target_frames = {
-          frame_id
-          for frame_id, label in frame_labels.items()
+          frame_id for frame_id, label in frame_labels.items()
           if args.symbol in label
       }
       target_callsites = [
-          callsite_id
-          for callsite_id, callsite in callsites.items()
+          callsite_id for callsite_id, callsite in callsites.items()
           if callsite.frame_id in target_frames
       ]
       matched_callsites = descendants(target_callsites, children)
       matched_allocations = [
-          alloc for alloc in allocations if alloc.callsite_id in matched_callsites
+          alloc for alloc in allocations
+          if alloc.callsite_id in matched_callsites
       ]
-    matched_allocations.sort(key=lambda alloc: abs(alloc.net_alloc_bytes), reverse=True)
+    matched_allocations.sort(
+        key=lambda alloc: abs(alloc.net_alloc_bytes), reverse=True)
 
     total_count = sum(alloc.net_alloc_count for alloc in matched_allocations)
     total_bytes = sum(alloc.net_alloc_bytes for alloc in matched_allocations)
@@ -1231,7 +1229,8 @@ def main() -> int:
       print(f"    net_alloc_bytes: {classified_total_bytes}")
       print(f"    net_alloc_mib: {classified_total_bytes / 1048576.0:.3f}")
       print()
-      classification_labels = build_classification_label_map(classified, remaining)
+      classification_labels = build_classification_label_map(
+          classified, remaining)
       if args.pprof_out:
         write_pprof(
             args.pprof_out,
@@ -1242,8 +1241,8 @@ def main() -> int:
             processes,
             classification_labels,
         )
-      category_summary_pprof_out = os.path.join(
-          output_dir, "category_summary.pprof.pb.gz")
+      category_summary_pprof_out = os.path.join(output_dir,
+                                                "category_summary.pprof.pb.gz")
       write_classification_summary_pprof(
           category_summary_pprof_out,
           summary_data,
@@ -1272,8 +1271,8 @@ def main() -> int:
         write_classification_summary(summary_out, summary_data)
       summary_speedscope_out = args.classify_summary_speedscope_out
       if summary_speedscope_out is None:
-        summary_speedscope_out = os.path.join(
-            output_dir, "summary.speedscope.json")
+        summary_speedscope_out = os.path.join(output_dir,
+                                              "summary.speedscope.json")
       if summary_speedscope_out:
         write_summary_speedscope(
             summary_speedscope_out,
@@ -1293,7 +1292,8 @@ def main() -> int:
       print(f"  net_alloc_bytes: {alloc.net_alloc_bytes}")
       print(f"  net_alloc_mib: {alloc.net_alloc_bytes / 1048576.0:.3f}")
       print("  stack:")
-      for line in format_stack(alloc.callsite_id, callsites, frame_labels).splitlines():
+      for line in format_stack(alloc.callsite_id, callsites,
+                               frame_labels).splitlines():
         print(f"    {line}")
       print()
   finally:

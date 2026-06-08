@@ -6,7 +6,6 @@ import unittest
 
 import meminfo_android_demo.verify_meminfo_demo as verifier
 
-
 BASELINE = textwrap.dedent("""
     Applications Memory Usage (in Kilobytes):
     Uptime: 100 Realtime: 100
@@ -42,7 +41,6 @@ BASELINE = textwrap.dedent("""
          cache hits  cache misses    cache size  Dbname
                 1            2             3  /data/user/0/com.example.meminfodemo/databases/demo.db
 """)
-
 
 AFTER = textwrap.dedent("""
     Applications Memory Usage (in Kilobytes):
@@ -105,11 +103,16 @@ class MeminfoAndroidDemoTest(unittest.TestCase):
     failed = [check for check in checks if not check.passed]
 
     self.assertEqual(failed, [])
-    self.assertGreater(verifier.delta(after, baseline, "Native Heap", "private_dirty"), 64 * 1024)
-    self.assertGreater(verifier.delta(after, baseline, "Other mmap", "pss"), 16 * 1024)
-    self.assertGreater(verifier.delta(after, baseline, "Unknown", "pss"), 32 * 1024)
-    self.assertGreater(after.summary_pss["Graphics"] - baseline.summary_pss["Graphics"],
-                       32 * 1024)
+    self.assertGreater(
+        verifier.delta(after, baseline, "Native Heap", "private_dirty"),
+        64 * 1024)
+    self.assertGreater(
+        verifier.delta(after, baseline, "Other mmap", "pss"), 16 * 1024)
+    self.assertGreater(
+        verifier.delta(after, baseline, "Unknown", "pss"), 32 * 1024)
+    self.assertGreater(
+        after.summary_pss["Graphics"] - baseline.summary_pss["Graphics"],
+        32 * 1024)
 
 
 if __name__ == "__main__":
