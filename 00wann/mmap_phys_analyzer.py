@@ -1173,6 +1173,18 @@ def load_perfetto_root(config_dir: str) -> Optional[str]:
           continue
         if token.startswith("PerfettoRoot="):
           value = token.split("=", 1)[1]
+          if os.name == "nt" and value.startswith("/") and not value.startswith("//"):
+            try:
+              proc = subprocess.run(
+                  ["cygpath", "-w", value],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  check=False)
+              if proc.returncode == 0 and proc.stdout.strip():
+                return os.path.abspath(proc.stdout.strip())
+            except FileNotFoundError:
+              pass
           return os.path.abspath(os.path.join(config_dir, value))
   return None
 
@@ -1181,15 +1193,31 @@ def find_default_tp(config_dir: Optional[str] = None) -> Optional[str]:
   if config_dir is None:
     config_dir = os.path.dirname(os.path.abspath(__file__))
   perfetto_root = load_perfetto_root(config_dir)
+  env_override = os.environ.get("TRACE_PROCESSOR")
+  if env_override:
+    return env_override
   candidates = [
       "trace_processor_shell",
       "trace_processor",
   ]
   if perfetto_root:
-    candidates.insert(
-        0,
-        os.path.join(perfetto_root,
-                     "out/linux_clang_release/trace_processor_shell"))
+    if os.name == "nt":
+      perfetto_candidates = [
+          os.path.join(perfetto_root, "out", "win_clang",
+                       "trace_processor_shell.exe"),
+          os.path.join(perfetto_root, "out", "win",
+                       "trace_processor_shell.exe"),
+          os.path.join(perfetto_root, "out", "linux_clang_release",
+                       "trace_processor_shell"),
+      ]
+    else:
+      perfetto_candidates = [
+          os.path.join(perfetto_root, "out", "linux_clang_release",
+                       "trace_processor_shell"),
+          os.path.join(perfetto_root, "out", "android_arm64",
+                       "trace_processor_shell"),
+      ]
+    candidates = perfetto_candidates + candidates
   for candidate in candidates:
     if os.path.exists(candidate) and os.access(candidate, os.X_OK):
       return candidate

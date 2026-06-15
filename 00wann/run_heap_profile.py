@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-APP = "com.tencent.dhwdxkty.trunk.profiler"
+APP = "com.fs.t.prf"
 MALLOC_LIVE_SQL = ("select coalesce(sum(size), 0) as malloc_live_bytes "
                    "from heap_profile_allocation;")
 HEALTH_SQL = (
@@ -28,7 +28,30 @@ HEALTH_SQL = (
     "'traced_buf_chunks_discarded','traced_buf_trace_writer_packet_loss',"
     "'traced_buf_patches_failed','traced_buf_abi_violations',"
     "'heapprofd_buffer_overran','heapprofd_client_error',"
-    "'heapprofd_missing_packet','heapprofd_non_finalized_profile');")
+    "'heapprofd_missing_packet','heapprofd_non_finalized_profile',"
+    "'heapprofd_rejected_concurrent');")
+
+WINDOWS_SIGBREAK_BRIDGE_CODE = r"""
+import runpy
+import signal
+import sys
+
+
+def _forward_sigbreak_to_sigint(signum, frame):
+  handler = signal.getsignal(signal.SIGINT)
+  if callable(handler):
+    handler(signal.SIGINT, frame)
+  elif handler == signal.SIG_DFL:
+    raise KeyboardInterrupt
+
+
+if hasattr(signal, "SIGBREAK"):
+  signal.signal(signal.SIGBREAK, _forward_sigbreak_to_sigint)
+
+script = sys.argv[1]
+sys.argv = sys.argv[1:]
+runpy.run_path(script, run_name="__main__")
+"""
 
 
 class TeeLogger:
@@ -58,6 +81,138 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
   return subprocess.run(cmd, check=False, **kwargs)
 
 
+def build_heap_profile_command(inner_python: str, heap_profile_script: Path,
+                               args: list[str]) -> list[str]:
+  """Windows 用桥接进程把 Ctrl-Break 转成 Perfetto 期待的 SIGINT。"""
+  if os.name == "nt":
+    return [
+        inner_python,
+        "-c",
+        WINDOWS_SIGBREAK_BRIDGE_CODE,
+        str(heap_profile_script),
+        *args,
+    ]
+  return [inner_python, str(heap_profile_script), *args]
+
+
+def profiler_creation_flags() -> int:
+  if os.name == "nt":
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+  return 0
+
+
+def request_profiler_shutdown(profiler_proc: subprocess.Popen[str]) -> None:
+  """请求 heap_profile.py 走 Perfetto 自身的 trace 收尾路径。"""
+  if profiler_proc.poll() is not None:
+    return
+  try:
+    if os.name == "nt":
+      profiler_proc.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+      profiler_proc.send_signal(signal.SIGINT)
+  except (ValueError, OSError) as exc:
+    print(
+        "HEAP_PROFILE_WARN|reason=shutdown_signal_failed|"
+        f"pid={profiler_proc.pid}|error={exc}"
+    )
+    profiler_proc.terminate()
+
+
+def adb_binary() -> str:
+  return os.environ.get("ADB_BINARY", "adb")
+
+
+def cp_binary() -> str:
+  return os.environ.get("CP_BINARY", "cp")
+
+
+def resolve_shell_path(base_dir: Path, value: str) -> Path:
+  """把 config.sh 中的 MSYS 路径转换成当前 Python 可访问的宿主机路径。"""
+  if os.name == "nt" and value.startswith("/") and not value.startswith("//"):
+    cygpath = shutil.which("cygpath")
+    if cygpath:
+      proc = subprocess.run(
+          [cygpath, "-w", value],
+          text=True,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.DEVNULL,
+          check=False,
+      )
+      if proc.returncode == 0 and proc.stdout.strip():
+        return Path(proc.stdout.strip()).resolve()
+
+  path = Path(value)
+  if not path.is_absolute():
+    path = base_dir / path
+  return path.resolve()
+
+
+def _is_executable(path: Path) -> bool:
+  if os.name == "nt" and path.suffix.lower() not in (".exe", ".bat", ".cmd",
+                                                      ".com"):
+    return False
+  return path.exists() and os.access(path, os.X_OK)
+
+
+def resolve_perfetto_tool(perfetto_root: Path, tool: str,
+                          env_name: str) -> Path:
+  """按宿主机优先级选择 Perfetto 工具，兼容 Linux 和 Windows Git Bash。"""
+  override = os.environ.get(env_name)
+  if override:
+    return Path(override)
+
+  if os.name == "nt":
+    candidates_by_tool = {
+        "trace_processor_shell": [
+            perfetto_root / "out/win_clang/trace_processor_shell.exe",
+            perfetto_root / "out/win_clang/trace_processor_shell.cmd",
+            perfetto_root / "out/win/trace_processor_shell.exe",
+            perfetto_root / "out/win/trace_processor_shell.cmd",
+            perfetto_root / "out/linux_clang_release/trace_processor_shell",
+            perfetto_root / "out/android_arm64/trace_processor_shell",
+        ],
+        "traceconv": [
+            perfetto_root / "out/win_clang/traceconv.exe",
+            perfetto_root / "out/win_clang/traceconv.cmd",
+            perfetto_root / "out/win/traceconv.exe",
+            perfetto_root / "out/win/traceconv.cmd",
+            perfetto_root / "out/android_arm64/msvc/traceconv.exe",
+            perfetto_root / "out/linux_clang_release/traceconv",
+            perfetto_root / "out/android_arm64/traceconv",
+        ],
+    }
+  else:
+    candidates_by_tool = {
+        "trace_processor_shell": [
+            perfetto_root / "out/linux_clang_release/trace_processor_shell",
+            perfetto_root / "out/android_arm64/trace_processor_shell",
+            perfetto_root / "out/win_clang/trace_processor_shell.exe",
+            perfetto_root / "out/win/trace_processor_shell.exe",
+        ],
+        "traceconv": [
+            perfetto_root / "out/linux_clang_release/traceconv",
+            perfetto_root / "out/android_arm64/traceconv",
+            perfetto_root / "out/android_arm64/msvc/traceconv.exe",
+            perfetto_root / "out/win_clang/traceconv.exe",
+            perfetto_root / "out/win/traceconv.exe",
+        ],
+    }
+
+  for candidate in candidates_by_tool[tool]:
+    if _is_executable(candidate):
+      return candidate
+
+  from_path = shutil.which(tool) or shutil.which(f"{tool}.exe")
+  if from_path:
+    return Path(from_path)
+
+  print(f"HEAP_PROFILE_FAILED|reason=perfetto_tool_missing|tool={tool}",
+        file=sys.stderr)
+  for candidate in candidates_by_tool[tool]:
+    print(f"  checked={candidate}", file=sys.stderr)
+  raise SystemExit(1)
+
+
 def load_perfetto_root(script_dir: Path) -> Path:
   cmd = "source config.sh; printf '%s' \"$PerfettoRoot\""
   proc = subprocess.run(
@@ -73,7 +228,7 @@ def load_perfetto_root(script_dir: Path) -> Path:
         f"HEAP_PROFILE_FAILED|reason=load_config_failed|stderr={proc.stderr.strip()}"
     )
     raise SystemExit(1)
-  return (script_dir / proc.stdout.strip()).resolve()
+  return resolve_shell_path(script_dir, proc.stdout.strip())
 
 
 def source_fsbootcmd(script_dir: Path, env: dict[str, str]) -> int:
@@ -91,7 +246,18 @@ def build_env(perfetto_root: Path) -> dict[str, str]:
   env["MSYS_NO_PATHCONV"] = "1"
   env["PERFETTO_SYMBOLIZER_MODE"] = "index"
   env["PERFETTO_BINARY_PATH"] = "./workspace/allsymbols/arm64-v8a"
-  env["PATH"] = f"{perfetto_root / 'buildtools/linux64/clang/bin'}{os.pathsep}{env.get('PATH', '')}"
+  clang_bins = (
+      [perfetto_root / "buildtools/win/clang/bin"]
+      if os.name == "nt" else []) + [
+          perfetto_root / "buildtools/linux64/clang/bin",
+      ]
+  existing_clang_bins = [str(path) for path in clang_bins if path.exists()]
+  if existing_clang_bins:
+    env["PATH"] = os.pathsep.join(
+        [*existing_clang_bins, env.get("PATH", "")])
+  extra_path = env.get("RUN_HEAP_PROFILE_EXTRA_PATH")
+  if extra_path:
+    env["PATH"] = f"{extra_path}{os.pathsep}{env.get('PATH', '')}"
   python_path = str(perfetto_root / "python")
   if env.get("PYTHONPATH"):
     python_path = f"{python_path}{os.pathsep}{env['PYTHONPATH']}"
@@ -131,7 +297,7 @@ def capture_meminfo_snapshot(out_dir: Path, package_name: str) -> bool:
   print(f"\n抓取采集后 meminfo: adb shell dumpsys meminfo {package_name}")
   with tmp_path.open("wb") as out:
     proc = subprocess.run(
-        ["adb", "shell", "dumpsys", "meminfo", package_name],
+        [adb_binary(), "shell", "dumpsys", "meminfo", package_name],
         stdout=out,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -141,6 +307,11 @@ def capture_meminfo_snapshot(out_dir: Path, package_name: str) -> bool:
     return True
   tmp_path.unlink(missing_ok=True)
   return False
+
+
+def count_heap_dump_files(out_dir: Path) -> int:
+  return len(list(out_dir.glob("heap_dump.*.pb"))) + len(
+      list(out_dir.glob("heap_dump.*.pb.gz")))
 
 
 def write_validation(validation_path: Path,
@@ -213,7 +384,7 @@ def validate_heap_profile_against_meminfo(
   diff_bytes = abs(malloc_live_bytes - meminfo_alloc_bytes)
   allowed_diff_bytes = int(
       os.environ.get("HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES", "67108864"))
-  heap_dump_count = len(list(out_dir.glob("heap_dump.*.pb.gz")))
+  heap_dump_count = count_heap_dump_files(out_dir)
 
   write_validation(
       validation_path,
@@ -278,7 +449,7 @@ def wait_for_pid(package_name: str, shutdown_requested: callable) -> str:
   pid = ""
   while not pid and not shutdown_requested():
     proc = subprocess.run(
-        ["adb", "shell", "pidof", package_name],
+        [adb_binary(), "shell", "pidof", package_name],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -310,8 +481,9 @@ def main(argv: list[str]) -> int:
   env = build_env(perfetto_root)
   os.environ.update(env)
 
-  traceconv = perfetto_root / "out/linux_clang_release/traceconv"
-  trace_processor = perfetto_root / "out/linux_clang_release/trace_processor_shell"
+  traceconv = resolve_perfetto_tool(perfetto_root, "traceconv", "TRACECONV")
+  trace_processor = resolve_perfetto_tool(perfetto_root, "trace_processor_shell",
+                                          "TRACE_PROCESSOR")
   duration_args, interval_args, shmem_args = parse_args(argv)
 
   out_dir = script_dir / "PerfData/mem" / _datetime.datetime.now().strftime(
@@ -321,7 +493,7 @@ def main(argv: list[str]) -> int:
   if source_fsbootcmd(script_dir, env) != 0:
     return 1
 
-  run(["adb", "push", "debugconfig.txt", f"/sdcard/Android/data/{APP}/files"],
+  run([adb_binary(), "push", "debugconfig.txt", f"/sdcard/Android/data/{APP}/files"],
       env=env)
 
   shutdown_requested = False
@@ -332,26 +504,28 @@ def main(argv: list[str]) -> int:
     shutdown_requested = True
     if profiler_proc and profiler_proc.poll() is None:
       print("\n收到中断信号，已请求 heap_profile.py 停止采集并等待 trace 收尾...")
-      profiler_proc.send_signal(signal.SIGINT)
+      request_profiler_shutdown(profiler_proc)
 
   signal.signal(signal.SIGINT, request_shutdown)
   signal.signal(signal.SIGTERM, request_shutdown)
 
   print(f"\n重启目标应用以覆盖启动后的 native malloc 分配: {APP}")
-  run(["adb", "shell", "am", "force-stop", APP], env=env)
+  run([adb_binary(), "shell", "am", "force-stop", APP], env=env)
   time.sleep(1)
 
   prebuilt_traceconv = Path.home() / ".local/share/perfetto/prebuilts/traceconv"
   prebuilt_traceconv.parent.mkdir(parents=True, exist_ok=True)
-  run(["cp", str(traceconv), str(prebuilt_traceconv)], env=env)
+  run([cp_binary(), str(traceconv), str(prebuilt_traceconv)], env=env)
 
   profile_log = Path(tempfile.gettempdir()
                     ) / f"run_heap_profile_{int(time.time())}_{os.getpid()}.log"
   profile_log_dest = out_dir / "heap_profile.log"
   logger = TeeLogger(profile_log)
-  cmd = [
-      "python3",
-      str(perfetto_root / "python/tools/heap_profile.py"),
+  inner_python_override = os.environ.get("RUN_HEAP_PROFILE_INNER_PYTHON")
+  inner_python = (
+      str(resolve_shell_path(script_dir, inner_python_override))
+      if inner_python_override else sys.executable)
+  heap_profile_args = [
       "-n",
       APP,
       "-o",
@@ -365,6 +539,9 @@ def main(argv: list[str]) -> int:
       *interval_args,
       *shmem_args,
   ]
+  cmd = build_heap_profile_command(
+      inner_python, perfetto_root / "python/tools/heap_profile.py",
+      heap_profile_args)
   profiler_proc = subprocess.Popen(
       cmd,
       stdout=subprocess.PIPE,
@@ -372,6 +549,7 @@ def main(argv: list[str]) -> int:
       text=True,
       env=env,
       bufsize=1,
+      creationflags=profiler_creation_flags(),
   )
   pump_thread = threading.Thread(
       target=logger.pump, args=(profiler_proc,), daemon=True)
@@ -380,19 +558,19 @@ def main(argv: list[str]) -> int:
   active_timeout_s = int(os.environ.get("HEAP_PROFILE_ACTIVE_TIMEOUT_S", "60"))
   if not wait_for_log_pattern(logger, profiler_proc, "Profiling active",
                               active_timeout_s):
-    run(["cp", str(profile_log), str(profile_log_dest)], env=env)
+    run([cp_binary(), str(profile_log), str(profile_log_dest)], env=env)
     print(
         f"HEAP_PROFILE_FAILED|reason=profiling_active_timeout|out_dir={out_dir}|log={profile_log_dest}"
     )
     if profiler_proc.poll() is None:
-      profiler_proc.send_signal(signal.SIGINT)
+      request_profiler_shutdown(profiler_proc)
       profiler_proc.wait()
     pump_thread.join(timeout=5)
     return 1
 
   if not shutdown_requested:
     print(f"\nheapprofd 已就绪，启动目标应用: {APP}")
-    run(["adb", "shell", "monkey", "-p", APP, "1"], env=env)
+    run([adb_binary(), "shell", "monkey", "-p", APP, "1"], env=env)
     pid = wait_for_pid(APP, lambda: shutdown_requested)
     if pid:
       print(f"\r应用已启动: {APP} pid={pid}")
@@ -406,7 +584,7 @@ def main(argv: list[str]) -> int:
 
   heap_profile_rc = profiler_proc.wait()
   pump_thread.join(timeout=5)
-  run(["cp", str(profile_log), str(profile_log_dest)], env=env)
+  run([cp_binary(), str(profile_log), str(profile_log_dest)], env=env)
 
   if not meminfo_captured and ((out_dir / "raw-trace").exists() or
                                (out_dir / "symbolized-trace").exists()):

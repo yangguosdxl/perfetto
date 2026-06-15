@@ -25,7 +25,8 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       expected = os.path.abspath(
           os.path.join(
               tmpdir,
-              "perfetto-root/out/linux_clang_release/trace_processor_shell"))
+              "perfetto-root", "out", "linux_clang_release",
+              "trace_processor_shell"))
       os.makedirs(os.path.dirname(expected))
       with open(expected, "w", encoding="utf-8") as f:
         f.write("#!/usr/bin/env bash\n")

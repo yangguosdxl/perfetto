@@ -18,3 +18,18 @@ run_heap_profile.sh
 
 # 目录说明
 - PerfData 性能数据，无源代码
+
+## demo
+- 00wann/heapprofd_malloc_apk_demo
+
+### fs app（封神应用）
+这是要进行Native内存分析的正式应用
+- 使用 unity2022.3.62 构建
+- 应用的 il2cpp 运行时源码路径(称之为 `AppIl2cpp`)：`D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj\BuildCache\DR2NativeProfiler\unityLibrary\src\main\Il2CppOutputProject\IL2CPP`
+- 应用的 unity3d 工程(称之为 `FS客户端工程`)：`D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj`
+- 应用导出安卓工程(称之为 `FS安卓工程`)：`D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj\BuildCache\DR2NativeProfiler`
+- unity3d 工程打包时使用的il2cpp(称之为 `OriginIl2cpp`)：
+- unity3d 引擎源代码：`D:\wann\u3d2019`，因为不是构建应用使用的 unity2022.3.62，所以只作为研究引擎实现的**参考**
+- gradle: `D:\bin\gradle-7.5.1`
+- unity2022.3.62安装路径：`D:\Program Files\Unity 2022.3.62f3`，sdk,ndk,java都使用这里的
+- 真机

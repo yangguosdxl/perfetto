@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$script_dir"
+source common_tools.sh
 
 usage() {
   cat <<'EOF'
@@ -41,6 +42,31 @@ has_arg() {
     shift
   done
   return 1
+}
+
+host_python_wants_windows_paths() {
+  local python_bin=$1
+  if ! is_windows_git_bash; then
+    return 1
+  fi
+  case "$python_bin" in
+    /[a-zA-Z]/*|/[a-zA-Z]|[a-zA-Z]:/*|[a-zA-Z]:\\*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+python_script_path_for_host() {
+  local python_bin=$1
+  local script_path=$2
+  # Windows 原生 Python 不能稳定识别 Git Bash 的 /d/... 脚本路径，先转成盘符路径。
+  if host_python_wants_windows_paths "$python_bin" &&
+      command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$script_path"
+  else
+    printf '%s\n' "$script_path"
+  fi
 }
 
 find_latest_capture_dir() {
@@ -92,8 +118,13 @@ if [[ -z "$latest_trace" ]]; then
   exit 1
 fi
 
+python_bin=$(select_python)
+python_script=$(python_script_path_for_host \
+  "$python_bin" \
+  "$script_dir/heap_analyzer/query_heap_alloc_stacks_by_symbol.py")
+
 cmd=(
-  python3 -u -B "$script_dir/heap_analyzer/query_heap_alloc_stacks_by_symbol.py"
+  "$python_bin" -u -B "$python_script"
   --trace "$latest_trace"
   --classify-config heap_analyzer/fs.ini
 )

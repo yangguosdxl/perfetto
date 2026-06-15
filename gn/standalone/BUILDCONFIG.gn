@@ -123,7 +123,11 @@ if (is_win) {
 set_default_toolchain(_default_toolchain)
 
 if (is_cross_compiling) {
-  host_toolchain = "//gn/standalone/toolchain:gcc_like_host"
+  if (host_os == "win") {
+    host_toolchain = "//gn/standalone/toolchain:msvc"
+  } else {
+    host_toolchain = "//gn/standalone/toolchain:gcc_like_host"
+  }
 } else {
   host_toolchain = _default_toolchain
 }

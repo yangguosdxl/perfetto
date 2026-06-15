@@ -1,6 +1,6 @@
 # Native heap profile 采集脚本
 
-`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，默认目标包名为 `com.tencent.dhwdxkty.trunk.profiler`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。`run_heap_profile.sh` 只是兼容入口，实际流程由 `run_heap_profile.py` 执行；入口会自动切换到自身所在目录，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
+`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，默认目标包名为 `com.fs.t.prf`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。`run_heap_profile.sh` 只是兼容入口，实际流程由 `run_heap_profile.py` 执行；入口会自动切换到自身所在目录，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
 
 默认执行时不限制采集时长，`heap_profile.py` 会持续采集直到人工中断：
 
@@ -8,7 +8,7 @@
 00wann/run_heap_profile.sh
 ```
 
-人工按 Ctrl+C 时，Python 主脚本会把 SIGINT 转发给 `heap_profile.py`，让 Perfetto 进入 `Waiting for profiler shutdown...` 收尾流程。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
+人工按 Ctrl+C 时，Python 主脚本会请求 `heap_profile.py` 停止采集，让 Perfetto 进入 `Waiting for profiler shutdown...` 收尾流程。Linux 下直接转发 `SIGINT`；Windows 下 `subprocess` 不支持对子进程发送 `SIGINT`，脚本会用新进程组和 Ctrl-Break bridge 把控制台事件转换为 `heap_profile.py` 内部的 `SIGINT` 处理。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
 
 如需自动退出，可把采集时长作为第一个参数传入，单位为毫秒：
 
@@ -33,7 +33,7 @@
 为了让 heapprofd 的 malloc live 总量和采集后 `dumpsys meminfo` 的 `Native Heap / Heap Alloc` 具备同口径可比性，脚本会在采集前重启目标应用：
 
 ```bash
-adb shell am force-stop com.tencent.dhwdxkty.trunk.profiler
+adb shell am force-stop com.fs.t.prf
 ```
 
 随后脚本以 `--no-running` 启动 `heap_profile.py`，等待日志出现 `Profiling active`，再执行一次：
@@ -56,21 +56,36 @@ PerfData/mem/<日期时间>/heap_profile.log
 
 Python 主脚本还会显式传入本地构建产物：
 
-```bash
---traceconv-binary "$PerfettoRoot/out/linux_clang_release/traceconv"
---trace-processor-binary "$PerfettoRoot/out/linux_clang_release/trace_processor_shell"
+```text
+Linux 优先：
+  --traceconv-binary "$PerfettoRoot/out/linux_clang_release/traceconv"
+  --trace-processor-binary "$PerfettoRoot/out/linux_clang_release/trace_processor_shell"
+
+Windows Git Bash 优先：
+  --traceconv-binary "$PerfettoRoot/out/win_clang/traceconv.exe"
+  --traceconv-binary "$PerfettoRoot/out/android_arm64/msvc/traceconv.exe"
+  --trace-processor-binary "$PerfettoRoot/out/win_clang/trace_processor_shell.exe"
+  --trace-processor-binary "$PerfettoRoot/out/win/trace_processor_shell.exe"
 ```
 
-这样可以避免 `heap_profile.py` 下载或复用 `~/.local/share/perfetto/prebuilts` 中与当前系统 glibc 不兼容的预构建二进制。
+实际路径由 `common_tools.sh` 和 `run_heap_profile.py` 自动探测；也可以用
+`TRACECONV`、`TRACE_PROCESSOR` 覆盖。这样可以避免 `heap_profile.py`
+下载或复用 `~/.local/share/perfetto/prebuilts` 中与当前宿主机不兼容的预构建二进制。
+Windows 下脚本还会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，
+确保 `traceconv.exe` 符号化时可以找到 `llvm-symbolizer.exe`。
 
-AI 做真机验证时必须传入 `45000`，表示采集 45 秒后自动停止并拉取 `raw-trace`、生成 `symbolized-trace` 和 `heap_dump.*.pb.gz`。下探采样 interval 时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes> <shmem_size>`。
+Windows Git Bash 中如果没有 `python3`，入口会回退到 `python` 或 `py`；
+测试和手工运行也可以用 `PYTHON=python` 或 `RUN_HEAP_PROFILE_PYTHON=python`
+显式指定解释器。
+
+AI 做真机验证时必须传入 `45000`，表示采集 45 秒后自动停止并拉取 `raw-trace`、生成 `symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz`。下探采样 interval 时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes> <shmem_size>`。
 
 ## 验证
 
 每次 `heap_profile.py` 输出 `Waiting for profiler shutdown...` 后，脚本会在 host 侧 trace 转换、符号化和 pprof 生成完成前立刻执行：
 
 ```bash
-adb shell dumpsys meminfo com.tencent.dhwdxkty.trunk.profiler
+adb shell dumpsys meminfo com.fs.t.prf
 ```
 
 原始输出保存为：
@@ -106,17 +121,17 @@ abs(malloc_live_bytes - meminfo_native_heap_alloc_bytes)
 HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES=67108864
 ```
 
-验证通过时输出 `HEAP_MEMINFO_VALIDATION=PASS`。如果不相当，脚本输出 `HEAP_MEMINFO_VALIDATION=FAIL` 并返回失败。百 MB 级差异不能通过百分比阈值放行，必须继续定位是否存在 heapprofd 丢包、trace 缺失、采样间隔过粗、启动前分配未覆盖、meminfo 抓取晚于采集窗口，或 `Native Heap Alloc` 中存在 heapprofd 未统计来源等根因。报告中会保留 `health_sum`、`heap_dump_count`、trace 路径和 meminfo 路径。
+验证通过时输出 `HEAP_MEMINFO_VALIDATION=PASS`。如果不相当，脚本输出 `HEAP_MEMINFO_VALIDATION=FAIL` 并返回失败。百 MB 级差异不能通过百分比阈值放行，必须继续定位是否存在 heapprofd 丢包、trace 缺失、并发 profiling 残留导致的 `heapprofd_rejected_concurrent`、采样间隔过粗、启动前分配未覆盖、meminfo 抓取晚于采集窗口，或 `Native Heap Alloc` 中存在 heapprofd 未统计来源等根因。报告中会保留 `health_sum`、`heap_dump_count`、trace 路径和 meminfo 路径。
 
 修改 `run_heap_profile.sh` 后可运行：
 
 ```bash
 bash 00wann/test_run_heap_profile.sh
 bash -n 00wann/run_heap_profile.sh 00wann/test_run_heap_profile.sh
-/usr/bin/python3 -m py_compile 00wann/run_heap_profile.py
+python -m py_compile 00wann/run_heap_profile.py
 ```
 
-测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。测试还会模拟人工 Ctrl+C，确认中断会传递给 `heap_profile.py`，并在 `heap_profile.py` 完成 trace/heap dump 本地收尾后继续完成 meminfo 抓取和 SQL 验证。
+测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。Linux 环境会模拟人工 Ctrl+C，确认中断会传递给 `heap_profile.py`，并在 `heap_profile.py` 完成 trace/heap dump 本地收尾后继续完成 meminfo 抓取和 SQL 验证；Windows 环境会额外验证 Ctrl-Break bridge 能触发 `heap_profile.py` 的 `SIGINT` 收尾逻辑。
 
 ## 启动耗时评估
 
@@ -155,7 +170,7 @@ intervals = 512 256 128 64 32 16
 
 ```text
 LAN_STARTUP_MS  -> 从 am start 前设备时间到 “LAN 更新流程开始” 日志出现的耗时
-HEAP_DUMP_COUNT -> heap_dump.*.pb.gz 文件数量
+HEAP_DUMP_COUNT -> heap_dump.*.pb 或 heap_dump.*.pb.gz 文件数量
 ALLOC           -> heap_profile_allocation 的 alloc_rows、positive_rows、net_size
 HEALTH_SUM      -> heapprofd/perfetto 丢失统计求和；0 表示没有发现样本丢失
 ```

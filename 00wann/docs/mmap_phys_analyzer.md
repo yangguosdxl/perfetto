@@ -89,8 +89,24 @@ com.tencent.dhwdxkty.trunk.profiler
 默认 trace processor：
 
 ```text
-$PerfettoRoot/out/linux_clang_release/trace_processor_shell
+Linux 优先：
+  $PerfettoRoot/out/linux_clang_release/trace_processor_shell
+
+Windows Git Bash 优先：
+  $PerfettoRoot/out/win_clang/trace_processor_shell.exe
+  $PerfettoRoot/out/win/trace_processor_shell.exe
 ```
+
+入口脚本会通过 `common_tools.sh` 自动选择 Python、`trace_processor_shell` 和
+`traceconv`。如需覆盖，可显式设置：
+
+```bash
+PYTHON=python TRACE_PROCESSOR=/path/to/trace_processor_shell TRACECONV=/path/to/traceconv ./run_mmap_phys_profile.sh
+```
+
+如果需要脚本在目标进程不存在时自动拉起指定 Activity，可设置
+`MMAP_PHYS_ACTIVITY=<package>/<activity>`。未设置时保留旧行为，只发送一次
+launcher Intent。
 
 运行前需要目标 App 已启动；脚本会等待目标进程出现。采集过程中可以触发 App 行为，例如：
 
@@ -1260,7 +1276,7 @@ libvulkan
 离线分析示例：
 
 ```bash
-python3 -u -B mmap_phys_analyzer.py \
+python -u -B mmap_phys_analyzer.py \
   --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <pid> \
@@ -1377,6 +1393,10 @@ demo 只验证 malloc 分配量，不叠加超深调用栈，避免调用栈展�
 默认场景会在 1 分钟内累计 malloc 1 GiB，每次分配大小按 1 byte 到 1 MiB 的范围变化，
 每块内存都会写入以确保 Native Heap PSS 能反映真实驻留。
 
+Windows Git Bash 下脚本会探测 Unity Android SDK/NDK/OpenJDK，使用 NDK
+`clang`、`dx.jar`、`apksigner.jar` 和 JDK `jar` 构建 APK，避免 `.cmd/.bat`
+工具路径空格导致的执行问题。demo APK 的 `targetSdkVersion` 为 24，以满足当前设备安装限制。
+
 demo 报告路径：
 
 ```text
@@ -1451,7 +1471,7 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 需要完全指定 trace、smaps 或输出路径时，也可以继续直接运行底层分析器：
 
 ```bash
-python3 -u -B mmap_phys_analyzer.py \
+python -u -B mmap_phys_analyzer.py \
   --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <目标 pid> \
@@ -1504,7 +1524,7 @@ Python 内存中展开 stack_profile_callsite parent 链和 inline frame
 运行：
 
 ```bash
-python3 -B -m unittest -v test_mmap_phys_analyzer.py
+python -B -m unittest -v test_mmap_phys_analyzer.py
 bash test_run_mmap_phys_profile.sh
 bash test_run_mmap_phys_analyze_latest.sh
 ```
@@ -1538,7 +1558,7 @@ bash test_run_mmap_phys_analyze_latest.sh
 ```bash
 MMAP_PHYS_TEST_OUTPUT=/home/dianhun/disk2/work/fsprofiler/PerfData/mmap_phys_attribution_test.json \
 MMAP_PHYS_TEST_SPEEDSCOPE_OUTPUT=/home/dianhun/disk2/work/fsprofiler/PerfData/mmap_phys_attribution_test.speedscope.json \
-  python3 -B -m unittest -v test_mmap_phys_analyzer.py
+  python -B -m unittest -v test_mmap_phys_analyzer.py
 ```
 
 ## 已验证结果

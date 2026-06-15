@@ -6,6 +6,7 @@ cd "$script_dir" || exit
 
 # shellcheck source=00wann/config.sh
 source config.sh
+source common_tools.sh
 
 app=${HEAP_STARTUP_APP:-com.tencent.dhwdxkty.trunk.profiler}
 activity=${HEAP_STARTUP_ACTIVITY:-com.tencent.dhwdxkty.trunk.profiler/com.dhplugin.unity.MainActivity}
@@ -27,9 +28,6 @@ export PERFETTO_BINARY_PATH='./workspace/allsymbols/arm64-v8a'
 export PATH="$PerfettoRoot/buildtools/linux64/clang/bin:$PATH"
 export PYTHONPATH="$PerfettoRoot/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-
-traceconv_binary="$PerfettoRoot/out/linux_clang_release/traceconv"
-trace_processor_binary="$PerfettoRoot/out/linux_clang_release/trace_processor_shell"
 health_sql="select coalesce(sum(value), 0) as health_sum from stats where name in ('traced_buf_bytes_overwritten','traced_buf_chunks_overwritten','traced_buf_chunks_discarded','traced_buf_trace_writer_packet_loss','traced_buf_patches_failed','traced_buf_abi_violations','heapprofd_buffer_overran','heapprofd_client_error','heapprofd_missing_packet','heapprofd_non_finalized_profile');"
 alloc_sql="select count(*) as alloc_rows, sum(case when size > 0 then 1 else 0 end) as positive_rows, sum(size) as net_size from heap_profile_allocation;"
 
@@ -61,6 +59,10 @@ if [ "${HEAP_STARTUP_DRY_RUN:-0}" = "1" ]; then
     print_config
     exit 0
 fi
+
+python_bin=$(select_python)
+traceconv_binary=$(select_perfetto_tool traceconv "$PerfettoRoot" "${TRACECONV:-}" || true)
+trace_processor_binary=$(select_perfetto_tool trace_processor_shell "$PerfettoRoot" "${TRACE_PROCESSOR:-}")
 
 lan_elapsed_ms="MISSING"
 lan_line=""
@@ -139,7 +141,7 @@ run_profile_case() {
     sleep 2
     adb logcat -c
 
-    python3 "$PerfettoRoot/python/tools/heap_profile.py" \
+    "$python_bin" "$PerfettoRoot/python/tools/heap_profile.py" \
         -n "$app" \
         -o "$out_dir" \
         -d "$duration_ms" \

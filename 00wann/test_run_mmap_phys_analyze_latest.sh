@@ -6,6 +6,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 cp "$script_dir/run_mmap_phys_analyze_latest.sh" "$tmpdir/run_mmap_phys_analyze_latest.sh"
+cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
 
 cat >"$tmpdir/config.sh" <<EOF
 PerfettoRoot="$tmpdir/perfetto"

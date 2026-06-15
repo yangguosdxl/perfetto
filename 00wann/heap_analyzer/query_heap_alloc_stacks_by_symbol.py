@@ -38,6 +38,18 @@ def load_perfetto_root(script_dir: str) -> str | None:
           continue
         if token.startswith("PerfettoRoot="):
           value = token.split("=", 1)[1]
+          if os.name == "nt" and value.startswith("/") and not value.startswith("//"):
+            try:
+              proc = subprocess.run(
+                  ["cygpath", "-w", value],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  check=False)
+              if proc.returncode == 0 and proc.stdout.strip():
+                return os.path.abspath(proc.stdout.strip())
+            except FileNotFoundError:
+              pass
           return os.path.abspath(os.path.join(config_dir, value))
   return None
 
@@ -45,10 +57,31 @@ def load_perfetto_root(script_dir: str) -> str | None:
 def default_trace_processor(script_dir: str | None = None) -> str:
   if script_dir is None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
+  env_override = os.environ.get("TRACE_PROCESSOR")
+  if env_override:
+    return env_override
   perfetto_root = load_perfetto_root(script_dir)
   if perfetto_root:
-    return os.path.join(perfetto_root,
-                        "out/linux_clang_release/trace_processor_shell")
+    if os.name == "nt":
+      candidates = [
+          os.path.join(perfetto_root, "out", "win_clang",
+                       "trace_processor_shell.exe"),
+          os.path.join(perfetto_root, "out", "win",
+                       "trace_processor_shell.exe"),
+          os.path.join(perfetto_root, "out", "linux_clang_release",
+                       "trace_processor_shell"),
+      ]
+    else:
+      candidates = [
+          os.path.join(perfetto_root, "out", "linux_clang_release",
+                       "trace_processor_shell"),
+          os.path.join(perfetto_root, "out", "android_arm64",
+                       "trace_processor_shell"),
+      ]
+    for candidate in candidates:
+      if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return candidates[0]
   return "trace_processor_shell"
 
 

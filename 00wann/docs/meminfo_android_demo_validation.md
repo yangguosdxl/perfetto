@@ -360,6 +360,16 @@ GLES20.glTexImage2D(..., pixels);
 00wann/run_meminfo_android_demo.sh
 ```
 
+Windows Git Bash 下构建脚本会优先探测 Unity 2022.3.62 自带的
+`AndroidPlayer/SDK`、`AndroidPlayer/NDK` 和 `AndroidPlayer/OpenJDK`。
+如需覆盖，可设置 `ANDROID_SDK_ROOT`、`ANDROID_NDK_ROOT`、`ANDROID_BUILD_TOOLS`
+或 `ANDROID_JAR`。
+
+为兼容当前 Android 设备的安装限制，demo 的 `targetSdkVersion` 为 24。
+Windows Git Bash 构建时不调用 `ndk-build.cmd`、`dx.bat` 或 `apksigner.bat`；
+脚本直接使用 NDK `clang++` 编译 JNI，并通过 `dx.jar`、`apksigner.jar`
+完成 dex 和签名，避免 `.cmd/.bat` 路径空格和参数转换问题。
+
 流程：
 
 ```text
@@ -543,7 +553,7 @@ Graphics:
 ## 复验命令
 
 ```bash
-python3 00wann/test_meminfo_android_demo.py
+python 00wann/test_meminfo_android_demo.py
 bash -n 00wann/meminfo_android_demo/build_demo_apk.sh 00wann/run_meminfo_android_demo.sh
 00wann/run_meminfo_android_demo.sh
 ```

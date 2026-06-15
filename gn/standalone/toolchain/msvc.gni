@@ -35,14 +35,19 @@ if (is_win_host) {
   #    https://developer.microsoft.com/en-us/windows/downloads/windows-10-sdk/
 
   # These variables are required both for clang-cl.exe and MSVC (cl.exe).
+  if (target_os == "win") {
+    _win_msvc_cpu = target_cpu
+  } else {
+    _win_msvc_cpu = host_cpu
+  }
   win_sdk_lib_dir = _win_sdk_base + "\\Lib\\" + _win_sdk_ver
-  win_msvc_lib_dir = _win_msvc_base + "\\lib\\${target_cpu}"
+  win_msvc_lib_dir = _win_msvc_base + "\\lib\\${_win_msvc_cpu}"
 
   # These variables are only required when building with MSVC.
   # Clang is clever enough to figure out the right include path by querying the
   # registry and detect the Windows SDK path (it still needs the /LIBPATH
   # though, hence the _lib_dir above).
-  win_msvc_bin_dir = _win_msvc_base + "\\bin\\Host${host_cpu}\\${target_cpu}"
+  win_msvc_bin_dir = _win_msvc_base + "\\bin\\Host${host_cpu}\\${_win_msvc_cpu}"
   win_msvc_inc_dirs = [
     _win_msvc_base + "\\include",
     _win_sdk_base + "\\Include\\" + _win_sdk_ver + "\\ucrt",
@@ -50,8 +55,8 @@ if (is_win_host) {
     _win_sdk_base + "\\Include\\" + _win_sdk_ver + "\\shared",
   ]
   win_msvc_sys_lib_flags = [
-    "/LIBPATH:\"${win_sdk_lib_dir}\\ucrt\\${target_cpu}\"",
-    "/LIBPATH:\"${win_sdk_lib_dir}\\um\\${target_cpu}\"",
+    "/LIBPATH:\"${win_sdk_lib_dir}\\ucrt\\${_win_msvc_cpu}\"",
+    "/LIBPATH:\"${win_sdk_lib_dir}\\um\\${_win_msvc_cpu}\"",
     "/LIBPATH:\"${win_msvc_lib_dir}\"",
   ]
 } else {

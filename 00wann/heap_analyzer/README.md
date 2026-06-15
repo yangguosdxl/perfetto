@@ -12,8 +12,8 @@
 
 ## 使用方式
 
-推荐在工程根目录 `/home/dianhun/disk2/perfetto/00wann` 执行 wrapper；
-直接调用 Python 脚本时也建议在工程根目录执行，确保
+推荐在 `00wann` 工程目录执行 wrapper；Linux 和 Windows Git Bash 都走同一入口。
+直接调用 Python 脚本时也建议在 `00wann` 目录执行，确保
 `heap_analyzer/fs.ini` 等相对路径生效：
 
 如果只需要分析最近一次 Native heap trace，优先使用 wrapper：
@@ -37,12 +37,23 @@ wrapper 会自动选择 `PerfData/mem` 下最近一次 trace，优先使用同�
 ./run_heap_alloc_stacks_by_symbol_latest.sh --symbol malloc --limit 50
 ```
 
+宿主机工具由 `../common_tools.sh` 自动选择。Windows Git Bash 会优先使用
+`$PerfettoRoot/out/win_clang/trace_processor_shell.exe` 或
+`$PerfettoRoot/out/win/trace_processor_shell.exe`；Linux 会优先使用
+`$PerfettoRoot/out/linux_clang_release/trace_processor_shell`。当 Windows Git Bash
+选择到原生 Windows Python 时，wrapper 会把入口脚本路径转成 `D:\...` 盘符路径，
+避免 `/d/...` 被误解析成 `D:\d\...`。如需覆盖：
+
+```bash
+PYTHON=python TRACE_PROCESSOR=/path/to/trace_processor_shell ./run_heap_alloc_stacks_by_symbol_latest.sh
+```
+
 显式传入 `--symbol` 时，wrapper 不会强制追加默认 `--all-allocations`，
 这样仍可按符号筛选调用栈；如需符号参数同时保留全量模式，可显式传入
 `--all-allocations`。
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --symbol 'il2cpp::vm::Class::Init' \
   --limit 10
 ```
@@ -50,7 +61,7 @@ python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
 输出较长时可以重定向到文件：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --symbol 'il2cpp::vm::Class::Init' \
   --limit 50 \
   > /tmp/heap_alloc_stacks_by_symbol.txt
@@ -59,7 +70,7 @@ python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
 也可以直接输出 speedscope JSON：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --symbol 'il2cpp::vm::Class::Init' \
   --limit 0 \
   --speedscope-out heap_alloc_stacks_by_symbol.speedscope.json
@@ -70,7 +81,7 @@ python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
 脚本默认输出 pprof profile，可用 `go tool pprof` 同时查看火焰图、调用树、top 和调用图：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --symbol 'il2cpp::vm::Class::Init' \
   --limit 0
 ```
@@ -92,7 +103,7 @@ go tool pprof -sample_index=absolute_net_alloc_bytes -http=:0 <symbolized-trace 
 pprof 默认 sample 口径是 `positive_net_alloc_bytes`，也可以通过 `-sample_index=absolute_net_alloc_bytes` 查看净变化绝对值。speedscope 默认使用 `positive-net` 权重，只写入 `net_alloc_bytes > 0` 的分配栈，单位为 bytes。Native heap 的 `size` 是净变化，可能有负值；如果想把负值也按绝对值展示，可以使用：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --symbol 'il2cpp::vm::Class::Init' \
   --limit 0 \
   --speedscope-weight absolute-net \
@@ -108,7 +119,7 @@ python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
 如果 trace 文件在其他位置，传入 `--trace`：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --trace /path/to/symbolized-trace \
   --symbol 'il2cpp::vm::Class::Init'
 ```
@@ -126,7 +137,7 @@ $PerfettoRoot/out/linux_clang_release/trace_processor_shell query \
 优化脚本通过 `--symbol` 指定目标函数：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py --symbol 'malloc'
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py --symbol 'malloc'
 ```
 
 如果使用 SQL 文件，则打开 `heap_alloc_stacks_by_symbol.sql`，修改 `target(symbol)` 里的字符串：
@@ -187,7 +198,7 @@ SUM(size) AS net_alloc_bytes
 如果需要把释放量也作为“变化规模”观察，可以使用 `--speedscope-weight absolute-net`：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --all-allocations \
   --limit 0 \
   --classify-config heap_analyzer/fs.ini \
@@ -310,7 +321,7 @@ net_alloc_mib: 145.111
 对全部 Native heap 分配栈分类，默认输出 pprof 分类结果；如需 speedscope 明细，再额外传入 `--classify-speedscope-dir`：
 
 ```bash
-python3 -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
+python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
   --all-allocations \
   --limit 0 \
   --classify-config heap_analyzer/fs.ini

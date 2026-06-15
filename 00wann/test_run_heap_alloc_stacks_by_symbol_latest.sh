@@ -2,11 +2,13 @@
 set -euo pipefail
 
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+extra_tmpdir=
+trap 'rm -rf "$tmpdir" "$extra_tmpdir"' EXIT
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 cp "$script_dir/run_heap_alloc_stacks_by_symbol_latest.sh" \
   "$tmpdir/run_heap_alloc_stacks_by_symbol_latest.sh"
+cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
 
 mkdir -p "$tmpdir/bin" "$tmpdir/heap_analyzer"
 cp "$script_dir/heap_analyzer/fs.ini" "$tmpdir/heap_analyzer/fs.ini"
@@ -88,4 +90,33 @@ if ! grep -Fq -- "--classify-config heap_analyzer/fs.ini --all-allocations --lim
   echo "用户参数顺序应保留在默认参数后面"
   cat "$TEST_LOG"
   exit 1
+fi
+
+if { [[ "${OSTYPE:-}" == msys* ]] || [[ -n "${MSYSTEM:-}" ]]; } &&
+    command -v cygpath >/dev/null 2>&1; then
+  extra_tmpdir=$(mktemp -d "$script_dir/.tmp_win_python.XXXXXX")
+  mkdir -p "$extra_tmpdir/bin"
+  cat >"$extra_tmpdir/bin/python" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'windows-python %s\n' "$*" >>"${TEST_LOG:?}"
+EOF
+  chmod +x "$extra_tmpdir/bin/python"
+
+  : >"$TEST_LOG"
+  PYTHON="$extra_tmpdir/bin/python" \
+    ./run_heap_alloc_stacks_by_symbol_latest.sh >"$tmpdir/windows_python.out"
+
+  expected_script=$(cygpath -w "$tmpdir/heap_analyzer/query_heap_alloc_stacks_by_symbol.py")
+  if ! grep -Fq -- "$expected_script" "$TEST_LOG"; then
+    echo "Windows 原生 Python 应收到 cygpath 转换后的查询脚本路径"
+    echo "期望: $expected_script"
+    cat "$TEST_LOG"
+    exit 1
+  fi
+  if grep -Fq -- "$tmpdir/heap_analyzer/query_heap_alloc_stacks_by_symbol.py" "$TEST_LOG"; then
+    echo "Windows 原生 Python 不应收到 Git Bash 的 /d/... 脚本路径"
+    cat "$TEST_LOG"
+    exit 1
+  fi
 fi

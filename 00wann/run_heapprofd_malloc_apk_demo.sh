@@ -6,13 +6,32 @@ cd "$script_dir"
 
 # shellcheck source=00wann/config.sh
 source config.sh
+source common_tools.sh
+unset MSYS_NO_PATHCONV
 
-sdk_root=${ANDROID_HOME:-/home/dianhun/disk2/Android/tools}
-ndk_root=${ANDROID_NDK:-/home/dianhun/disk2/Android/android-ndk-r27d}
-build_tools=${sdk_root}/build-tools/26.0.1
-android_jar=${sdk_root}/platforms/android-23/android.jar
-clang=${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android23-clang
-trace_processor=${PerfettoRoot}/out/linux_clang_release/trace_processor_shell
+sdk_root=$(select_android_sdk_root)
+ndk_root=$(select_android_ndk_root)
+build_tools=$(select_build_tools_dir "$sdk_root")
+android_jar=$(select_android_jar "$sdk_root")
+ndk_prebuilt=$(select_ndk_prebuilt_tag "$ndk_root")
+clang=${ndk_root}/toolchains/llvm/prebuilt/${ndk_prebuilt}/bin/clang
+if [[ -e "${clang}.exe" ]]; then
+  clang="${clang}.exe"
+fi
+trace_processor=$(select_perfetto_tool trace_processor_shell "$PerfettoRoot" "${TRACE_PROCESSOR:-}")
+python_bin=$(select_python)
+jdk_bin=$(select_unity_jdk_bin || true)
+if [[ -n "$jdk_bin" ]]; then
+  export PATH="$jdk_bin:$PATH"
+fi
+aapt=$(find_build_tool "$build_tools" aapt)
+zipalign=$(find_build_tool "$build_tools" zipalign)
+dx_jar="$build_tools/lib/dx.jar"
+apksigner_jar="$build_tools/lib/apksigner.jar"
+java_tool=$(command -v java)
+javac_tool=$(command -v javac)
+keytool_tool=$(command -v keytool)
+jar_tool=$(command -v jar)
 package_name=com.example.heapprofddemo
 activity_name=${package_name}/.MainActivity
 out_dir="PerfData/heapprofd_malloc_apk_demo/$(date +%F_%H-%M-%S)"
@@ -30,38 +49,39 @@ keystore=${out_dir}/debug.keystore
 mkdir -p "$build_dir/classes" "$build_dir/apk/lib/arm64-v8a"
 
 printf "编译 APK demo native lib\n"
-"$clang" -O2 -Wall -Wextra -shared -fPIC \
-  -I"${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+run_host_tool "$clang" --target=aarch64-linux-android23 -O2 -Wall -Wextra -shared -fPIC \
   -o "$build_dir/apk/lib/arm64-v8a/libheapprofddemo.so" \
   heapprofd_malloc_apk_demo/jni/heapprofd_malloc_apk_demo.c \
   -llog
 
 printf "编译 APK demo Java\n"
-javac -source 1.7 -target 1.7 -bootclasspath "$android_jar" \
+run_host_tool "$javac_tool" -encoding UTF-8 -source 1.7 -target 1.7 -bootclasspath "$android_jar" \
   -d "$build_dir/classes" \
   heapprofd_malloc_apk_demo/src/com/example/heapprofddemo/MainActivity.java
-"$build_tools/dx" --dex --output="$build_dir/apk/classes.dex" "$build_dir/classes"
+run_host_tool "$java_tool" -cp "$dx_jar" com.android.dx.command.Main \
+  --dex --output="$build_dir/apk/classes.dex" "$build_dir/classes"
 
 printf "打包 APK\n"
-"$build_tools/aapt" package -f \
+run_host_tool "$aapt" package -f \
   -M heapprofd_malloc_apk_demo/AndroidManifest.xml \
   -I "$android_jar" \
   -F "$build_dir/base.apk"
 cp "$build_dir/base.apk" "$build_dir/apk/unsigned.apk"
-(cd "$build_dir/apk" && zip -q -u unsigned.apk classes.dex lib/arm64-v8a/libheapprofddemo.so)
+(cd "$build_dir/apk" && run_host_tool "$jar_tool" uf unsigned.apk classes.dex lib/arm64-v8a/libheapprofddemo.so)
 
-keytool -genkeypair -keystore "$keystore" -storepass android -keypass android \
+run_host_tool "$keytool_tool" -genkeypair -keystore "$keystore" -storepass android -keypass android \
   -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
   -dname "CN=Android Debug,O=Android,C=US" >/dev/null
-"$build_tools/zipalign" -f 4 "$build_dir/apk/unsigned.apk" "$build_dir/aligned.apk"
+run_host_tool "$zipalign" -f 4 "$build_dir/apk/unsigned.apk" "$build_dir/aligned.apk"
 JAVA_TOOL_OPTIONS="--add-opens=java.base/java.io=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED --add-exports=java.base/sun.security.pkcs=ALL-UNNAMED" \
-  "$build_tools/apksigner" sign --ks "$keystore" --ks-pass pass:android \
+  run_host_tool "$java_tool" -jar "$apksigner_jar" sign --ks "$keystore" --ks-pass pass:android \
   --key-pass pass:android --out "$out_dir/heapprofd_malloc_apk_demo.apk" \
   "$build_dir/aligned.apk"
 
 printf "安装 APK: %s\n" "$package_name"
 adb uninstall "$package_name" >/dev/null 2>&1 || true
 adb install -r "$out_dir/heapprofd_malloc_apk_demo.apk" >/dev/null
+export MSYS_NO_PATHCONV=1
 adb shell am force-stop "$package_name" >/dev/null
 adb shell run-as "$package_name" rm -f files/malloc_demo_result.txt >/dev/null
 
@@ -223,7 +243,7 @@ EOF
 query_csv="$out_dir/trace_processor.csv"
 "$trace_processor" query "$out_dir/malloc_demo.perfetto-trace" "$(cat "$sql_path")" >"$query_csv"
 
-python3 - "$out_dir" "$expected_live" "$mallinfo_uordblks" "$allocation_count" "$total_bytes" "$meminfo_path" "$query_csv" <<'PY'
+"$python_bin" - "$out_dir" "$expected_live" "$mallinfo_uordblks" "$allocation_count" "$total_bytes" "$meminfo_path" "$query_csv" <<'PY'
 import csv
 import json
 import re

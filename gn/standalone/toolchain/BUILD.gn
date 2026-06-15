@@ -53,6 +53,7 @@ declare_args() {
 #    This is used by OSSFuzz and CrOS ebuilds.
 
 _llvm_strip_wrapper = rebase_path("llvm-strip.py", root_build_dir)
+_ar_wrapper = rebase_path("//gn/standalone/ar.py", root_build_dir)
 
 declare_args() {
   sysroot = ""
@@ -192,11 +193,19 @@ declare_args() {
   } else {
     target_ar = "ar"
     if (is_android) {
-      target_ar = "$android_llvm_dir/bin/llvm-ar"
+      if (is_win_host) {
+        target_ar = "python $_ar_wrapper"
+      } else {
+        target_ar = "$android_llvm_dir/bin/llvm-ar"
+      }
       target_cc = "$android_llvm_dir/bin/clang"
       target_cxx = "$android_llvm_dir/bin/clang++"
       target_linker = "$android_llvm_dir/bin/ld.lld"
-      target_strip = "$android_llvm_dir/bin/llvm-strip"
+      if (is_win_host) {
+        target_strip = ""
+      } else {
+        target_strip = "$android_llvm_dir/bin/llvm-strip"
+      }
     } else if (is_qnx) {
       target_ar = "${_target_triplet}-ar"
       target_linker = "${_target_triplet}-ld"
@@ -323,7 +332,11 @@ template("gcc_like_toolchain") {
         command = "rm -f {{output}} && libtool -static {{arflags}} -o {{output}} -filelist $rspfile"
       } else {
         rspfile_content = "{{inputs}}"
-        command = "rm -f {{output}} && $ar rcsD {{output}} @$rspfile"
+        if (is_win_host) {
+          command = "$ar rcsD {{output}} @$rspfile"
+        } else {
+          command = "rm -f {{output}} && $ar rcsD {{output}} @$rspfile"
+        }
       }
       outputs =
           [ "{{root_out_dir}}/{{target_output_name}}{{output_extension}}" ]
@@ -341,7 +354,8 @@ template("gcc_like_toolchain") {
       if (is_mac) {
         rpath = "-Wl,-install_name,@rpath/$soname"
       }
-      command = "$cc_wrapper $cxx $ld_arg -shared {{ldflags}} ${external_ldflags} @$rspfile {{solibs}} {{libs}} $rpath -o $unstripped_so"
+      _command = "$cc_wrapper $cxx $ld_arg -shared {{ldflags}} ${external_ldflags} @$rspfile {{solibs}} {{libs}} $rpath -o $unstripped_so"
+      command = _command
       outputs = [ unstripped_so ]
       output_prefix = "lib"
       default_output_extension = ".so"
@@ -349,7 +363,11 @@ template("gcc_like_toolchain") {
       if (strip != "") {
         stripped_so = "{{root_out_dir}}/stripped/$soname"
         outputs += [ stripped_so ]
-        command += " && $strip -o $stripped_so $unstripped_so"
+        if (is_win_host) {
+          command = "cmd.exe /c \"$_command && $strip -o $stripped_so $unstripped_so\""
+        } else {
+          command += " && $strip -o $stripped_so $unstripped_so"
+        }
       }
     }
 
@@ -358,13 +376,18 @@ template("gcc_like_toolchain") {
           "{{root_out_dir}}/{{target_output_name}}{{output_extension}}"
       rspfile = "$unstripped_exe.rsp"
       rspfile_content = "{{inputs}}"
-      command = "$cc_wrapper $cxx $ld_arg {{ldflags}} ${external_ldflags} @$rspfile {{solibs}} {{libs}} -o $unstripped_exe"
+      _command = "$cc_wrapper $cxx $ld_arg {{ldflags}} ${external_ldflags} @$rspfile {{solibs}} {{libs}} -o $unstripped_exe"
+      command = _command
       outputs = [ unstripped_exe ]
       description = "link $unstripped_exe"
       if (strip != "") {
         stripped_exe = "{{root_out_dir}}/stripped/{{target_output_name}}{{output_extension}}"
         outputs += [ stripped_exe ]
-        command += " && $strip -o $stripped_exe $unstripped_exe"
+        if (is_win_host) {
+          command = "cmd.exe /c \"$_command && $strip -o $stripped_exe $unstripped_exe\""
+        } else {
+          command += " && $strip -o $stripped_exe $unstripped_exe"
+        }
       }
     }
 
@@ -477,6 +500,10 @@ wasm_toolchain("wasm_memory64") {
 # This is used both for MSVC anc clang-cl. clang-cl cmdline interface pretends
 # to be MSVC's cl.exe.
 toolchain("msvc") {
+  toolchain_args = {
+    current_os = host_os
+    current_cpu = host_cpu
+  }
   lib_switch = ""
   lib_dir_switch = "/LIBPATH:"
   sys_lib_flags = string_join(" ", win_msvc_sys_lib_flags)

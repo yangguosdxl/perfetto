@@ -79,6 +79,11 @@ def format_smaps_progress_line(path: str, size_bytes: int,
 
 def launch_app(name: str):
   """目标进程未运行时，通过 monkey 发送一次启动 Intent。"""
+  activity = os.environ.get("MMAP_PHYS_ACTIVITY", "").strip()
+  if activity:
+    print(f"目标进程未启动，使用 am start 启动 Activity: {activity}")
+    adb_shell(f"am start -n {shell_quote(activity)}")
+    return
   print(f"目标进程未启动，尝试启动应用: {name}")
   adb_shell(f"monkey -p {shell_quote(name)} 1")
 

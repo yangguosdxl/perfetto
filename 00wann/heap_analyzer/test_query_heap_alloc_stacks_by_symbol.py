@@ -19,10 +19,14 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
       with open(os.path.join(tmpdir, "config.sh"), "w", encoding="utf-8") as f:
         f.write("export PerfettoRoot='perfetto-root'\n")
 
-      expected = os.path.abspath(
-          os.path.join(
-              tmpdir,
-              "perfetto-root/out/linux_clang_release/trace_processor_shell"))
+      if os.name == "nt":
+        expected = os.path.abspath(
+            os.path.join(tmpdir, "perfetto-root", "out", "win_clang",
+                         "trace_processor_shell.exe"))
+      else:
+        expected = os.path.abspath(
+            os.path.join(tmpdir, "perfetto-root", "out",
+                         "linux_clang_release", "trace_processor_shell"))
 
       self.assertEqual(analyzer.default_trace_processor(script_dir), expected)
 
@@ -32,7 +36,8 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
 
     output_dir = analyzer.default_output_dir(trace)
 
-    self.assertEqual(output_dir, "/tmp/perfetto-case/heap_analyze")
+    self.assertEqual(output_dir,
+                     os.path.abspath("/tmp/perfetto-case/heap_analyze"))
 
   def test_classify_config_defaults_to_all_allocations_without_explicit_symbol(
       self):
@@ -63,7 +68,8 @@ class HeapAllocStacksBySymbolTest(unittest.TestCase):
     analyzer.normalize_output_paths(args)
 
     self.assertEqual(args.pprof_out,
-                     "/tmp/perfetto-case/heap_analyze/native_heap.pprof.pb.gz")
+                     os.path.abspath(
+                         "/tmp/perfetto-case/heap_analyze/native_heap.pprof.pb.gz"))
 
   def test_write_pprof_keeps_classification_category_labels(self):
     """总 pprof 在分类模式下应保留 category 标签。"""

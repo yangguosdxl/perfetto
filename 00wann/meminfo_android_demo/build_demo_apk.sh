@@ -2,10 +2,28 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
-sdk_root=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/home/dianhun/disk2/Android/tools}}
-ndk_root=${ANDROID_NDK_ROOT:-/home/dianhun/disk2/Android/android-ndk-r27d}
-build_tools=${ANDROID_BUILD_TOOLS:-$sdk_root/build-tools/26.0.1}
-android_jar=${ANDROID_JAR:-$sdk_root/platforms/android-23/android.jar}
+source "$script_dir/../common_tools.sh"
+unset MSYS_NO_PATHCONV
+sdk_root=$(select_android_sdk_root)
+ndk_root=$(select_android_ndk_root)
+build_tools=$(select_build_tools_dir "$sdk_root")
+android_jar=$(select_android_jar "$sdk_root")
+ndk_prebuilt=$(select_ndk_prebuilt_tag "$ndk_root")
+clangxx="$ndk_root/toolchains/llvm/prebuilt/$ndk_prebuilt/bin/clang++"
+if [[ -e "${clangxx}.exe" ]]; then
+  clangxx="${clangxx}.exe"
+fi
+jdk_bin=$(select_unity_jdk_bin || true)
+if [[ -n "$jdk_bin" ]]; then
+  export PATH="$jdk_bin:$PATH"
+fi
+aapt2=$(find_build_tool "$build_tools" aapt2)
+zipalign=$(find_build_tool "$build_tools" zipalign)
+dx_jar="$build_tools/lib/dx.jar"
+apksigner_jar="$build_tools/lib/apksigner.jar"
+java_tool=$(command -v java)
+keytool_tool=$(command -v keytool)
+jar_tool=$(command -v jar)
 
 app_name=meminfo-demo
 package_name=com.example.meminfodemo
@@ -28,11 +46,11 @@ run() {
   printf '+'
   printf ' %q' "$@"
   printf '\n'
-  "$@"
+  run_host_tool "$@"
 }
 
-for path in "$build_tools/aapt2" "$build_tools/dx" "$build_tools/zipalign" \
-    "$build_tools/apksigner" "$android_jar" "$ndk_root/ndk-build"; do
+for path in "$aapt2" "$zipalign" "$android_jar" "$clangxx" "$dx_jar" \
+    "$apksigner_jar" "$java_tool" "$keytool_tool" "$jar_tool"; do
   if [[ ! -e "$path" ]]; then
     echo "缺少构建工具: $path" >&2
     exit 1
@@ -43,15 +61,16 @@ rm -rf "$build_dir" "$script_dir/libs" "$script_dir/obj"
 mkdir -p "$gen_dir" "$classes_dir" "$dex_dir" "$apkroot_dir/lib/arm64-v8a"
 
 log "编译 native JNI"
-run "$ndk_root/ndk-build" \
-  "NDK_PROJECT_PATH=$script_dir" \
-  "APP_BUILD_SCRIPT=$script_dir/jni/Android.mk" \
-  "NDK_APPLICATION_MK=$script_dir/jni/Application.mk" \
-  -j"$(nproc)"
+mkdir -p "$script_dir/libs/arm64-v8a"
+run "$clangxx" --target=aarch64-linux-android23 -O2 -Wall -Wextra -shared -fPIC \
+  -o "$script_dir/libs/arm64-v8a/libmeminfodemo.so" \
+  "$script_dir/jni/meminfo_demo_jni.cpp" \
+  -static-libstdc++ \
+  -llog
 
 log "编译 Android resources"
-run "$build_tools/aapt2" compile --dir "$script_dir/res" -o "$build_dir/res.zip"
-run "$build_tools/aapt2" link \
+run "$aapt2" compile --dir "$script_dir/res" -o "$build_dir/res.zip"
+run "$aapt2" link \
   -I "$android_jar" \
   --manifest "$script_dir/AndroidManifest.xml" \
   --java "$gen_dir" \
@@ -61,13 +80,14 @@ run "$build_tools/aapt2" link \
 
 log "编译 Java"
 mapfile -t java_sources < <(find "$script_dir/src" "$gen_dir" -name '*.java' | sort)
-run javac -source 1.7 -target 1.7 \
+run javac -encoding UTF-8 -source 1.7 -target 1.7 \
   -bootclasspath "$android_jar" \
   -d "$classes_dir" \
   "${java_sources[@]}"
 
 log "生成 classes.dex"
-run "$build_tools/dx" --dex --output="$dex_dir/classes.dex" "$classes_dir"
+run "$java_tool" -cp "$dx_jar" com.android.dx.command.Main \
+  --dex --output="$dex_dir/classes.dex" "$classes_dir"
 
 log "组装 APK"
 cp "$linked_apk" "$unsigned_apk"
@@ -75,18 +95,18 @@ cp "$dex_dir/classes.dex" "$apkroot_dir/classes.dex"
 cp "$script_dir/libs/arm64-v8a/libmeminfodemo.so" "$apkroot_dir/lib/arm64-v8a/"
 (
   cd "$apkroot_dir"
-  run zip -qr "$unsigned_apk" classes.dex lib
+  run "$jar_tool" uf "$unsigned_apk" classes.dex lib
 )
 
 log "zipalign 和签名"
-run "$build_tools/zipalign" -f 4 "$unsigned_apk" "$aligned_apk"
+run "$zipalign" -f 4 "$unsigned_apk" "$aligned_apk"
 if [[ ! -f "$keystore" ]]; then
-  run keytool -genkeypair -keystore "$keystore" -storepass android -keypass android \
+  run "$keytool_tool" -genkeypair -keystore "$keystore" -storepass android -keypass android \
     -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=Android Debug,O=Perfetto Meminfo Demo,C=CN"
 fi
 run env "JAVA_TOOL_OPTIONS=--add-opens=java.base/java.io=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED --add-exports=java.base/sun.security.pkcs=ALL-UNNAMED" \
-  "$build_tools/apksigner" sign \
+  "$java_tool" -jar "$apksigner_jar" sign \
   --ks "$keystore" \
   --ks-pass pass:android \
   --key-pass pass:android \

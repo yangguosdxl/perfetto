@@ -6,6 +6,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 cp "$script_dir/run_mmap_phys_profile.sh" "$tmpdir/run_mmap_phys_profile.sh"
+cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 cp "$script_dir/FSBootCmdLine.cfg" "$tmpdir/FSBootCmdLine.cfg"
 mkdir -p "$tmpdir/heap_analyzer"

@@ -32,6 +32,7 @@ if [[ -f config.sh ]]; then
   # shellcheck disable=SC1091
   source config.sh
 fi
+source common_tools.sh
 
 get_arg_value() {
   local name=$1
@@ -156,7 +157,7 @@ latest_speedscope_output="$latest_dir/mmap_phys_attribution.speedscope.json"
 
 trace_processor=${TRACE_PROCESSOR:-}
 if [[ -z "$trace_processor" && -n "${PerfettoRoot:-}" ]]; then
-  trace_processor="$PerfettoRoot/out/linux_clang_release/trace_processor_shell"
+  trace_processor=$(select_perfetto_tool trace_processor_shell "$PerfettoRoot" "" || true)
 fi
 user_trace_processor=$(get_arg_value "--trace-processor" "$@" || true)
 if [[ -n "$user_trace_processor" ]]; then
@@ -186,7 +187,7 @@ if ! has_arg "--pid" "$@"; then
 fi
 
 cmd=(
-  python3 -u -B "$script_dir/mmap_phys_analyzer.py"
+  "$(select_python)" -u -B "$script_dir/mmap_phys_analyzer.py"
   --trace "$latest_trace"
   --smaps-dir "$latest_smaps_dir"
 )

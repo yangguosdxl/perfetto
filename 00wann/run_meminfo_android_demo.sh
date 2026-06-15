@@ -2,6 +2,8 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
+source "$script_dir/common_tools.sh"
+unset MSYS_NO_PATHCONV
 demo_dir="$script_dir/meminfo_android_demo"
 package_name=com.example.meminfodemo
 activity="$package_name/.MainActivity"
@@ -20,7 +22,7 @@ run() {
 }
 
 adb_shell() {
-  run adb shell "$@"
+  (export MSYS_NO_PATHCONV=1; run adb shell "$@")
 }
 
 wait_for_pid() {
@@ -84,7 +86,7 @@ run adb shell dumpsys meminfo "$package_name" >"$out_dir/after_meminfo.txt"
 log "after pid=$after_pid 输出: $out_dir/after_meminfo.txt"
 
 log "校验指标增长"
-python3 "$demo_dir/verify_meminfo_demo.py" \
+"$(select_python)" "$demo_dir/verify_meminfo_demo.py" \
   --baseline "$out_dir/baseline_meminfo.txt" \
   --after "$out_dir/after_meminfo.txt" | tee "$out_dir/verify.txt"
 
