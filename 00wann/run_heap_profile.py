@@ -25,6 +25,8 @@ LAUNCH_ACTIVITY = "com.fs.t.prf/com.dhplugin.unity.MainActivity"
 LOGIN_DONE_PATTERN = "登录场景完成"
 LOGIN_STABLE_SECONDS = 5
 LOGIN_TIMEOUT_SECONDS = 180
+APP_START_TIMEOUT_SECONDS = int(
+    os.environ.get("HEAP_PROFILE_APP_START_TIMEOUT_S", "60"))
 MALLOC_LIVE_SQL = ("select coalesce(sum(size), 0) as malloc_live_bytes "
                    "from heap_profile_allocation;")
 HEALTH_SQL = (
@@ -121,6 +123,45 @@ def request_profiler_shutdown(profiler_proc: subprocess.Popen[str]) -> None:
         f"pid={profiler_proc.pid}|error={exc}"
     )
     profiler_proc.terminate()
+
+
+def wait_for_profiler_exit(
+    profiler_proc: subprocess.Popen[str],
+    timeout_s: int,
+    shutdown_marker_seen: bool,
+) -> tuple[int, bool]:
+  """等待 heap_profile.py 退出；超时后强制终止，避免主脚本无限等待。"""
+  if profiler_proc.poll() is not None:
+    return profiler_proc.returncode or 0, False
+
+  if not shutdown_marker_seen:
+    print(
+        "HEAP_PROFILE_FAILED|reason=profiler_shutdown_timeout|"
+        f"timeout_s={timeout_s}|pid={profiler_proc.pid}"
+    )
+    request_profiler_shutdown(profiler_proc)
+    return force_stop_profiler(profiler_proc), True
+
+  try:
+    return profiler_proc.wait(timeout=timeout_s), False
+  except subprocess.TimeoutExpired:
+    print(
+        "HEAP_PROFILE_FAILED|reason=profiler_shutdown_timeout|"
+        f"timeout_s={timeout_s}|pid={profiler_proc.pid}"
+    )
+    request_profiler_shutdown(profiler_proc)
+    return force_stop_profiler(profiler_proc), True
+
+
+def force_stop_profiler(profiler_proc: subprocess.Popen[str]) -> int:
+  if profiler_proc.poll() is None:
+    profiler_proc.terminate()
+    try:
+      return profiler_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      profiler_proc.kill()
+      return profiler_proc.wait(timeout=5)
+  return profiler_proc.returncode or 0
 
 
 def adb_binary() -> str:
@@ -527,9 +568,11 @@ def wait_for_login_done(out_dir: Path, shutdown_requested: callable) -> bool:
   return False
 
 
-def wait_for_pid(package_name: str, shutdown_requested: callable) -> str:
+def wait_for_pid(package_name: str, shutdown_requested: callable,
+                 timeout_s: int) -> str:
   pid = ""
-  while not pid and not shutdown_requested():
+  deadline = time.time() + timeout_s
+  while not pid and not shutdown_requested() and time.time() < deadline:
     proc = subprocess.run(
         [adb_binary(), "shell", "pidof", package_name],
         stdout=subprocess.PIPE,
@@ -542,6 +585,11 @@ def wait_for_pid(package_name: str, shutdown_requested: callable) -> str:
       break
     print(f"\r等待应用启动: {package_name} ...", end="", flush=True)
     time.sleep(0.2)
+  if not pid and not shutdown_requested():
+    print(
+        "\nHEAP_PROFILE_FAILED|reason=app_start_timeout|"
+        f"package={package_name}|timeout_s={timeout_s}"
+    )
   return pid
 
 
@@ -584,6 +632,9 @@ def main(argv: list[str]) -> int:
   logcat_stdout: BinaryIO | None = None
   logcat_stderr: BinaryIO | None = None
   login_timeout_failed = False
+  app_start_failed = False
+  app_start_timeout_failed = False
+  profiler_shutdown_timeout_failed = False
 
   def request_shutdown(signum, _frame) -> None:
     nonlocal shutdown_requested
@@ -650,7 +701,7 @@ def main(argv: list[str]) -> int:
     )
     if profiler_proc.poll() is None:
       request_profiler_shutdown(profiler_proc)
-      profiler_proc.wait()
+      force_stop_profiler(profiler_proc)
     pump_thread.join(timeout=5)
     return 1
 
@@ -659,29 +710,49 @@ def main(argv: list[str]) -> int:
       logcat_proc, logcat_stdout, logcat_stderr = start_logcat_capture(
           out_dir, env)
       print(f"\nheapprofd 已就绪，启动目标 Activity: {LAUNCH_ACTIVITY}")
-      launch_target_app(env)
-      pid = wait_for_pid(APP, lambda: shutdown_requested)
+      launch_proc = launch_target_app(env)
+      if launch_proc.returncode != 0:
+        app_start_failed = True
+        print(
+            "HEAP_PROFILE_FAILED|reason=app_start_failed|"
+            f"rc={launch_proc.returncode}|activity={LAUNCH_ACTIVITY}"
+        )
+        request_profiler_shutdown(profiler_proc)
+        pid = ""
+      else:
+        pid = wait_for_pid(APP, lambda: shutdown_requested,
+                           APP_START_TIMEOUT_SECONDS)
+        if not pid and not shutdown_requested:
+          app_start_timeout_failed = True
+          request_profiler_shutdown(profiler_proc)
       if pid:
         print(f"\r应用已启动 {APP} pid={pid}")
-      login_done = wait_for_login_done(out_dir, lambda: shutdown_requested)
-      if login_done:
-        request_profiler_shutdown(profiler_proc)
-      elif not shutdown_requested:
-        login_timeout_failed = True
-        request_profiler_shutdown(profiler_proc)
+        login_done = wait_for_login_done(out_dir, lambda: shutdown_requested)
+        if login_done:
+          request_profiler_shutdown(profiler_proc)
+        elif not shutdown_requested:
+          login_timeout_failed = True
+          request_profiler_shutdown(profiler_proc)
   finally:
     stop_logcat_capture(logcat_proc, logcat_stdout, logcat_stderr)
 
   meminfo_captured = False
   shutdown_timeout_s = int(
       os.environ.get("HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S", "600"))
-  if wait_for_log_pattern(logger, profiler_proc,
-                          "Waiting for profiler shutdown", shutdown_timeout_s):
+  shutdown_marker_seen = wait_for_log_pattern(
+      logger, profiler_proc, "Waiting for profiler shutdown", shutdown_timeout_s)
+  if shutdown_marker_seen:
     meminfo_captured = capture_meminfo_snapshot(out_dir, APP)
 
-  heap_profile_rc = profiler_proc.wait()
+  heap_profile_rc, profiler_shutdown_timeout_failed = wait_for_profiler_exit(
+      profiler_proc, shutdown_timeout_s, shutdown_marker_seen)
   pump_thread.join(timeout=5)
   run([cp_binary(), str(profile_log), str(profile_log_dest)], env=env)
+
+  if profiler_shutdown_timeout_failed:
+    return 1
+  if app_start_failed or app_start_timeout_failed:
+    return 1
 
   if not meminfo_captured and ((out_dir / "raw-trace").exists() or
                                (out_dir / "symbolized-trace").exists()):

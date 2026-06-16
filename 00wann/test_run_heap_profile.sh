@@ -50,14 +50,31 @@ if [[ "$1" == "shell" && "$2" == "pidof" ]]; then
   count=$(cat "$pidof_count_file")
   count=$((count + 1))
   printf '%s' "$count" >"$pidof_count_file"
-  if [[ "$count" -ge 2 ]]; then
+  if [[ "${FAKE_PIDOF_NEVER:-0}" != "1" && "$count" -ge 2 ]]; then
     printf '4321\n'
   fi
+elif [[ "$1" == "shell" && "$2" == "am" && "$3" == "start" ]]; then
+  exit "${FAKE_AM_START_RC:-0}"
 elif [[ "$1" == "logcat" && "$2" == "-c" ]]; then
   :
 elif [[ "$1" == "logcat" && "$2" == "-v" && "$3" == "time" ]]; then
+  printf 'FAKE_LOGCAT_STARTED\n' >>"$log_file"
+  trap 'printf "FAKE_LOGCAT_TERM\n" >>"$log_file"; exit 0' TERM INT
   printf '06-16 15:00:00.000 I/FS( 4321): 启动登录流程\n'
-  printf '06-16 15:00:01.000 I/FS( 4321): 登录场景完成\n'
+  if [[ "${FAKE_LOGCAT_NO_LOGIN:-0}" != "1" ]]; then
+    printf '06-16 15:00:01.000 I/FS( 4321): 登录场景完成\n'
+  fi
+  if [[ "${FAKE_LOGCAT_LONG_RUNNING:-0}" == "1" ]]; then
+    parent_pid=$PPID
+    while true; do
+      if ! kill -0 "$parent_pid" 2>/dev/null; then
+        printf 'FAKE_LOGCAT_PARENT_GONE\n' >>"$log_file"
+        exit 0
+      fi
+      sleep 0.1
+    done
+  fi
+  printf 'FAKE_LOGCAT_EXIT\n' >>"$log_file"
 elif [[ "$1" == "shell" && "$2" == "dumpsys" && "$3" == "meminfo" ]]; then
   native_heap_alloc_kb="${FAKE_NATIVE_HEAP_ALLOC_KB:-102400}"
   cat <<MEMINFO
@@ -121,6 +138,11 @@ def write_fake_profile_outputs():
 print("Profiling active. Press Ctrl+C to terminate.", flush=True)
 
 if os.environ.get("FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT") == "1":
+  if os.environ.get("FAKE_HEAP_PROFILE_IGNORE_SIGINT") == "1":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    while True:
+      time.sleep(0.2)
+
   def on_sigint(_signum, _frame):
     with open(log_path, "a", encoding="utf-8") as log:
       log.write("PYTHON_GOT_SIGINT\n")
@@ -186,12 +208,16 @@ fi
 real_python=$(command -v python3 || command -v python || command -v py)
 export RUN_HEAP_PROFILE_PYTHON="$real_python"
 export RUN_HEAP_PROFILE_INNER_PYTHON="$real_python"
+export RUN_HEAP_PROFILE_EXTRA_PATH="$tmpdir/bin"
+export ADB_BINARY="$tmpdir/bin/adb"
+export CP_BINARY="$tmpdir/bin/cp"
 if command -v cygpath >/dev/null 2>&1; then
   export RUN_HEAP_PROFILE_EXTRA_PATH="$(cygpath -w "$tmpdir/bin")"
   export ADB_BINARY="$(cygpath -w "$tmpdir/bin/adb.cmd")"
   export CP_BINARY="$(cygpath -w "$tmpdir/bin/cp.cmd")"
 fi
 export PATH="$tmpdir/bin:$PATH"
+export FAKE_LOGCAT_LONG_RUNNING=1
 export TEST_LOG="$tmpdir/commands.log"
 export PIDOF_COUNT_FILE="$tmpdir/pidof_count"
 python_run_heap_profile_path="$tmpdir/run_heap_profile.py"
@@ -207,6 +233,29 @@ run_script() {
   cd /
   FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT=1 \
     "$tmpdir/run_heap_profile.sh" "$@" >"$tmpdir/run_heap_profile_test.out"
+}
+
+run_script_with_timeout() {
+  local timeout_s=$1
+  local log_file=$2
+  shift 2
+  : >"$log_file"
+  printf '0' >"$PIDOF_COUNT_FILE"
+  cd /
+  FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT=1 \
+    timeout "$timeout_s" "$tmpdir/run_heap_profile.sh" "$@" >"$tmpdir/run_heap_profile_test.out"
+}
+
+wait_for_test_log_pattern() {
+  local pattern=$1
+  local attempt
+  for attempt in $(seq 1 50); do
+    if grep -Eq "$pattern" "$TEST_LOG"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 expected_app=$("$real_python" - "$python_run_heap_profile_path" <<'PY'
@@ -235,6 +284,11 @@ if ! grep -Fq "adb logcat -v time" "$TEST_LOG"; then
 fi
 if ! grep -Fq "PYTHON_GOT_SIGINT" "$TEST_LOG"; then
   echo "登录完成后未请求 heap_profile.py 收尾"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! wait_for_test_log_pattern 'FAKE_LOGCAT_(TERM|PARENT_GONE)'; then
+  echo "正常登录完成后未终止长驻 logcat"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -334,6 +388,90 @@ profile_log_line=$(grep -n "cp .*heap_profile.log" "$TEST_LOG" | head -1 | cut -
 if [[ "$meminfo_line" == "" || "$profile_log_line" == "" || "$meminfo_line" -ge "$profile_log_line" ]]; then
   echo "应在 profiler 进入 shutdown 后、host 后处理完成前抓取 meminfo"
   cat "$TEST_LOG"
+  exit 1
+fi
+
+export FAKE_PIDOF_NEVER=1
+export HEAP_PROFILE_APP_START_TIMEOUT_S=1
+export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
+set +e
+run_script_with_timeout 8 "$TEST_LOG" 45000
+app_start_timeout_rc=$?
+set -e
+unset FAKE_PIDOF_NEVER HEAP_PROFILE_APP_START_TIMEOUT_S HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
+if [[ "$app_start_timeout_rc" -eq 124 ]]; then
+  echo "pidof 永不返回 PID 时脚本不应无限等待"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if [[ "$app_start_timeout_rc" -eq 0 ]]; then
+  echo "pidof 永不返回 PID 时脚本不应成功"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "HEAP_PROFILE_FAILED|reason=app_start_timeout" "$tmpdir/run_heap_profile_test.out"; then
+  echo "pidof 永不返回 PID 时未输出 app_start_timeout"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! wait_for_test_log_pattern 'FAKE_LOGCAT_(TERM|PARENT_GONE)'; then
+  echo "pidof 超时退出时未终止 logcat"
+  cat "$TEST_LOG"
+  exit 1
+fi
+
+export FAKE_AM_START_RC=37
+export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
+set +e
+run_script_with_timeout 8 "$TEST_LOG" 45000
+app_start_failed_rc=$?
+set -e
+unset FAKE_AM_START_RC HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
+if [[ "$app_start_failed_rc" -eq 124 ]]; then
+  echo "am start 失败时脚本不应无限等待"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if [[ "$app_start_failed_rc" -eq 0 ]]; then
+  echo "am start 失败时脚本不应成功"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "HEAP_PROFILE_FAILED|reason=app_start_failed|rc=37" "$tmpdir/run_heap_profile_test.out"; then
+  echo "am start 失败时未输出 app_start_failed"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+
+export FAKE_HEAP_PROFILE_IGNORE_SIGINT=1
+export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=1
+set +e
+run_script_with_timeout 12 "$TEST_LOG" 45000
+profiler_shutdown_timeout_rc=$?
+set -e
+unset FAKE_HEAP_PROFILE_IGNORE_SIGINT HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
+if [[ "$profiler_shutdown_timeout_rc" -eq 124 ]]; then
+  echo "heap_profile.py 不响应 shutdown 时脚本不应无限等待"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if [[ "$profiler_shutdown_timeout_rc" -eq 0 ]]; then
+  echo "heap_profile.py 不响应 shutdown 时脚本不应成功"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "HEAP_PROFILE_FAILED|reason=profiler_shutdown_timeout" "$tmpdir/run_heap_profile_test.out"; then
+  echo "heap_profile.py 不响应 shutdown 时未输出 profiler_shutdown_timeout"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
 
