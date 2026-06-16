@@ -53,6 +53,11 @@ if [[ "$1" == "shell" && "$2" == "pidof" ]]; then
   if [[ "$count" -ge 2 ]]; then
     printf '4321\n'
   fi
+elif [[ "$1" == "logcat" && "$2" == "-c" ]]; then
+  :
+elif [[ "$1" == "logcat" && "$2" == "-v" && "$3" == "time" ]]; then
+  printf '06-16 15:00:00.000 I/FS( 4321): 启动登录流程\n'
+  printf '06-16 15:00:01.000 I/FS( 4321): 登录场景完成\n'
 elif [[ "$1" == "shell" && "$2" == "dumpsys" && "$3" == "meminfo" ]]; then
   native_heap_alloc_kb="${FAKE_NATIVE_HEAP_ALLOC_KB:-102400}"
   cat <<MEMINFO
@@ -124,7 +129,7 @@ if os.environ.get("FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT") == "1":
     time.sleep(0.5)
     with open(log_path, "a", encoding="utf-8") as log:
       log.write("PYTHON_SIGINT_DONE\n")
-    raise SystemExit(0)
+    raise SystemExit(int(os.environ.get("FAKE_HEAP_PROFILE_RC", "0")))
 
   signal.signal(signal.SIGINT, on_sigint)
   while True:
@@ -200,7 +205,8 @@ run_script() {
   : >"$log_file"
   printf '0' >"$PIDOF_COUNT_FILE"
   cd /
-  "$tmpdir/run_heap_profile.sh" "$@" >"$tmpdir/run_heap_profile_test.out"
+  FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT=1 \
+    "$tmpdir/run_heap_profile.sh" "$@" >"$tmpdir/run_heap_profile_test.out"
 }
 
 expected_app=$("$real_python" - "$python_run_heap_profile_path" <<'PY'
@@ -212,8 +218,23 @@ print(namespace["APP"])
 PY
 )
 run_script "$TEST_LOG"
-if ! grep -Fq "adb shell monkey -p $expected_app 1" "$TEST_LOG"; then
-  echo "未在目标进程缺失时启动应用"
+if grep -Fq "adb shell monkey -p $expected_app 1" "$TEST_LOG"; then
+  echo "FS 登录场景采集不能使用 monkey 启动"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "adb shell am start -n $expected_app/com.dhplugin.unity.MainActivity" "$TEST_LOG"; then
+  echo "未使用明确 Activity 启动 FS"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "adb logcat -v time" "$TEST_LOG"; then
+  echo "未保存登录场景 logcat"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "PYTHON_GOT_SIGINT" "$TEST_LOG"; then
+  echo "登录完成后未请求 heap_profile.py 收尾"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -372,7 +393,7 @@ with open(output_path, "w", encoding="utf-8") as output:
   while time.time() < deadline:
     try:
       with open(test_log, "r", encoding="utf-8") as log:
-        if f"adb shell monkey -p {expected_app} 1" in log.read():
+        if f"adb shell am start -n {expected_app}/com.dhplugin.unity.MainActivity" in log.read():
           break
     except FileNotFoundError:
       pass

@@ -18,8 +18,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 APP = "com.fs.t.prf"
+LAUNCH_ACTIVITY = "com.fs.t.prf/com.dhplugin.unity.MainActivity"
+LOGIN_DONE_PATTERN = "登录场景完成"
+LOGIN_STABLE_SECONDS = 5
+LOGIN_TIMEOUT_SECONDS = 180
 MALLOC_LIVE_SQL = ("select coalesce(sum(size), 0) as malloc_live_bytes "
                    "from heap_profile_allocation;")
 HEALTH_SQL = (
@@ -124,6 +129,45 @@ def adb_binary() -> str:
 
 def cp_binary() -> str:
   return os.environ.get("CP_BINARY", "cp")
+
+
+def start_logcat_capture(
+    out_dir: Path, env: dict[str, str]
+) -> tuple[subprocess.Popen[bytes], BinaryIO, BinaryIO]:
+  """清空旧 logcat，并把登录阶段日志保存到本次输出目录。"""
+  run([adb_binary(), "logcat", "-c"], env=env)
+  stdout_file = (out_dir / "logcat.txt").open("wb")
+  stderr_file = (out_dir / "logcat.err.txt").open("wb")
+  proc = subprocess.Popen(
+      [adb_binary(), "logcat", "-v", "time"],
+      stdout=stdout_file,
+      stderr=stderr_file,
+      env=env,
+  )
+  return proc, stdout_file, stderr_file
+
+
+def stop_logcat_capture(
+    proc: subprocess.Popen[bytes] | None,
+    stdout_file: BinaryIO | None,
+    stderr_file: BinaryIO | None,
+) -> None:
+  """结束 adb logcat，避免采集完成后留下后台进程和未刷新的文件句柄。"""
+  if proc and proc.poll() is None:
+    proc.terminate()
+    try:
+      proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      proc.kill()
+      proc.wait(timeout=5)
+  for file_obj in (stdout_file, stderr_file):
+    if file_obj:
+      file_obj.close()
+
+
+def launch_target_app(env: dict[str, str]) -> subprocess.CompletedProcess:
+  return run([adb_binary(), "shell", "am", "start", "-n", LAUNCH_ACTIVITY],
+             env=env)
 
 
 def resolve_shell_path(base_dir: Path, value: str) -> Path:
@@ -445,6 +489,44 @@ def wait_for_log_pattern(
   return False
 
 
+def wait_for_login_done(out_dir: Path, shutdown_requested: callable) -> bool:
+  logcat_path = out_dir / "logcat.txt"
+  deadline = time.time() + LOGIN_TIMEOUT_SECONDS
+  offset = 0
+  tail = ""
+
+  while time.time() < deadline:
+    if shutdown_requested():
+      return False
+    if logcat_path.exists():
+      with logcat_path.open(encoding="utf-8", errors="replace") as logcat:
+        logcat.seek(offset)
+        chunk = logcat.read()
+        offset = logcat.tell()
+      if chunk:
+        text = tail + chunk
+        if LOGIN_DONE_PATTERN in text:
+          print(
+              "LOGIN_SCENE_DONE|"
+              f"pattern={LOGIN_DONE_PATTERN}|"
+              f"stable_seconds={LOGIN_STABLE_SECONDS}"
+          )
+          stable_deadline = time.time() + LOGIN_STABLE_SECONDS
+          while time.time() < stable_deadline:
+            if shutdown_requested():
+              return False
+            time.sleep(min(0.2, max(0, stable_deadline - time.time())))
+          return True
+        tail = text[-len(LOGIN_DONE_PATTERN):]
+    time.sleep(0.2)
+
+  print(
+      "LOGIN_SCENE_TIMEOUT|"
+      f"pattern={LOGIN_DONE_PATTERN}|timeout_s={LOGIN_TIMEOUT_SECONDS}"
+  )
+  return False
+
+
 def wait_for_pid(package_name: str, shutdown_requested: callable) -> str:
   pid = ""
   while not pid and not shutdown_requested():
@@ -498,6 +580,10 @@ def main(argv: list[str]) -> int:
 
   shutdown_requested = False
   profiler_proc: subprocess.Popen[str] | None = None
+  logcat_proc: subprocess.Popen[bytes] | None = None
+  logcat_stdout: BinaryIO | None = None
+  logcat_stderr: BinaryIO | None = None
+  login_timeout_failed = False
 
   def request_shutdown(signum, _frame) -> None:
     nonlocal shutdown_requested
@@ -568,12 +654,23 @@ def main(argv: list[str]) -> int:
     pump_thread.join(timeout=5)
     return 1
 
-  if not shutdown_requested:
-    print(f"\nheapprofd 已就绪，启动目标应用: {APP}")
-    run([adb_binary(), "shell", "monkey", "-p", APP, "1"], env=env)
-    pid = wait_for_pid(APP, lambda: shutdown_requested)
-    if pid:
-      print(f"\r应用已启动: {APP} pid={pid}")
+  try:
+    if not shutdown_requested:
+      logcat_proc, logcat_stdout, logcat_stderr = start_logcat_capture(
+          out_dir, env)
+      print(f"\nheapprofd 已就绪，启动目标 Activity: {LAUNCH_ACTIVITY}")
+      launch_target_app(env)
+      pid = wait_for_pid(APP, lambda: shutdown_requested)
+      if pid:
+        print(f"\r应用已启动 {APP} pid={pid}")
+      login_done = wait_for_login_done(out_dir, lambda: shutdown_requested)
+      if login_done:
+        request_profiler_shutdown(profiler_proc)
+      elif not shutdown_requested:
+        login_timeout_failed = True
+        request_profiler_shutdown(profiler_proc)
+  finally:
+    stop_logcat_capture(logcat_proc, logcat_stdout, logcat_stderr)
 
   meminfo_captured = False
   shutdown_timeout_s = int(
@@ -595,6 +692,9 @@ def main(argv: list[str]) -> int:
   if heap_profile_rc != 0:
     print(f"HEAP_PROFILE_FAILED|rc={heap_profile_rc}|out_dir={out_dir}")
     return heap_profile_rc
+  if login_timeout_failed:
+    print(f"HEAP_PROFILE_FAILED|reason=login_scene_timeout|out_dir={out_dir}")
+    return 1
   return validation_rc
 
 
