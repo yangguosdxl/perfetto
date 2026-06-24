@@ -48,7 +48,7 @@ HybridCLR 原始字节证据：
   - `Hotfix/*.bytes` 合计约 `44.09 MiB`
   - `AOTAssemblies/*.bytes` 合计约 `13.09 MiB`
 
-注意：这份基线的 `heap_meminfo_validation.txt` 仍为 `FAIL`，原因是 heapprofd live bytes 与 `dumpsys meminfo` Native Heap Alloc 差异约 `139 MiB`。它可作为优化方向证据，不能直接作为最终验收基线。最终验收前需要让采集工具按“登录完成 + 稳定期 + 对账通过”生成基线和优化后数据。
+注意：这份基线的 `heap_meminfo_validation.txt` 仍为 `FAIL`，原因是 heapprofd live bytes 与 `dumpsys meminfo` Native Heap Alloc 差异约 `139 MiB`。它可作为优化方向证据，不能直接作为最终验收基线。最终验收前需要让采集工具按“等待登录完成日志 + 稳定采集 30 秒 + 对账通过”生成基线和优化后数据。
 
 ## 目标
 
@@ -234,7 +234,7 @@ RawImageBase::Load 解析 PE/metadata
   - Perfetto/heapprofd 先于 App 启动。
   - 重启目标 App。
   - 等待 `登录场景完成`。
-  - 登录完成后保留稳定期再结束。
+  - 登录完成日志出现后继续稳定采集 30 秒。
   - 保存 logcat。
   - `heap_meminfo_validation` 通过，或明确修正验证口径并在报告中说明。
 

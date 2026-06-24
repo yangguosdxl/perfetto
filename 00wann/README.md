@@ -6,9 +6,11 @@
 | --- | --- |
 | `mmap_phys_analyzer.md` | mmap 真实物理内存归因、无栈 mmap 验证、分类输出和已知边界。 |
 | `heap_profile.md` | Native heap profile 采集、meminfo 对比和启动耗时评估。 |
+| `hybridclr_mmap_malloc_symbol_report_2026-06-22.md` | HybridCLR mmap 优化的符号路径根因、重新符号化和 malloc 分类验证报告。 |
 | `heap_analyzer/README.md` | Native heap 调用栈查询、fs.ini 分类、pprof 和 speedscope 输出。 |
 | `meminfo_android_demo_validation.md` | `dumpsys meminfo` 真机 demo 的构建、指标和验证结论。 |
 | `dumpsys_meminfo_metrics.md` | Android `dumpsys meminfo` 各行各列口径说明。 |
+| `superpower_memory_perf_injection_slow_spec.md` | 验证内存性能模块注入后程序运行过慢问题的任务规格、采集数据和验收标准。 |
 
 ## 环境和运行入口
 
@@ -79,7 +81,7 @@ Native heap 调用栈分析
 | --- | --- |
 | mmap 采集、mmap 验证、host 兼容性改动 | 45 秒无栈 mmap 验证：`MMAP_PHYS_APP=com.example.meminfodemo MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000` |
 | mmap 调用栈归因改动 | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景 |
-| Native heap profile 改动 | AI 验证必须带时长：`./run_heap_profile.sh 45000` |
+| Native heap profile 改动 | AI 验证不传时长：`./run_heap_profile.sh`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号 |
 | heapprofd malloc 统计改动 | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh` |
 | meminfo demo 或解析改动 | 跑 `./run_meminfo_android_demo.sh` |
 
@@ -316,27 +318,26 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 1. 自动选择 Python。
 2. 调用 run_heap_profile.py。
 3. 目标包名固定为 com.fs.t.prf。
-4. 不传 duration 时持续采集，直到人工 Ctrl+C；Windows 下通过新进程组和 Ctrl-Break bridge 触发 Perfetto 的 SIGINT 收尾。
+4. 不传 duration；脚本等待 `登录场景完成` 日志出现后继续稳定采集 30 秒，再请求 Perfetto 收尾。人工 Ctrl+C 时，Windows 下通过新进程组和 Ctrl-Break bridge 触发 Perfetto 的 SIGINT 收尾。
 5. 不传 interval 时使用 1024 bytes。
 6. 不传 shmem-size 时使用 8388608 bytes。
+7. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
 ```
 
 命令：
 
 ```bash
 ./run_heap_profile.sh
-./run_heap_profile.sh 45000
-./run_heap_profile.sh 45000 1024
-./run_heap_profile.sh 45000 1024 67108864
+./run_heap_profile.sh 1024
+./run_heap_profile.sh 1024 67108864
 ```
 
 参数说明：
 
 | 位置参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `1: duration_ms` | 空 | 采集时长，单位 ms；空表示人工停止。AI 验证必须传 `45000`。 |
-| `2: interval_bytes` | `1024` | heapprofd 采样间隔，单位 bytes。 |
-| `3: shmem_size` | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。 |
+| `1: interval_bytes` | `1024` | heapprofd 采样间隔，单位 bytes。 |
+| `2: shmem_size` | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。 |
 
 环境变量：
 
@@ -349,7 +350,11 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 | `CP_BINARY` | `cp` | 复制命令。 |
 | `TRACE_PROCESSOR` | 自动探测 | trace processor。 |
 | `TRACECONV` | 自动探测 | traceconv。 |
+| `PERFETTO_BINARY_PATH` | 自动生成 | traceconv 符号搜索路径；显式设置时脚本原样保留。 |
+| `RUN_HEAP_PROFILE_SYMBOLS_DIR` | 当前 FS 打包产物符号目录 | 未设置 `PERFETTO_BINARY_PATH` 时，用于覆盖优先符号目录。 |
 | `HEAP_PROFILE_ACTIVE_TIMEOUT_S` | `60` | 等待 `Profiling active` 的超时。 |
+| `HEAP_PROFILE_LOGIN_TIMEOUT_S` | `0` | 等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。 |
+| `HEAP_PROFILE_LOGIN_STABLE_S` | `30` | 登录完成后的稳定采集秒数；真机验收保持默认 30。 |
 | `HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S` | `600` | 等待 profiler shutdown 的超时。 |
 | `HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES` | `67108864` | malloc live 和 meminfo Native Heap Alloc 允许差值。 |
 
@@ -382,8 +387,8 @@ PerfData/mem/<时间戳>/
 4. 推送 FSBootCmdLine.cfg 和 debugconfig.txt。
 5. force-stop 目标 App。
 6. 启动 Perfetto heap_profile.py，并等待 Profiling active。
-7. 使用 adb shell monkey -p <package> 1 只拉起目标 App。
-8. 等待 profiler shutdown 后保存 meminfo。
+7. 使用 `adb shell am start -n com.fs.t.prf/com.dhplugin.unity.MainActivity` 拉起固定 Activity。
+8. 等待 logcat 输出 `登录场景完成`，日志出现后稳定采集 30 秒，再请求 profiler shutdown 并保存 meminfo。
 9. 查询 heap_profile_allocation 累计 live bytes。
 10. 与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值验证。
 ```
@@ -392,13 +397,12 @@ PerfData/mem/<时间戳>/
 
 | 位置参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `1: duration_ms` | 空 | 传给 Perfetto `heap_profile.py -d`。 |
-| `2: interval_bytes` | `1024` | 传给 `heap_profile.py -i`。 |
-| `3: shmem_size` | `8388608` | 传给 `heap_profile.py --shmem-size`。 |
+| `1: interval_bytes` | `1024` | 传给 `heap_profile.py -i`。 |
+| `2: shmem_size` | `8388608` | 传给 `heap_profile.py --shmem-size`。 |
 
 环境变量同 `run_heap_profile.sh`。
 
-注意：这里的 `adb monkey -p <package> 1` 只用于发送启动 Intent，不用于随机触发测试场景。
+注意：Native heap 采集使用 `adb shell am start -n com.fs.t.prf/com.dhplugin.unity.MainActivity` 拉起固定 Activity，不使用 `adb monkey` 随机触发测试场景。
 
 ## `run_heap_startup_eval.sh`
 
@@ -945,7 +949,7 @@ python -m py_compile run_heap_profile.py
 
 用途：测试启动耗时评估脚本的 dry-run 和配置输出。
 
-默认行为：验证默认 duration、shmem、intervals、目标 App 和日志 pattern。
+默认行为：验证无 duration、登录日志触发收尾、shmem、intervals、目标 App 和日志 pattern。
 
 参数说明：无位置参数；脚本内部会设置 dry-run 流程。
 
@@ -1029,5 +1033,5 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000
 
 # 5. Native heap profile AI 验证
-./run_heap_profile.sh 45000
+./run_heap_profile.sh
 ```

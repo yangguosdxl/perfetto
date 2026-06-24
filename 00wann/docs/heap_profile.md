@@ -2,30 +2,24 @@
 
 `run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，默认目标包名为 `com.fs.t.prf`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。`run_heap_profile.sh` 只是兼容入口，实际流程由 `run_heap_profile.py` 执行；入口会自动切换到自身所在目录，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
 
-默认执行时不限制采集时长，`heap_profile.py` 会持续采集直到人工中断：
+默认执行时不限制采集时长。脚本会在 heapprofd 就绪后启动 FS，并等待 logcat 出现 `登录场景完成`；该日志出现后继续稳定采集 30 秒，再请求 `heap_profile.py` 进入 `Waiting for profiler shutdown...` 收尾流程：
 
 ```bash
 00wann/run_heap_profile.sh
 ```
 
-人工按 Ctrl+C 时，Python 主脚本会请求 `heap_profile.py` 停止采集，让 Perfetto 进入 `Waiting for profiler shutdown...` 收尾流程。Linux 下直接转发 `SIGINT`；Windows 下 `subprocess` 不支持对子进程发送 `SIGINT`，脚本会用新进程组和 Ctrl-Break bridge 把控制台事件转换为 `heap_profile.py` 内部的 `SIGINT` 处理。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
+人工按 Ctrl+C 时，Python 主脚本也会请求 `heap_profile.py` 停止采集。Linux 下直接转发 `SIGINT`；Windows 下 `subprocess` 不支持对子进程发送 `SIGINT`，脚本会用新进程组和 Ctrl-Break bridge 把控制台事件转换为 `heap_profile.py` 内部的 `SIGINT` 处理。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
 
-如需自动退出，可把采集时长作为第一个参数传入，单位为毫秒：
+如需指定采样 interval，可把 interval 作为第一个参数传入，单位为 bytes。不传时脚本默认使用 1024。真机验证中 4096 曾出现 malloc live 与 `meminfo Native Heap Alloc` 相差百 MB 级的问题；1024 在当前设备上通过 64MiB 绝对阈值验证：
 
 ```bash
-00wann/run_heap_profile.sh 45000
+00wann/run_heap_profile.sh 1024
 ```
 
-如需指定采样 interval，可把 interval 作为第二个参数传入，单位为 bytes。不传时脚本默认使用 1024。真机验证中 4096 曾出现 malloc live 与 `meminfo Native Heap Alloc` 相差百 MB 级的问题；1024 在当前设备上通过 64MiB 绝对阈值验证：
+如需指定 heapprofd 共享缓冲区大小，可把 `shmem-size` 作为第二个参数传入，单位为 bytes。该值必须是 4096 的 2 的幂倍数且至少 8192：
 
 ```bash
-00wann/run_heap_profile.sh 45000 1024
-```
-
-如需指定 heapprofd 共享缓冲区大小，可把 `shmem-size` 作为第三个参数传入，单位为 bytes。该值必须是 4096 的 2 的幂倍数且至少 8192：
-
-```bash
-00wann/run_heap_profile.sh 45000 1024 67108864
+00wann/run_heap_profile.sh 1024 67108864
 ```
 
 ## 启动目标应用
@@ -39,10 +33,10 @@ adb shell am force-stop com.fs.t.prf
 随后脚本以 `--no-running` 启动 `heap_profile.py`，等待日志出现 `Profiling active`，再执行一次：
 
 ```bash
-adb shell monkey -p <package> 1
+adb shell am start -n com.fs.t.prf/com.dhplugin.unity.MainActivity
 ```
 
-该命令只用于发送启动 Intent 拉起目标应用，不用于随机触发测试场景。需要测试数据或目标场景交互时，仍应在手机上手动操作。
+该命令只用于拉起固定 Activity，不使用 `adb monkey` 随机触发事件。需要测试数据或目标场景交互时，仍应在手机上手动操作。
 
 这个顺序保证目标进程启动后的 native malloc/free 会被 heapprofd 观察到；如果附加到已经运行很久的进程，heapprofd 无法还原采集开始前已经发生的 native 分配，`malloc_live_bytes` 会明显低于 `meminfo Native Heap Alloc`。
 
@@ -74,11 +68,21 @@ Windows Git Bash 优先：
 Windows 下脚本还会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，
 确保 `traceconv.exe` 符号化时可以找到 `llvm-symbolizer.exe`。
 
+符号化路径由 `PERFETTO_BINARY_PATH` 控制。若外部已设置该变量，脚本会原样保留，便于临时指定一组完整符号目录。未设置时，脚本优先使用当前 FS 打包产物符号目录：
+
+```text
+D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj\BuildCache\Published\Android\DreamRivakes2.apk\unityLibrary\symbols\arm64-v8a
+```
+
+如果需要分析其它包或临时产物，可以设置 `RUN_HEAP_PROFILE_SYMBOLS_DIR=<符号目录>` 覆盖 FS 打包产物目录。`00wann/workspace/allsymbols/arm64-v8a` 仍会作为补充目录追加，用于解析该目录中独有的 `libBattleLogic.so`、`libprotobuf.so` 等符号。
+
 Windows Git Bash 中如果没有 `python3`，入口会回退到 `python` 或 `py`；
 测试和手工运行也可以用 `PYTHON=python` 或 `RUN_HEAP_PROFILE_PYTHON=python`
 显式指定解释器。
 
-AI 做真机验证时必须传入 `45000`，表示采集 45 秒后自动停止并拉取 `raw-trace`、生成 `symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz`。下探采样 interval 时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh 45000 <interval_bytes> <shmem_size>`。
+AI 做真机验证时不要传入 duration 参数。采集结束必须由 FS logcat 输出 `登录场景完成` 触发，日志出现后继续稳定采集 30 秒；下探采样 interval 时使用 `00wann/run_heap_profile.sh <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。历史命令中的 `45000` 只做兼容忽略，不再作为推荐用法。
+
+默认不限制等待登录场景的时间。只有显式设置 `HEAP_PROFILE_LOGIN_TIMEOUT_S=<秒>` 时，脚本才会在未等到 `登录场景完成` 时超时退出；真机验收不要设置这个变量。`HEAP_PROFILE_LOGIN_STABLE_S` 默认是 30，只用于测试或排障覆盖，真机验收保持默认值。
 
 ## 验证
 

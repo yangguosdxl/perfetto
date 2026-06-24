@@ -66,12 +66,19 @@ elif [[ "$1" == "logcat" && "$2" == "-v" && "$3" == "time" ]]; then
   fi
   if [[ "${FAKE_LOGCAT_LONG_RUNNING:-0}" == "1" ]]; then
     parent_pid=$PPID
+    after_login_poll_count=0
+    after_login_marker_written=0
     while true; do
       if ! kill -0 "$parent_pid" 2>/dev/null; then
         printf 'FAKE_LOGCAT_PARENT_GONE\n' >>"$log_file"
         exit 0
       fi
       sleep 0.1
+      after_login_poll_count=$((after_login_poll_count + 1))
+      if [[ "${FAKE_LOGCAT_MARK_AFTER_LOGIN:-0}" == "1" && "$after_login_poll_count" -ge 10 && "$after_login_marker_written" == "0" ]]; then
+        printf 'FAKE_LOGCAT_AFTER_LOGIN_DELAY\n' >>"$log_file"
+        after_login_marker_written=1
+      fi
     done
   fi
   printf 'FAKE_LOGCAT_EXIT\n' >>"$log_file"
@@ -218,12 +225,68 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 export PATH="$tmpdir/bin:$PATH"
 export FAKE_LOGCAT_LONG_RUNNING=1
+export FAKE_LOGCAT_MARK_AFTER_LOGIN=1
+export HEAP_PROFILE_LOGIN_STABLE_S=1
 export TEST_LOG="$tmpdir/commands.log"
 export PIDOF_COUNT_FILE="$tmpdir/pidof_count"
 python_run_heap_profile_path="$tmpdir/run_heap_profile.py"
+python_tmpdir_path="$tmpdir"
+python_perfetto_path="$tmpdir/perfetto"
 if command -v cygpath >/dev/null 2>&1; then
   python_run_heap_profile_path=$(cygpath -w "$python_run_heap_profile_path")
+  python_tmpdir_path=$(cygpath -w "$python_tmpdir_path")
+  python_perfetto_path=$(cygpath -w "$python_perfetto_path")
 fi
+
+mkdir -p "$tmpdir/fs_symbols/arm64-v8a" "$tmpdir/workspace/allsymbols/arm64-v8a"
+env -u PERFETTO_BINARY_PATH \
+  RUN_HEAP_PROFILE_SYMBOLS_DIR="$tmpdir/fs_symbols/arm64-v8a" \
+  "$real_python" - "$python_run_heap_profile_path" "$python_perfetto_path" "$python_tmpdir_path" <<'PY'
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+module_path = Path(sys.argv[1])
+perfetto_root = Path(sys.argv[2])
+script_dir = Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location("run_heap_profile", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+env = module.build_env(perfetto_root, script_dir=script_dir)
+paths = env["PERFETTO_BINARY_PATH"].split(os.pathsep)
+expected = [
+    str((script_dir / "fs_symbols/arm64-v8a").resolve()),
+    str((script_dir / "workspace/allsymbols/arm64-v8a").resolve()),
+]
+if paths[:2] != expected:
+  raise SystemExit(
+      "PERFETTO_BINARY_PATH 未按 FS 符号目录优先、旧 allsymbols 补充的顺序生成: "
+      + repr(paths))
+PY
+
+PERFETTO_BINARY_PATH="$tmpdir/custom_symbols" \
+  RUN_HEAP_PROFILE_SYMBOLS_DIR="$tmpdir/fs_symbols/arm64-v8a" \
+  "$real_python" - "$python_run_heap_profile_path" "$python_perfetto_path" "$python_tmpdir_path" <<'PY'
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+module_path = Path(sys.argv[1])
+perfetto_root = Path(sys.argv[2])
+script_dir = Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location("run_heap_profile", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+env = module.build_env(perfetto_root, script_dir=script_dir)
+if env["PERFETTO_BINARY_PATH"] != os.environ["PERFETTO_BINARY_PATH"]:
+  raise SystemExit("外部 PERFETTO_BINARY_PATH 应优先于脚本默认符号目录")
+PY
 
 run_script() {
   local log_file=$1
@@ -266,6 +329,51 @@ namespace = runpy.run_path(sys.argv[1])
 print(namespace["APP"])
 PY
 )
+default_login_stable_seconds=$(env -u HEAP_PROFILE_LOGIN_STABLE_S "$real_python" - "$python_run_heap_profile_path" <<'PY'
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+print(namespace["LOGIN_STABLE_SECONDS"])
+PY
+)
+if [[ "$default_login_stable_seconds" != "30" ]]; then
+  echo "默认登录稳定期必须是 30 秒"
+  exit 1
+fi
+"$real_python" - "$python_run_heap_profile_path" "$tmpdir" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+namespace = runpy.run_path(sys.argv[1])
+out_dir = Path(sys.argv[2]) / "stable_unit"
+out_dir.mkdir(parents=True, exist_ok=True)
+(out_dir / "logcat.txt").write_text(
+    "06-16 15:00:01.000 I/FS( 4321): 登录场景完成\n",
+    encoding="utf-8")
+
+current_time = [1000.0]
+sleep_seconds = []
+
+def fake_time():
+  return current_time[0]
+
+def fake_sleep(seconds):
+  sleep_seconds.append(seconds)
+  current_time[0] += seconds
+
+namespace["time"].time = fake_time
+namespace["time"].sleep = fake_sleep
+namespace["wait_for_login_done"].__globals__["LOGIN_STABLE_SECONDS"] = 30
+namespace["wait_for_login_done"].__globals__["LOGIN_TIMEOUT_SECONDS"] = 0
+
+if not namespace["wait_for_login_done"](out_dir, lambda: False):
+  raise SystemExit("登录完成日志存在时应返回成功")
+
+if sum(sleep_seconds) + 0.001 < 30:
+  raise SystemExit(f"登录完成后的稳定期不足 30 秒: {sum(sleep_seconds)}")
+PY
 run_script "$TEST_LOG"
 if grep -Fq "adb shell monkey -p $expected_app 1" "$TEST_LOG"; then
   echo "FS 登录场景采集不能使用 monkey 启动"
@@ -285,6 +393,12 @@ fi
 if ! grep -Fq "PYTHON_GOT_SIGINT" "$TEST_LOG"; then
   echo "登录完成后未请求 heap_profile.py 收尾"
   cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "LOGIN_SCENE_DONE|pattern=" "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "stable_seconds=1" "$tmpdir/run_heap_profile_test.out"; then
+  echo "登录完成后必须进入稳定期，测试环境应输出 stable_seconds=1"
+  cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
 if ! wait_for_test_log_pattern 'FAKE_LOGCAT_(TERM|PARENT_GONE)'; then
@@ -395,7 +509,7 @@ export FAKE_PIDOF_NEVER=1
 export HEAP_PROFILE_APP_START_TIMEOUT_S=1
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
 set +e
-run_script_with_timeout 8 "$TEST_LOG" 45000
+run_script_with_timeout 8 "$TEST_LOG"
 app_start_timeout_rc=$?
 set -e
 unset FAKE_PIDOF_NEVER HEAP_PROFILE_APP_START_TIMEOUT_S HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -426,7 +540,7 @@ fi
 export FAKE_AM_START_RC=37
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
 set +e
-run_script_with_timeout 8 "$TEST_LOG" 45000
+run_script_with_timeout 8 "$TEST_LOG"
 app_start_failed_rc=$?
 set -e
 unset FAKE_AM_START_RC HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -452,7 +566,7 @@ fi
 export FAKE_HEAP_PROFILE_IGNORE_SIGINT=1
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=1
 set +e
-run_script_with_timeout 12 "$TEST_LOG" 45000
+run_script_with_timeout 12 "$TEST_LOG"
 profiler_shutdown_timeout_rc=$?
 set -e
 unset FAKE_HEAP_PROFILE_IGNORE_SIGINT HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -476,15 +590,15 @@ if ! grep -Fq "HEAP_PROFILE_FAILED|reason=profiler_shutdown_timeout" "$tmpdir/ru
 fi
 
 run_script "$TEST_LOG" 45000
-if ! grep -Fq -- "-d 45000" "$TEST_LOG"; then
-  echo "传入 45000 时未设置 45 秒自动退出采集时长"
+if grep -Fq -- "-d 45000" "$TEST_LOG"; then
+  echo "传入历史参数 45000 时不应设置 45 秒自动退出采集时长"
   cat "$TEST_LOG"
   exit 1
 fi
 
 run_script "$TEST_LOG" 45000 1024
-if ! grep -Fq -- "-d 45000" "$TEST_LOG"; then
-  echo "传入 45000 时未设置 45 秒自动退出采集时长"
+if grep -Fq -- "-d 45000" "$TEST_LOG"; then
+  echo "传入历史参数 45000 时不应设置 45 秒自动退出采集时长"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -497,6 +611,18 @@ fi
 run_script "$TEST_LOG" 45000 1024 67108864
 if ! grep -Fq -- "--shmem-size 67108864" "$TEST_LOG"; then
   echo "传入 67108864 时未设置 heapprofd 共享缓冲区大小"
+  cat "$TEST_LOG"
+  exit 1
+fi
+
+run_script "$TEST_LOG" 128 268435456
+if ! grep -Fq -- "-i 128" "$TEST_LOG"; then
+  echo "无 duration 模式下第一个参数应作为采样 interval"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq -- "--shmem-size 268435456" "$TEST_LOG"; then
+  echo "无 duration 模式下第二个参数应作为 heapprofd 共享缓冲区大小"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -682,9 +808,35 @@ PY
   fi
 fi
 
+export FAKE_LOGCAT_NO_LOGIN=1
+export HEAP_PROFILE_LOGIN_TIMEOUT_S=1
+set +e
+run_script_with_timeout 6 "$TEST_LOG"
+login_timeout_rc=$?
+set -e
+unset FAKE_LOGCAT_NO_LOGIN HEAP_PROFILE_LOGIN_TIMEOUT_S
+if [[ "$login_timeout_rc" -eq 124 ]]; then
+  echo "显式设置 HEAP_PROFILE_LOGIN_TIMEOUT_S 后，未进入登录场景时脚本应自行超时退出"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if [[ "$login_timeout_rc" -eq 0 ]]; then
+  echo "未进入登录场景时脚本不应验证成功"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "LOGIN_SCENE_TIMEOUT" "$tmpdir/run_heap_profile_test.out"; then
+  echo "显式登录超时时应输出 LOGIN_SCENE_TIMEOUT"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+
 export FAKE_HEAP_PROFILE_RC=1
 set +e
-run_script "$TEST_LOG" 45000
+run_script "$TEST_LOG"
 failed_rc=$?
 set -e
 unset FAKE_HEAP_PROFILE_RC
@@ -712,7 +864,7 @@ fi
 export FAKE_MALLOC_LIVE_BYTES=696873169
 export FAKE_NATIVE_HEAP_ALLOC_KB=913859
 set +e
-run_script "$TEST_LOG" 45000
+run_script "$TEST_LOG"
 large_diff_rc=$?
 set -e
 unset FAKE_MALLOC_LIVE_BYTES FAKE_NATIVE_HEAP_ALLOC_KB

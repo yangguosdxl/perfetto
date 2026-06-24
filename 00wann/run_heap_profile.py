@@ -23,8 +23,13 @@ from typing import BinaryIO
 APP = "com.fs.t.prf"
 LAUNCH_ACTIVITY = "com.fs.t.prf/com.dhplugin.unity.MainActivity"
 LOGIN_DONE_PATTERN = "登录场景完成"
-LOGIN_STABLE_SECONDS = 5
-LOGIN_TIMEOUT_SECONDS = 180
+DEFAULT_FS_SYMBOLS_DIR = Path(
+    r"D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj"
+    r"\BuildCache\Published\Android\DreamRivakes2.apk"
+    r"\unityLibrary\symbols\arm64-v8a")
+LEGACY_SYMBOLS_RELATIVE_DIR = Path("workspace/allsymbols/arm64-v8a")
+LOGIN_TIMEOUT_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_TIMEOUT_S", "0"))
+LOGIN_STABLE_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_STABLE_S", "30"))
 APP_START_TIMEOUT_SECONDS = int(
     os.environ.get("HEAP_PROFILE_APP_START_TIMEOUT_S", "60"))
 MALLOC_LIVE_SQL = ("select coalesce(sum(size), 0) as malloc_live_bytes "
@@ -326,11 +331,37 @@ def source_fsbootcmd(script_dir: Path, env: dict[str, str]) -> int:
   return proc.returncode
 
 
-def build_env(perfetto_root: Path) -> dict[str, str]:
+def append_symbol_path(paths: list[str], path: Path) -> None:
+  value = str(path)
+  if value not in paths:
+    paths.append(value)
+
+
+def default_symbol_paths(script_dir: Path) -> list[str]:
+  """返回 traceconv 默认符号目录，优先使用当前 FS 打包产物。"""
+  paths: list[str] = []
+  explicit_fs_symbols = os.environ.get("RUN_HEAP_PROFILE_SYMBOLS_DIR")
+  if explicit_fs_symbols:
+    append_symbol_path(paths, resolve_shell_path(script_dir, explicit_fs_symbols))
+  elif DEFAULT_FS_SYMBOLS_DIR.exists():
+    append_symbol_path(paths, DEFAULT_FS_SYMBOLS_DIR)
+
+  # 旧目录里仍可能有 libBattleLogic.so/libprotobuf.so 等补充符号。
+  legacy_symbols = script_dir / LEGACY_SYMBOLS_RELATIVE_DIR
+  if legacy_symbols.exists():
+    append_symbol_path(paths, legacy_symbols.resolve())
+  return paths
+
+
+def build_env(perfetto_root: Path, script_dir: Path | None = None) -> dict[str, str]:
   env = os.environ.copy()
   env["MSYS_NO_PATHCONV"] = "1"
   env["PERFETTO_SYMBOLIZER_MODE"] = "index"
-  env["PERFETTO_BINARY_PATH"] = "./workspace/allsymbols/arm64-v8a"
+  if "PERFETTO_BINARY_PATH" not in env:
+    symbol_script_dir = script_dir if script_dir is not None else Path.cwd()
+    symbol_paths = default_symbol_paths(symbol_script_dir)
+    if symbol_paths:
+      env["PERFETTO_BINARY_PATH"] = os.pathsep.join(symbol_paths)
   clang_bins = (
       [perfetto_root / "buildtools/win/clang/bin"]
       if os.name == "nt" else []) + [
@@ -532,11 +563,12 @@ def wait_for_log_pattern(
 
 def wait_for_login_done(out_dir: Path, shutdown_requested: callable) -> bool:
   logcat_path = out_dir / "logcat.txt"
-  deadline = time.time() + LOGIN_TIMEOUT_SECONDS
+  deadline = (
+      time.time() + LOGIN_TIMEOUT_SECONDS if LOGIN_TIMEOUT_SECONDS > 0 else None)
   offset = 0
   tail = ""
 
-  while time.time() < deadline:
+  while deadline is None or time.time() < deadline:
     if shutdown_requested():
       return False
     if logcat_path.exists():
@@ -594,11 +626,15 @@ def wait_for_pid(package_name: str, shutdown_requested: callable,
 
 
 def parse_args(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
-  duration_ms = argv[0] if len(argv) >= 1 else ""
-  interval_bytes = argv[1] if len(argv) >= 2 else "1024"
-  shmem_size = argv[2] if len(argv) >= 3 else "8388608"
+  args = list(argv)
+  if args and args[0] == "45000":
+    # 兼容历史 AI 验证入口。Native heap 采集不能再按固定时长收尾，
+    # 真实结束条件必须是 FS 输出“登录场景完成”。
+    args = args[1:]
+  interval_bytes = args[0] if len(args) >= 1 else "1024"
+  shmem_size = args[1] if len(args) >= 2 else "8388608"
 
-  duration_args = ["-d", duration_ms] if duration_ms else []
+  duration_args: list[str] = []
   interval_args = ["-i", interval_bytes] if interval_bytes else []
   shmem_args = ["--shmem-size", shmem_size] if shmem_size else []
   return duration_args, interval_args, shmem_args
@@ -608,7 +644,7 @@ def main(argv: list[str]) -> int:
   script_dir = Path(__file__).resolve().parent
   os.chdir(script_dir)
   perfetto_root = load_perfetto_root(script_dir)
-  env = build_env(perfetto_root)
+  env = build_env(perfetto_root, script_dir=script_dir)
   os.environ.update(env)
 
   traceconv = resolve_perfetto_tool(perfetto_root, "traceconv", "TRACECONV")

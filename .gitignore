@@ -54,3 +54,7 @@ TAGS
 .venv2/
 00wann/PerfData/
 00wann/workspace/
+00wann/.probe_official_tests/
+00wann/*logcat.txt
+00wann/fs_smoke_logcat_after_fix.txt
+00wann/logs/
