@@ -145,8 +145,8 @@ def build_perfetto_config(name: str,
                           buffer_kb: int,
                           include_ftrace: bool,
                           kernel_frames: bool,
-                          perf_ring_buffer_pages: int = 4096,
-                          perf_ring_buffer_read_period_ms: int = 100,
+                          perf_ring_buffer_pages: int = 32768,
+                          perf_ring_buffer_read_period_ms: int = 25,
                           include_mmap_callstacks: bool = True) -> str:
   kernel_frames_value = "true" if kernel_frames else "false"
   perf_ring_buffer_block = ""
@@ -1068,12 +1068,12 @@ def parse_args():
   parser.add_argument(
       "--perf-ring-buffer-pages",
       type=int,
-      default=8192,
+      default=32768,
       help="linux.perf 每 CPU ring buffer 页数；0 表示使用 Perfetto 默认值")
   parser.add_argument(
       "--perf-ring-buffer-read-period-ms",
       type=int,
-      default=100,
+      default=25,
       help="linux.perf ring buffer 读取周期；0 表示使用 Perfetto 默认值")
   parser.add_argument(
       "--mmap-callstacks",

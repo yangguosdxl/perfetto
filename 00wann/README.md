@@ -196,8 +196,8 @@ PerfData/mmap_phys/<时间戳>/
 | `-o, --output` | 自动生成 | 输出目录。 |
 | `--wait-timeout-s` | `120` | 等待目标进程启动超时，`0` 表示无限等待。 |
 | `--buffer-kb` | `262144` | Perfetto ring buffer 大小，单位 KiB。 |
-| `--perf-ring-buffer-pages` | `8192` | linux.perf 每 CPU ring buffer 页数，`0` 使用 Perfetto 默认。 |
-| `--perf-ring-buffer-read-period-ms` | `100` | linux.perf ring buffer 读取周期，`0` 使用 Perfetto 默认。 |
+| `--perf-ring-buffer-pages` | `32768` | linux.perf 每 CPU ring buffer 页数，`0` 使用 Perfetto 默认。 |
+| `--perf-ring-buffer-read-period-ms` | `25` | linux.perf ring buffer 读取周期，`0` 使用 Perfetto 默认。 |
 | `--mmap-callstacks` | 开启 | 采集 mmap 调用栈并分析。 |
 | `--no-mmap-callstacks` | 关闭项 | 只运行无栈 mmap 事件健康检查。 |
 | `--no-ftrace` | 关闭项 | 不启用 ftrace syscall 采集。 |
@@ -210,6 +210,34 @@ PerfData/mmap_phys/<时间戳>/
 | `--classify-config` | 空 | 传给 mmap 分析器的分类配置。 |
 | `--top-n` | 空 | 传给 mmap 分析器；`0` 表示全部。 |
 | `--analyzer` | `mmap_phys_analyzer.py` | 指定离线分析器路径。 |
+
+linux.perf 丢样调参：
+
+`memory_validation.json` 中 `trace_health.perf_data_loss` 对应 Perfetto
+`perf_cpu_lost_records`，含义是 linux.perf 每 CPU kernel ring buffer overrun。
+这类丢样不等同于 Perfetto 全局 trace buffer 不够；如果
+`perfetto_data_loss=0`、`ftrace_data_loss=0`，不要优先增大 `--buffer-kb`。
+
+主功能 mmap 调用栈采样使用 `raw_syscalls:sys_enter` + `period: 1`，降低采样频率会改变
+“每次 mmap enter 都尝试取栈”的语义，因此优先按下面顺序调大 linux.perf buffer：
+
+```bash
+# 旧默认值；如果出现 perf_data_loss，先不要作为最终结果使用
+--perf-ring-buffer-pages 8192 --perf-ring-buffer-read-period-ms 100
+
+# 第一档：启动期 mmap 峰值下常用，实测 perf_data_loss 957 -> 186
+--perf-ring-buffer-pages 16384 --perf-ring-buffer-read-period-ms 50
+
+# 第二档：仍有 perf_data_loss 时使用；Pixel 6 约 128 MiB/CPU，总量约 1 GiB
+--perf-ring-buffer-pages 32768 --perf-ring-buffer-read-period-ms 50
+
+# 当前默认值/无丢样档：32768/50ms 仍有丢样时使用；实测 perf_data_loss=0
+--perf-ring-buffer-pages 32768 --perf-ring-buffer-read-period-ms 25
+```
+
+`ring_buffer_pages` 是每 CPU 4 KiB 页数，Perfetto 要求该值必须是 2 的幂。
+当前 FS 启动 mmap 调用栈采样可用 `32768/25ms` 作为无丢样配置；如果该配置仍有丢样，
+再考虑加 `--no-kernel-frames` 降低每条样本负载；mmap 归因通常主要依赖用户态栈。
 
 额外环境变量：
 

@@ -275,10 +275,19 @@ data_sources {
         }
         kernel_frames: true
       }
+      ring_buffer_pages: 32768
+      ring_buffer_read_period_ms: 25
     }
   }
 }
 ```
+
+
+当前默认 `ring_buffer_pages: 32768`、`ring_buffer_read_period_ms: 25` 来自 FS
+启动 mmap 调用栈采样实测无 `perf_cpu_lost_records` 的配置。该 buffer 是每 CPU
+4 KiB 页数，主要用于吸收启动期 mmap tracepoint 的短时峰值；如果
+`memory_validation.json` 中 `trace_health.perf_data_loss` 非 0，先检查
+linux.perf ring buffer，不要优先增大 Perfetto 全局 `--buffer-kb`。
 
 ### `raw_syscalls` 与 `syscall_events` 的区别
 

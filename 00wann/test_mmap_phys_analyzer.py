@@ -222,6 +222,29 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn("ring_buffer_pages: 4096", config)
     self.assertIn("ring_buffer_read_period_ms: 100", config)
 
+
+  def test_perfetto_config_default_perf_ring_buffer_matches_fs_startup(self):
+    """默认 mmap 调用栈采样使用 FS 启动场景实测无丢样配置。"""
+    config = collector.build_perfetto_config(
+        name="com.example.app",
+        duration_ms=1000,
+        buffer_kb=1024,
+        include_ftrace=True,
+        kernel_frames=True,
+        include_mmap_callstacks=True)
+
+    self.assertIn("ring_buffer_pages: 32768", config)
+    self.assertIn("ring_buffer_read_period_ms: 25", config)
+
+  def test_collector_cli_default_perf_ring_buffer_matches_fs_startup(self):
+    """采集器 CLI 默认值也应使用 FS 启动场景实测无丢样配置。"""
+    with mock.patch.object(
+        sys, "argv", ["collect_mmap_phys_data.py", "-n", "com.example.app"]):
+      args = collector.parse_args()
+
+    self.assertEqual(args.perf_ring_buffer_pages, 32768)
+    self.assertEqual(args.perf_ring_buffer_read_period_ms, 25)
+
   def test_start_perfetto_streams_config_via_stdin(self):
     """启动 Perfetto 时通过 stdin 传配置，避免设备路径读取权限影响。"""
     calls = []
