@@ -12,6 +12,7 @@
 import argparse
 import bisect
 import csv
+import gzip
 import io
 import json
 import os
@@ -45,6 +46,17 @@ MMAP_CLASSIFICATION_METRICS = (
     "private_clean_bytes",
     "shared_dirty_bytes",
     "shared_clean_bytes",
+)
+
+MMAP_PPROF_SAMPLE_TYPES = (
+    ("pss_bytes", "bytes"),
+    ("rss_bytes", "bytes"),
+    ("virtual_bytes", "bytes"),
+    ("private_dirty_bytes", "bytes"),
+    ("private_clean_bytes", "bytes"),
+    ("shared_dirty_bytes", "bytes"),
+    ("shared_clean_bytes", "bytes"),
+    ("range_count", "count"),
 )
 
 
@@ -947,6 +959,179 @@ def build_speedscope(summary_items: List[dict],
   }
 
 
+def _pb_varint(value: int) -> bytes:
+  """编码 protobuf varint，负 int64 按二进制补码写入。"""
+  if value < 0:
+    value = (1 << 64) + value
+  out = bytearray()
+  while value >= 0x80:
+    out.append((value & 0x7f) | 0x80)
+    value >>= 7
+  out.append(value)
+  return bytes(out)
+
+
+def _pb_key(field_number: int, wire_type: int) -> bytes:
+  return _pb_varint((field_number << 3) | wire_type)
+
+
+def _pb_int(field_number: int, value: int) -> bytes:
+  return _pb_key(field_number, 0) + _pb_varint(value)
+
+
+def _pb_bool(field_number: int, value: bool) -> bytes:
+  return _pb_int(field_number, 1 if value else 0)
+
+
+def _pb_message(field_number: int, payload: bytes) -> bytes:
+  return _pb_key(field_number, 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_string(field_number: int, value: str) -> bytes:
+  payload = value.encode("utf-8")
+  return _pb_key(field_number, 2) + _pb_varint(len(payload)) + payload
+
+
+def _pprof_value_type(type_index: int, unit_index: int) -> bytes:
+  return _pb_int(1, type_index) + _pb_int(2, unit_index)
+
+
+def _pprof_line(function_id: int) -> bytes:
+  return _pb_int(1, function_id)
+
+
+def _pprof_mapping(filename_index: int) -> bytes:
+  return (_pb_int(1, 1) + _pb_int(5, filename_index) + _pb_bool(7, True) +
+          _pb_bool(8, True) + _pb_bool(9, True) + _pb_bool(10, True))
+
+
+def _pprof_label(key_index: int, value_index: int) -> bytes:
+  return _pb_int(1, key_index) + _pb_int(2, value_index)
+
+
+def write_mmap_pprof(output_path: str,
+                     summary_items: List[dict],
+                     profile_name: str = "mmap physical attribution",
+                     extra_labels_by_stack: Optional[Dict[int, Dict[str,
+                                                                    str]]] = None
+                     ) -> None:
+  """输出 pprof profile.pb.gz，便于用 go tool pprof 查看 mmap PSS/RSS。"""
+  string_table = [""]
+  string_ids = {"": 0}
+
+  def intern(value: object) -> int:
+    text = "" if value is None else str(value)
+    existing = string_ids.get(text)
+    if existing is not None:
+      return existing
+    string_ids[text] = len(string_table)
+    string_table.append(text)
+    return string_ids[text]
+
+  profile = bytearray()
+  for sample_type, unit in MMAP_PPROF_SAMPLE_TYPES:
+    profile += _pb_message(1,
+                           _pprof_value_type(intern(sample_type), intern(unit)))
+
+  mapping_filename_index = intern("mmap")
+  location_ids: Dict[str, int] = {}
+  function_payloads: List[bytes] = []
+  location_payloads: List[bytes] = []
+
+  def intern_location(frame_name: str) -> int:
+    existing = location_ids.get(frame_name)
+    if existing is not None:
+      return existing
+    location_id = len(location_ids) + 1
+    location_ids[frame_name] = location_id
+    name_index = intern(frame_name)
+    function_payloads.append(
+        _pb_int(1, location_id) + _pb_int(2, name_index) +
+        _pb_int(3, name_index))
+    location_payloads.append(
+        _pb_int(1, location_id) + _pb_int(2, 1) +
+        _pb_message(4, _pprof_line(location_id)))
+    return location_id
+
+  label_keys = {
+      "stack_id": intern("stack_id"),
+      "paths": intern("paths"),
+  }
+  extra_labels_by_stack = extra_labels_by_stack or {}
+  for labels in extra_labels_by_stack.values():
+    for key in labels:
+      if key not in label_keys:
+        label_keys[key] = intern(key)
+
+  sample_count = 0
+  for item in summary_items:
+    values = [
+        int(item.get(sample_type, 0))
+        for sample_type, _ in MMAP_PPROF_SAMPLE_TYPES
+    ]
+    if not any(values):
+      continue
+    stack = list(item.get("stack") or ["<unknown>"])
+    sample = bytearray()
+    for frame_name in stack:
+      sample += _pb_int(1, intern_location(frame_name))
+    for value in values:
+      sample += _pb_int(2, value)
+    stack_id = int(item.get("stack_id", -1))
+    labels = {
+        "stack_id": stack_id,
+        "paths": "; ".join(str(path) for path in item.get("paths", [])[:8]),
+    }
+    labels.update(extra_labels_by_stack.get(stack_id, {}))
+    for key, value in labels.items():
+      if value in (None, ""):
+        continue
+      sample += _pb_message(3, _pprof_label(label_keys[key], intern(value)))
+    profile += _pb_message(2, bytes(sample))
+    sample_count += 1
+
+  profile += _pb_message(3, _pprof_mapping(mapping_filename_index))
+  for payload in location_payloads:
+    profile += _pb_message(4, payload)
+  for payload in function_payloads:
+    profile += _pb_message(5, payload)
+  profile += _pb_message(11,
+                         _pprof_value_type(intern("pss_bytes"),
+                                           intern("bytes")))
+  profile += _pb_int(12, 1)
+  profile += _pb_int(13, intern(profile_name))
+  profile += _pb_int(14, intern("pss_bytes"))
+
+  for value in string_table:
+    profile += _pb_string(6, value)
+
+  common_classification.ensure_parent_dir(output_path)
+  with gzip.open(output_path, "wb") as output:
+    output.write(bytes(profile))
+  print(f"pprof 输出完成: {output_path}，samples={sample_count}，"
+        f"frames={len(location_ids)}")
+
+
+def build_mmap_classification_label_map(
+    classified: List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
+    remaining: List[ClassifiedMmapItem],
+) -> Dict[int, Dict[str, str]]:
+  """生成 stack_id -> pprof labels，用于在总 pprof 中按分类筛选。"""
+  labels_by_stack: Dict[int, Dict[str, str]] = {}
+  for rule, items in classified:
+    for item in items:
+      labels_by_stack[int(item.item.get("stack_id", -1))] = {
+          "category": rule.name,
+          "category_type": "classified",
+      }
+  for item in remaining:
+    labels_by_stack[int(item.item.get("stack_id", -1))] = {
+        "category": "remaining",
+        "category_type": "remaining",
+    }
+  return labels_by_stack
+
+
 def parse_classification_config(path: str) -> List[ClassificationRule]:
   return common_classification.parse_classification_config(path)
 
@@ -1139,6 +1324,79 @@ def write_mmap_summary_speedscope(
   print(f"分类汇总火焰图输出完成: {output_path}")
 
 
+def write_mmap_summary_pprof(
+    output_path: str,
+    summary: Dict[str, Any],
+) -> None:
+  """把分类 summary 输出成 pprof，便于用调用树查看分类层级。"""
+  summary_items: List[dict] = []
+  extra_labels: Dict[int, Dict[str, str]] = {}
+  for index, entry in enumerate(build_mmap_summary_hierarchy_entries(summary),
+                                start=1):
+    if not entry["is_leaf"]:
+      continue
+    path = tuple(str(part) for part in entry["path"])
+    full_name = "/".join(path)
+    stack_id = -index
+    if path == ("remaining",):
+      stack = ["remaining", "mmap summary"]
+      category_type = "remaining"
+    else:
+      stack = [*reversed(path), "classified", "mmap summary"]
+      category_type = "classified"
+    item = {
+        "stack_id": stack_id,
+        "stack": stack,
+        "paths": [full_name],
+    }
+    for sample_type, _ in MMAP_PPROF_SAMPLE_TYPES:
+      item[sample_type] = int(entry.get(sample_type, 0))
+    summary_items.append(item)
+    extra_labels[stack_id] = {
+        "category": full_name,
+        "category_type": category_type,
+    }
+  write_mmap_pprof(output_path, summary_items,
+                   "mmap classification summary", extra_labels)
+
+
+def remove_stale_generated_files(output_dir: str, suffix: str) -> None:
+  if not os.path.isdir(output_dir):
+    return
+  for file_name in os.listdir(output_dir):
+    if file_name.endswith(suffix):
+      os.remove(os.path.join(output_dir, file_name))
+
+
+def write_mmap_classification_pprof_files(
+    output_dir: str,
+    classified: List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
+    remaining: List[ClassifiedMmapItem],
+) -> None:
+  """为分类树每个节点输出一个 pprof 明细文件。"""
+  os.makedirs(output_dir, exist_ok=True)
+  remove_stale_generated_files(output_dir, ".pprof.pb.gz")
+  for index, entry in enumerate(
+      common_classification.build_hierarchy_entries(classified, remaining),
+      start=1):
+    full_name = "/".join(entry.path)
+    summary_items = [item.item for item in entry.items]
+    labels = {
+        int(item.item.get("stack_id", -1)): {
+            "category":
+                full_name,
+            "category_type":
+                "remaining" if entry.path == ("remaining",) else "classified",
+        } for item in entry.items
+    }
+    output_path = os.path.join(
+        output_dir,
+        f"{index:02d}_{common_classification.sanitize_filename(full_name)}.pprof.pb.gz"
+    )
+    write_mmap_pprof(output_path, summary_items,
+                     f"mmap category: {full_name}", labels)
+
+
 def write_mmap_classification_speedscope_files(
     output_dir: str,
     classified: List[Tuple[ClassificationRule, List[ClassifiedMmapItem]]],
@@ -1252,6 +1510,7 @@ def main() -> int:
   parser.add_argument("--pid", type=int, required=True, help="目标进程 pid")
   parser.add_argument("--output", required=True, help="输出 Chrome JSON trace")
   parser.add_argument("--speedscope-output", help="额外输出 speedscope 火焰图 JSON")
+  parser.add_argument("--pprof-output", help="额外输出 pprof profile.pb.gz")
   parser.add_argument("--classify-config", help="按 fs.ini 规则对 mmap 调用栈分类")
   parser.add_argument(
       "--classify-summary-out", help="分类统计 XLSX 输出路径；相对路径会写入 --output 同级目录")
@@ -1261,6 +1520,12 @@ def main() -> int:
   parser.add_argument(
       "--classify-speedscope-dir",
       help="每个分类输出一个 speedscope JSON 的目录；相对路径会写入 --output 同级目录")
+  parser.add_argument(
+      "--classify-summary-pprof-out",
+      help="分类统计 pprof 输出路径；相对路径会写入 --output 同级目录")
+  parser.add_argument(
+      "--classify-pprof-dir",
+      help="每个分类输出一个 pprof 的目录；相对路径会写入 --output 同级目录")
   parser.add_argument(
       "--trace-processor",
       default=find_default_tp(),
@@ -1326,6 +1591,9 @@ def main() -> int:
       json.dump(speedscope, fd, ensure_ascii=False)
     print(f"写入火焰图: {args.speedscope_output}")
 
+  if args.pprof_output and not args.classify_config:
+    write_mmap_pprof(args.pprof_output, summary_items)
+
   if args.classify_config:
     print("生成 mmap 分类输出...")
     rules = parse_classification_config(args.classify_config)
@@ -1354,21 +1622,38 @@ def main() -> int:
     print(f"    pss_bytes: {remaining_total['pss_bytes']}")
     print(f"    pss_mib: {remaining_total['pss_bytes'] / 1048576.0:.3f}")
 
+    if args.pprof_output:
+      write_mmap_pprof(args.pprof_output, all_summary_items,
+                       "mmap physical attribution",
+                       build_mmap_classification_label_map(
+                           classified, remaining))
+
     summary_out = resolve_analysis_output_path(
         args.output, args.classify_summary_out,
         "mmap_classification_summary.xlsx")
     write_mmap_classification_summary(summary_out, summary_data)
 
-    summary_speedscope_out = resolve_analysis_output_path(
-        args.output, args.classify_summary_speedscope_out,
-        "mmap_classification_summary.speedscope.json")
-    write_mmap_summary_speedscope(summary_speedscope_out, summary_data)
+    if args.classify_summary_speedscope_out:
+      summary_speedscope_out = resolve_analysis_output_path(
+          args.output, args.classify_summary_speedscope_out,
+          "mmap_classification_summary.speedscope.json")
+      write_mmap_summary_speedscope(summary_speedscope_out, summary_data)
+
+    if args.classify_summary_pprof_out:
+      summary_pprof_out = resolve_analysis_output_path(
+          args.output, args.classify_summary_pprof_out,
+          "mmap_classification_summary.pprof.pb.gz")
+      write_mmap_summary_pprof(summary_pprof_out, summary_data)
 
     if args.classify_speedscope_dir:
       write_mmap_classification_speedscope_files(
           resolve_analysis_output_dir(args.output,
                                       args.classify_speedscope_dir), classified,
           remaining)
+    if args.classify_pprof_dir:
+      write_mmap_classification_pprof_files(
+          resolve_analysis_output_dir(args.output, args.classify_pprof_dir),
+          classified, remaining)
   return 0
 
 

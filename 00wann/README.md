@@ -2,15 +2,17 @@
 
 本文是 `00wann` 目录的统一入口，集中说明每个工具的用途、默认行为、参数和输出。更细的实现逻辑仍保留在专项文档中：
 
-| 专项文档 | 内容 |
-| --- | --- |
-| `mmap_phys_analyzer.md` | mmap 真实物理内存归因、无栈 mmap 验证、分类输出和已知边界。 |
-| `heap_profile.md` | Native heap profile 采集、meminfo 对比和启动耗时评估。 |
-| `hybridclr_mmap_malloc_symbol_report_2026-06-22.md` | HybridCLR mmap 优化的符号路径根因、重新符号化和 malloc 分类验证报告。 |
-| `heap_analyzer/README.md` | Native heap 调用栈查询、fs.ini 分类、pprof 和 speedscope 输出。 |
-| `meminfo_android_demo_validation.md` | `dumpsys meminfo` 真机 demo 的构建、指标和验证结论。 |
-| `dumpsys_meminfo_metrics.md` | Android `dumpsys meminfo` 各行各列口径说明。 |
-| `superpower_memory_perf_injection_slow_spec.md` | 验证内存性能模块注入后程序运行过慢问题的任务规格、采集数据和验收标准。 |
+
+| 专项文档                                                | 内容                                                 |
+| --------------------------------------------------- | -------------------------------------------------- |
+| `mmap_phys_analyzer.md`                             | mmap 真实物理内存归因、无栈 mmap 验证、分类输出和已知边界。                |
+| `heap_profile.md`                                   | Native heap profile 采集、meminfo 对比和启动耗时评估。          |
+| `hybridclr_mmap_malloc_symbol_report_2026-06-22.md` | HybridCLR mmap 优化的符号路径根因、重新符号化和 malloc 分类验证报告。     |
+| `heap_analyzer/README.md`                           | Native heap 调用栈查询、fs.ini 分类、pprof 和 speedscope 输出。 |
+| `meminfo_android_demo_validation.md`                | `dumpsys meminfo` 真机 demo 的构建、指标和验证结论。             |
+| `dumpsys_meminfo_metrics.md`                        | Android `dumpsys meminfo` 各行各列口径说明。                |
+| `superpower_memory_perf_injection_slow_spec.md`     | 验证内存性能模块注入后程序运行过慢问题的任务规格、采集数据和验收标准。                |
+
 
 ## 环境和运行入口
 
@@ -77,13 +79,15 @@ Native heap 调用栈分析
 
 修改采集、分析或 demo 代码后，需要按影响范围运行对应验证：
 
-| 变更类型 | 必跑验证 |
-| --- | --- |
+
+| 变更类型                       | 必跑验证                                                                                                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | mmap 采集、mmap 验证、host 兼容性改动 | 45 秒无栈 mmap 验证：`MMAP_PHYS_APP=com.example.meminfodemo MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000` |
-| mmap 调用栈归因改动 | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景 |
-| Native heap profile 改动 | AI 验证不传时长：`./run_heap_profile.sh`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号 |
-| heapprofd malloc 统计改动 | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh` |
-| meminfo demo 或解析改动 | 跑 `./run_meminfo_android_demo.sh` |
+| mmap 调用栈归因改动               | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景                                                                                                                       |
+| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号                                                                                                           |
+| heapprofd malloc 统计改动      | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh`                                                                                                                            |
+| meminfo demo 或解析改动         | 跑 `./run_meminfo_android_demo.sh`                                                                                                                                        |
+
 
 无栈 mmap 验证只检查 mmap syscall events 和 smaps 健康状态，不启用 heapprofd malloc，不做 malloc/native heap 对比。
 
@@ -100,11 +104,12 @@ Native heap 调用栈分析
 2. 设置 PERFETTO_SYMBOLIZER_MODE=index。
 3. 设置 PERFETTO_BINARY_PATH=./workspace/allsymbols/arm64-v8a。
 4. 读取 config.sh 和 common_tools.sh。
-5. 默认目标进程为 com.tencent.dhwdxkty.trunk.profiler。
-6. 推送 FSBootCmdLine.cfg 和 debugconfig.txt。
-7. 调用 collect_mmap_phys_data.py。
-8. 默认启用 mmap 调用栈采集，并追加 --classify-config heap_analyzer/fs.ini --top-n 0。
-9. 输出到 PerfData/mmap_phys/<时间戳>/。
+5. Windows Git Bash 下把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，确保 `traceconv.exe` 能启动 `llvm-symbolizer.exe`。
+6. 默认目标进程来自 `MMAP_PHYS_APP`；当前 `config.sh` 默认 `com.fs.t.prf`，未配置时脚本回退 `com.tencent.dhwdxkty.trunk.profiler`。
+7. 推送 FSBootCmdLine.cfg；仅当目标包是 FS 包时推送 debugconfig.txt，demo/其他包会跳过该 FS 专用配置。
+8. 调用 collect_mmap_phys_data.py。
+9. 默认启用 mmap 调用栈采集，并追加 --classify-config heap_analyzer/fs.ini --top-n 0。
+10. 输出到 PerfData/mmap_phys/<时间戳>/。
 ```
 
 常用命令：
@@ -119,31 +124,39 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 
 参数说明：本脚本把参数原样透传给 `collect_mmap_phys_data.py`，常用参数如下。
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-d, --duration-ms` | `75000` | Perfetto 采集时长，单位 ms。 |
-| `--smaps-interval-ms` | `1000` | smaps 快照间隔，单位 ms。 |
-| `-o, --output` | 自动生成 | 输出目录。 |
-| `--mmap-callstacks` | 默认开启 | 采集 mmap 调用栈并运行物理归因分析。 |
-| `--no-mmap-callstacks` | 关闭项 | 进入无栈验证，只检查 mmap 事件和 smaps。 |
-| `--no-ftrace` | 关闭项 | 不启用 ftrace syscall 采集，会跳过无栈 mmap 验证。 |
-| `--no-kernel-frames` | 关闭项 | mmap 调用栈不采内核帧。 |
-| `--use-su` | 关闭项 | 强制用 `su 0` 读取 `/proc/<pid>/smaps`。 |
-| `--no-analyze` | 关闭项 | 只采集 trace 和 smaps，不运行离线分析。 |
-| `--trace-processor` | 自动探测 | 指定 `trace_processor_shell`。 |
-| `--traceconv` | 自动探测 | 指定 `traceconv`，主功能用于生成 `symbolized-trace`。 |
-| `--classify-config` | `heap_analyzer/fs.ini` | 分类规则文件。 |
-| `--top-n` | `0` | 输出调用栈数量，`0` 表示全部。 |
+
+| 参数                     | 默认值                    | 说明                                         |
+| ---------------------- | ---------------------- | ------------------------------------------ |
+| `-d, --duration-ms`    | `75000`                | Perfetto 采集时长，单位 ms。                       |
+| `--smaps-interval-ms`  | `1000`                 | smaps 快照间隔，单位 ms。                          |
+| `-o, --output`         | 自动生成                   | 输出目录。                                      |
+| `--mmap-callstacks`    | 默认开启                   | 采集 mmap 调用栈并运行物理归因分析。                      |
+| `--no-mmap-callstacks` | 关闭项                    | 进入无栈验证，只检查 mmap 事件和 smaps。                 |
+| `--no-ftrace`          | 关闭项                    | 不启用 ftrace syscall 采集，会跳过无栈 mmap 验证。       |
+| `--no-kernel-frames`   | 关闭项                    | mmap 调用栈不采内核帧。                             |
+| `--use-su`             | 关闭项                    | 强制用 `su 0` 读取 `/proc/<pid>/smaps`。         |
+| `--no-analyze`         | 关闭项                    | 只采集 trace 和 smaps，不运行离线分析。                 |
+| `--trace-processor`    | 自动探测                   | 指定 `trace_processor_shell`。                |
+| `--traceconv`          | 自动探测                   | 指定 `traceconv`，主功能用于生成 `symbolized-trace`。 |
+| `--classify-config`    | `heap_analyzer/fs.ini` | 分类规则文件。                                    |
+| `--top-n`              | `0`                    | 输出调用栈数量，`0` 表示全部。                          |
+
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MMAP_PHYS_APP` | `com.tencent.dhwdxkty.trunk.profiler` | 目标包名或进程名。 |
-| `MMAP_PHYS_ACTIVITY` | 空 | 目标进程不存在时用 `am start -n` 拉起的 Activity。 |
-| `PYTHON` | 自动探测 | 指定 Python。 |
-| `TRACE_PROCESSOR` | 自动探测 | 覆盖 trace processor。 |
-| `TRACECONV` | 自动探测 | 覆盖 traceconv。 |
+
+| 变量                   | 默认值                                   | 说明                                    |
+| -------------------- | ------------------------------------- | ------------------------------------- |
+| `MMAP_PHYS_APP`      | `config.sh` 默认为 `com.fs.t.prf`，未配置时脚本回退 `com.tencent.dhwdxkty.trunk.profiler` | 目标包名或进程名；命令行前缀里的 `MMAP_PHYS_APP=...` 会覆盖 `config.sh` 默认值。 |
+| `MMAP_PHYS_ACTIVITY` | 空                                     | 目标进程不存在时用 `am start -n` 拉起的 Activity。 |
+| `PYTHON`             | 自动探测                                  | 指定 Python。                            |
+| `TRACE_PROCESSOR`    | 自动探测                                  | 覆盖 trace processor。                   |
+| `TRACECONV`          | 自动探测                                  | 覆盖 traceconv。                         |
+
+符号化要求：
+
+`PERFETTO_BINARY_PATH=./workspace/allsymbols/arm64-v8a` 只决定 `traceconv symbolize` 去哪里找 `libil2cpp.so` 等带符号 so。Windows 下如果 `traceconv.exe` 不能从 `PATH` 找到 `llvm-symbolizer.exe`，生成的 `symbols` 可能只有地址、没有 `lines.function_name`，导入后 `stack_profile_symbol` 为空，`libil2cpp.so` 在 pprof 中就无法展开到 `il2cpp::vm::Class::Init`、`GlobalMetadata` 等函数名。`run_mmap_phys_profile.sh` 会自动补 `PerfettoRoot/buildtools/win/clang/bin`；手动重跑 `traceconv.exe symbolize` 时也要保留这个路径。
+
 
 输出：
 
@@ -155,18 +168,23 @@ PerfData/mmap_phys/<时间戳>/
   smaps/
   dumpsys_meminfo.txt
   memory_validation.json
+  mmap_health_report.md
+  mmap_health_report.json
   mmap_phys_attribution.json
-  mmap_phys_attribution.speedscope.json
+  mmap_phys_attribution.pprof.pb.gz
   mmap_classification_summary.xlsx
-  mmap_classification_summary.speedscope.json
-  mmap_categories/
+  mmap_classification_summary.pprof.pb.gz
+  pprof_categories/
 ```
+
+`mmap_health_report.md` 是终端“mmap 健康报告”的 Markdown 落盘版本，优先用表格展示健康检查、smaps/meminfo 对齐和 smaps 分类；`mmap_health_report.json` 保留同一内容的机器可读版本。其中 meminfo 对齐只解析 `dumpsys meminfo` 主表行，标题和 `App Summary` 不进入分类。
 
 验收要点：
 
 ```text
-主功能：重点看 mmap_phys_attribution.json 和 speedscope 火焰图。
+主功能：重点看 mmap_phys_attribution.json 和 pprof 数据。
 无栈验证：memory_validation.json 中 validation.status 应为 pass，mmap.syscall_events 和 mmap.smaps_snapshots 应大于 0，trace_health 丢失项应为 0。
+主功能健康：除无栈字段外，还要看 trace_health.perf_samples_skipped_dataloss 是否为 0；非 0 表示 traced_perf 内部调用栈 sample 丢失，调用栈归因结果不应作为最终结论。
 ```
 
 ## `collect_mmap_phys_data.py`
@@ -188,38 +206,40 @@ PerfData/mmap_phys/<时间戳>/
 
 参数说明：
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `-n, --name` | 必填 | 目标进程名或包名。 |
-| `-d, --duration-ms` | `75000` | Perfetto 采集时长，单位 ms。 |
-| `--smaps-interval-ms` | `1000` | smaps 采样间隔。 |
-| `-o, --output` | 自动生成 | 输出目录。 |
-| `--wait-timeout-s` | `120` | 等待目标进程启动超时，`0` 表示无限等待。 |
-| `--buffer-kb` | `262144` | Perfetto ring buffer 大小，单位 KiB。 |
-| `--perf-ring-buffer-pages` | `32768` | linux.perf 每 CPU ring buffer 页数，`0` 使用 Perfetto 默认。 |
-| `--perf-ring-buffer-read-period-ms` | `25` | linux.perf ring buffer 读取周期，`0` 使用 Perfetto 默认。 |
-| `--mmap-callstacks` | 开启 | 采集 mmap 调用栈并分析。 |
-| `--no-mmap-callstacks` | 关闭项 | 只运行无栈 mmap 事件健康检查。 |
-| `--no-ftrace` | 关闭项 | 不启用 ftrace syscall 采集。 |
-| `--no-kernel-frames` | 关闭项 | perf 调用栈不采内核帧。 |
-| `--no-guardrails` | 关闭项 | 传递给设备端 `perfetto --no-guardrails`。 |
-| `--use-su` | 关闭项 | 用 `su 0` 读取 smaps。 |
-| `--no-analyze` | 关闭项 | 不运行离线分析器。 |
-| `--trace-processor` | 自动探测 | 传给分析器和验证 SQL 的 trace processor。 |
-| `--traceconv` | 自动探测 | 用于符号化 trace。 |
-| `--classify-config` | 空 | 传给 mmap 分析器的分类配置。 |
-| `--top-n` | 空 | 传给 mmap 分析器；`0` 表示全部。 |
-| `--analyzer` | `mmap_phys_analyzer.py` | 指定离线分析器路径。 |
 
-linux.perf 丢样调参：
+| 参数                                  | 默认值                     | 说明                                                  |
+| ----------------------------------- | ----------------------- | --------------------------------------------------- |
+| `-n, --name`                        | 必填                      | 目标进程名或包名。                                           |
+| `-d, --duration-ms`                 | `75000`                 | Perfetto 采集时长，单位 ms。                                |
+| `--smaps-interval-ms`               | `1000`                  | smaps 采样间隔。                                         |
+| `-o, --output`                      | 自动生成                    | 输出目录。                                               |
+| `--wait-timeout-s`                  | `120`                   | 等待目标进程启动超时，`0` 表示无限等待。                              |
+| `--buffer-kb`                       | `262144`                | Perfetto ring buffer 大小，单位 KiB。                     |
+| `--perf-ring-buffer-pages`          | `32768`                 | linux.perf 每 CPU ring buffer 页数，`0` 使用 Perfetto 默认。 |
+| `--perf-ring-buffer-read-period-ms` | `25`                    | linux.perf ring buffer 读取周期，`0` 使用 Perfetto 默认。     |
+| `--mmap-callstacks`                 | 开启                      | 采集 mmap 调用栈并分析。                                     |
+| `--no-mmap-callstacks`              | 关闭项                     | 只运行无栈 mmap 事件健康检查。                                  |
+| `--no-ftrace`                       | 关闭项                     | 不启用 ftrace syscall 采集。                              |
+| `--no-kernel-frames`                | 关闭项                     | perf 调用栈不采内核帧。                                      |
+| `--no-guardrails`                   | 关闭项                     | 传递给设备端 `perfetto --no-guardrails`。                  |
+| `--use-su`                          | 关闭项                     | 用 `su 0` 读取 smaps。                                  |
+| `--no-analyze`                      | 关闭项                     | 不运行离线分析器。                                           |
+| `--trace-processor`                 | 自动探测                    | 传给分析器和验证 SQL 的 trace processor。                     |
+| `--traceconv`                       | 自动探测                    | 用于符号化 trace。                                        |
+| `--classify-config`                 | 空                       | 传给 mmap 分析器的分类配置。                                   |
+| `--top-n`                           | 空                       | 传给 mmap 分析器；`0` 表示全部。                               |
+| `--analyzer`                        | `mmap_phys_analyzer.py` | 指定离线分析器路径。                                          |
+
+
+### linux.perf 丢样调参：
+
+先按计数器区分丢样层级；详细流程见
+[traced_perf 内部 perf sample 丢失口径](docs/mmap_phys_analyzer.md#traced_perf-内部-perf-sample-丢失口径)。
 
 `memory_validation.json` 中 `trace_health.perf_data_loss` 对应 Perfetto
 `perf_cpu_lost_records`，含义是 linux.perf 每 CPU kernel ring buffer overrun。
-这类丢样不等同于 Perfetto 全局 trace buffer 不够；如果
-`perfetto_data_loss=0`、`ftrace_data_loss=0`，不要优先增大 `--buffer-kb`。
+这个问题优先调 linux.perf kernel ring buffer：
 
-主功能 mmap 调用栈采样使用 `raw_syscalls:sys_enter` + `period: 1`，降低采样频率会改变
-“每次 mmap enter 都尝试取栈”的语义，因此优先按下面顺序调大 linux.perf buffer：
 
 ```bash
 # 旧默认值；如果出现 perf_data_loss，先不要作为最终结果使用
@@ -231,19 +251,37 @@ linux.perf 丢样调参：
 # 第二档：仍有 perf_data_loss 时使用；Pixel 6 约 128 MiB/CPU，总量约 1 GiB
 --perf-ring-buffer-pages 32768 --perf-ring-buffer-read-period-ms 50
 
-# 当前默认值/无丢样档：32768/50ms 仍有丢样时使用；实测 perf_data_loss=0
+# 当前默认值/无丢样档：32768/25ms；用于 32768/50ms 仍有丢样时；实测 perf_data_loss=0
 --perf-ring-buffer-pages 32768 --perf-ring-buffer-read-period-ms 25
 ```
 
 `ring_buffer_pages` 是每 CPU 4 KiB 页数，Perfetto 要求该值必须是 2 的幂。
-当前 FS 启动 mmap 调用栈采样可用 `32768/25ms` 作为无丢样配置；如果该配置仍有丢样，
-再考虑加 `--no-kernel-frames` 降低每条样本负载；mmap 归因通常主要依赖用户态栈。
+
+`trace_health.perf_samples_skipped_dataloss` 对应 trace_processor 的
+`perf_samples_skipped_dataloss`，含义是 traced_perf 内部 reader 到 unwinder 队列阶段丢失了本应展开调用栈的 perf samples，常见原因是 load shedding。它不是 kernel ring buffer overrun；如果 `perf_data_loss=0` 但该字段非 0，不要只继续增大 `--perf-ring-buffer-pages`。
+
+这类丢样不等同于 Perfetto 全局 trace buffer 不够；如果
+`perfetto_data_loss=0`、`ftrace_data_loss=0`，不要优先增大 `--buffer-kb`。
+
+主功能 mmap 调用栈采样使用 `raw_syscalls:sys_enter` + `period: 1`，降低采样频率会改变“每次 mmap enter 都尝试取栈”的语义。当前 FS 启动 mmap 调用栈采样先保持 `32768/25ms`，然后按下面顺序处理 `perf_samples_skipped_dataloss`：
+
+```bash
+# 第一优先级：降低每条样本的展开成本；mmap 归因通常主要依赖用户态栈
+./run_mmap_phys_profile.sh --no-kernel-frames
+
+# 如果仍然只是 perf_samples_skipped_dataloss 非 0，可尝试缩短读取周期来削峰，但要复查采集开销
+./run_mmap_phys_profile.sh --no-kernel-frames --perf-ring-buffer-read-period-ms 10
+```
+
+当前脚本没有设置 `max_enqueued_footprint_kb`，Perfetto 侧等价于 `0`，即关闭 footprint 阈值检查；因此当前这类 `perf_samples_skipped_dataloss` 更可能来自 unwinder queue 写入失败/队列满，而不是命中 footprint 上限。若仍非 0，继续规避主要是降低调用栈采样压力；这会带来归因完整性的取舍。
 
 额外环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MMAP_PHYS_ACTIVITY` | 空 | 目标未启动时使用该 Activity 拉起，格式为 `package/.Activity`。 |
+
+| 变量                   | 默认值 | 说明                                             |
+| -------------------- | --- | ---------------------------------------------- |
+| `MMAP_PHYS_ACTIVITY` | 空   | 目标未启动时使用该 Activity 拉起，格式为 `package/.Activity`。 |
+
 
 验收要点：无栈验证不要检查 heapprofd malloc 字段；只看 mmap 事件、smaps 快照和 Perfetto/ftrace 健康。
 
@@ -261,27 +299,32 @@ linux.perf 丢样调参：
 5. 读取 smaps 快照。
 6. 按地址重叠把 smaps PSS/RSS 分摊到 mmap 调用栈。
 7. 输出 Perfetto Chrome JSON。
-8. 如传入 speedscope 或分类参数，同时输出火焰图和分类表。
+8. 如传入 pprof、speedscope 或分类参数，同时输出剖析数据和分类表。
 ```
 
 参数说明：
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--trace` | 必填 | 包含 mmap/perf 事件的 Perfetto trace，推荐 `symbolized-trace`。 |
-| `--smaps-dir` | 必填 | smaps 快照目录。 |
-| `--pid` | 必填 | 目标进程 pid。 |
-| `--output` | 必填 | 输出 Chrome JSON trace。 |
-| `--speedscope-output` | 空 | 额外输出 speedscope JSON。 |
-| `--classify-config` | 空 | 使用 `fs.ini` 规则分类 mmap 调用栈。 |
-| `--classify-summary-out` | 自动路径 | 分类统计 XLSX 输出路径。 |
-| `--classify-summary-speedscope-out` | 自动路径 | 分类汇总 speedscope 输出路径。 |
-| `--classify-speedscope-dir` | 空 | 每个分类单独输出 speedscope 的目录。 |
-| `--trace-processor` | 自动探测 | trace processor 路径。 |
-| `--smaps-ts-unit` | `auto` | smaps 文件名时间戳单位，可选 `auto/ns/us/ms/s`。 |
-| `--smaps-ts-offset-ns` | `0` | smaps 时间戳到 trace 时间轴的偏移。 |
-| `--stack-window-ns` | `5000000` | mmap enter 与 perf sample 匹配窗口。 |
-| `--top-n` | `50` | 每个快照输出 PSS 最大的 N 个调用栈，`0` 表示全部。 |
+
+| 参数                                  | 默认值       | 说明                                                     |
+| ----------------------------------- | --------- | ------------------------------------------------------ |
+| `--trace`                           | 必填        | 包含 mmap/perf 事件的 Perfetto trace，推荐 `symbolized-trace`。 |
+| `--smaps-dir`                       | 必填        | smaps 快照目录。                                            |
+| `--pid`                             | 必填        | 目标进程 pid。                                              |
+| `--output`                          | 必填        | 输出 Chrome JSON trace。                                  |
+| `--speedscope-output`               | 空         | 额外输出 speedscope JSON。                                  |
+| `--pprof-output`                    | 空         | 额外输出 pprof profile.pb.gz。                              |
+| `--classify-config`                 | 空         | 使用 `fs.ini` 规则分类 mmap 调用栈。                             |
+| `--classify-summary-out`            | 自动路径      | 分类统计 XLSX 输出路径。                                        |
+| `--classify-summary-speedscope-out` | 空         | 分类汇总 speedscope 输出路径。                                  |
+| `--classify-speedscope-dir`         | 空         | 每个分类单独输出 speedscope 的目录。                               |
+| `--classify-summary-pprof-out`      | 空         | 分类汇总 pprof 输出路径。                                       |
+| `--classify-pprof-dir`              | 空         | 每个分类单独输出 pprof 的目录。                                    |
+| `--trace-processor`                 | 自动探测      | trace processor 路径。                                    |
+| `--smaps-ts-unit`                   | `auto`    | smaps 文件名时间戳单位，可选 `auto/ns/us/ms/s`。                   |
+| `--smaps-ts-offset-ns`              | `0`       | smaps 时间戳到 trace 时间轴的偏移。                               |
+| `--stack-window-ns`                 | `5000000` | mmap enter 与 perf sample 匹配窗口。                         |
+| `--top-n`                           | `50`      | 每个快照输出 PSS 最大的 N 个调用栈，`0` 表示全部。                        |
+
 
 输出验收：
 
@@ -289,8 +332,11 @@ linux.perf 丢样调参：
 mmap_phys_attribution.json
   -> Perfetto UI 可加载；metadata.final_summary 中 pss_bytes 是主指标。
 
+mmap_phys_attribution.pprof.pb.gz
+  -> go tool pprof 可加载；默认 sample type 是 pss_bytes，同时包含 RSS/virtual/dirty/clean/range_count。
+
 mmap_phys_attribution.speedscope.json
-  -> Speedscope 可加载；权重单位 bytes，默认按 PSS。
+  -> 仅显式传 --speedscope-output 时生成；权重单位 bytes，默认按 PSS。
 ```
 
 ## `run_mmap_phys_analyze_latest.sh`
@@ -303,9 +349,10 @@ mmap_phys_attribution.speedscope.json
 1. 在 PerfData/mmap_phys 下寻找最近一个包含 trace 和 smaps 的目录。
 2. 优先使用 symbolized-trace，没有则回退 mmap_trace.perfetto-trace。
 3. 未传 --pid 时，按 MMAP_PHYS_APP 从 trace 中自动查询 pid。
-4. 默认输出 mmap_phys_attribution.json 和 mmap_phys_attribution.speedscope.json。
-5. 默认追加 --classify-config heap_analyzer/fs.ini --classify-speedscope-dir mmap_categories --top-n 0。
+4. 默认输出 mmap_phys_attribution.json 和 mmap_phys_attribution.pprof.pb.gz。
+5. 默认追加 --classify-config heap_analyzer/fs.ini --classify-summary-pprof-out mmap_classification_summary.pprof.pb.gz --classify-pprof-dir pprof_categories --top-n 0。
 6. 用户参数追加在默认参数之后，可覆盖本次分析口径。
+7. 传入 --latestdir 时直接使用指定目录，不再自动扫描最近目录；该参数只由 wrapper 消费，不透传给分析器。
 ```
 
 命令：
@@ -313,28 +360,34 @@ mmap_phys_attribution.speedscope.json
 ```bash
 ./run_mmap_phys_analyze_latest.sh
 MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
+./run_mmap_phys_analyze_latest.sh --latestdir PerfData/mmap_phys/<时间戳> --pid 1234
 ./run_mmap_phys_analyze_latest.sh --pid 1234 --top-n 25
 ```
 
-参数说明：参数原样透传给 `mmap_phys_analyzer.py`。
+参数说明：除 `--latestdir` 由 wrapper 消费外，其余参数会透传给 `mmap_phys_analyzer.py`。
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--pid` | 自动查询 | 目标 pid。 |
-| `--trace` | 最近目录 trace | 指定 trace。 |
-| `--smaps-dir` | 最近目录 smaps | 指定 smaps。 |
-| `--top-n` | `0` | 输出调用栈数量。 |
-| `--classify-config` | `heap_analyzer/fs.ini` | 分类配置。 |
-| `--trace-processor` | 自动探测 | trace processor。 |
-| `-h, --help` | 无 | 打印用法。 |
+
+| 参数                  | 默认值                    | 说明               |
+| ------------------- | ---------------------- | ---------------- |
+| `--pid`             | 自动查询                   | 目标 pid。          |
+| `--latestdir`       | 自动扫描最近目录                | 指定本次离线分析使用的采集目录；不透传给分析器。 |
+| `--trace`           | 最近目录 trace             | 指定 trace。        |
+| `--smaps-dir`       | 最近目录 smaps             | 指定 smaps。        |
+| `--top-n`           | `0`                    | 输出调用栈数量。         |
+| `--classify-config` | `heap_analyzer/fs.ini` | 分类配置。            |
+| `--trace-processor` | 自动探测                   | trace processor。 |
+| `-h, --help`        | 无                      | 打印用法。            |
+
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MMAP_PHYS_DATA_DIR` | `PerfData/mmap_phys` | 最近采集目录搜索根目录。 |
-| `MMAP_PHYS_APP` | `com.tencent.dhwdxkty.trunk.profiler` | 自动查询 pid 时使用的进程名。 |
-| `TRACE_PROCESSOR` | 自动探测 | 覆盖 trace processor。 |
+
+| 变量                   | 默认值                                   | 说明                  |
+| -------------------- | ------------------------------------- | ------------------- |
+| `MMAP_PHYS_DATA_DIR` | `PerfData/mmap_phys`                  | 最近采集目录搜索根目录。        |
+| `MMAP_PHYS_APP`      | `com.tencent.dhwdxkty.trunk.profiler` | 自动查询 pid 时使用的进程名。   |
+| `TRACE_PROCESSOR`    | 自动探测                                  | 覆盖 trace processor。 |
+
 
 ## `run_heap_profile.sh`
 
@@ -362,29 +415,33 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 
 参数说明：
 
-| 位置参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `1: interval_bytes` | `1024` | heapprofd 采样间隔，单位 bytes。 |
-| `2: shmem_size` | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。 |
+
+| 位置参数                | 默认值       | 说明                          |
+| ------------------- | --------- | --------------------------- |
+| `1: interval_bytes` | `1024`    | heapprofd 采样间隔，单位 bytes。    |
+| `2: shmem_size`     | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。 |
+
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `RUN_HEAP_PROFILE_PYTHON` | 自动探测 | wrapper 使用的 Python。 |
-| `RUN_HEAP_PROFILE_INNER_PYTHON` | 当前 Python | 调用 Perfetto `heap_profile.py` 的 Python。 |
-| `RUN_HEAP_PROFILE_EXTRA_PATH` | 空 | 追加到 PATH 前面的路径。 |
-| `ADB_BINARY` | `adb` | adb 可执行文件。 |
-| `CP_BINARY` | `cp` | 复制命令。 |
-| `TRACE_PROCESSOR` | 自动探测 | trace processor。 |
-| `TRACECONV` | 自动探测 | traceconv。 |
-| `PERFETTO_BINARY_PATH` | 自动生成 | traceconv 符号搜索路径；显式设置时脚本原样保留。 |
-| `RUN_HEAP_PROFILE_SYMBOLS_DIR` | 当前 FS 打包产物符号目录 | 未设置 `PERFETTO_BINARY_PATH` 时，用于覆盖优先符号目录。 |
-| `HEAP_PROFILE_ACTIVE_TIMEOUT_S` | `60` | 等待 `Profiling active` 的超时。 |
-| `HEAP_PROFILE_LOGIN_TIMEOUT_S` | `0` | 等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。 |
-| `HEAP_PROFILE_LOGIN_STABLE_S` | `30` | 登录完成后的稳定采集秒数；真机验收保持默认 30。 |
-| `HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S` | `600` | 等待 profiler shutdown 的超时。 |
-| `HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES` | `67108864` | malloc live 和 meminfo Native Heap Alloc 允许差值。 |
+
+| 变量                                        | 默认值            | 说明                                            |
+| ----------------------------------------- | -------------- | --------------------------------------------- |
+| `RUN_HEAP_PROFILE_PYTHON`                 | 自动探测           | wrapper 使用的 Python。                           |
+| `RUN_HEAP_PROFILE_INNER_PYTHON`           | 当前 Python      | 调用 Perfetto `heap_profile.py` 的 Python。       |
+| `RUN_HEAP_PROFILE_EXTRA_PATH`             | 空              | 追加到 PATH 前面的路径。                               |
+| `ADB_BINARY`                              | `adb`          | adb 可执行文件。                                    |
+| `CP_BINARY`                               | `cp`           | 复制命令。                                         |
+| `TRACE_PROCESSOR`                         | 自动探测           | trace processor。                              |
+| `TRACECONV`                               | 自动探测           | traceconv。                                    |
+| `PERFETTO_BINARY_PATH`                    | 自动生成           | traceconv 符号搜索路径；显式设置时脚本原样保留。                 |
+| `RUN_HEAP_PROFILE_SYMBOLS_DIR`            | 当前 FS 打包产物符号目录 | 未设置 `PERFETTO_BINARY_PATH` 时，用于覆盖优先符号目录。      |
+| `HEAP_PROFILE_ACTIVE_TIMEOUT_S`           | `60`           | 等待 `Profiling active` 的超时。                    |
+| `HEAP_PROFILE_LOGIN_TIMEOUT_S`            | `0`            | 等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。           |
+| `HEAP_PROFILE_LOGIN_STABLE_S`             | `30`           | 登录完成后的稳定采集秒数；真机验收保持默认 30。                     |
+| `HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S`  | `600`          | 等待 profiler shutdown 的超时。                     |
+| `HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES` | `67108864`     | malloc live 和 meminfo Native Heap Alloc 允许差值。 |
+
 
 Windows 下脚本会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，确保 `traceconv.exe` 可以启动 `llvm-symbolizer.exe` 完成符号化。
 
@@ -423,10 +480,12 @@ PerfData/mem/<时间戳>/
 
 参数说明：
 
-| 位置参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `1: interval_bytes` | `1024` | 传给 `heap_profile.py -i`。 |
-| `2: shmem_size` | `8388608` | 传给 `heap_profile.py --shmem-size`。 |
+
+| 位置参数                | 默认值       | 说明                                 |
+| ------------------- | --------- | ---------------------------------- |
+| `1: interval_bytes` | `1024`    | 传给 `heap_profile.py -i`。           |
+| `2: shmem_size`     | `8388608` | 传给 `heap_profile.py --shmem-size`。 |
+
 
 环境变量同 `run_heap_profile.sh`。
 
@@ -458,23 +517,27 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 
 参数说明：
 
-| 位置参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `1: duration_ms` | `45000` | 每轮 heapprofd 采集时长。 |
-| `2: shmem_size` | `268435456` | heapprofd shmem 大小。 |
-| `3...: intervals` | `512 256 128 64 32 16` | 待评估的采样间隔列表。 |
+
+| 位置参数              | 默认值                    | 说明                  |
+| ----------------- | ---------------------- | ------------------- |
+| `1: duration_ms`  | `45000`                | 每轮 heapprofd 采集时长。  |
+| `2: shmem_size`   | `268435456`            | heapprofd shmem 大小。 |
+| `3...: intervals` | `512 256 128 64 32 16` | 待评估的采样间隔列表。         |
+
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `HEAP_STARTUP_APP` | `com.tencent.dhwdxkty.trunk.profiler` | 目标包名。 |
-| `HEAP_STARTUP_ACTIVITY` | `com.tencent.dhwdxkty.trunk.profiler/com.dhplugin.unity.MainActivity` | 启动 Activity。 |
-| `HEAP_STARTUP_PATTERN` | `LAN 更新流程开始` | 业务启动完成日志。 |
-| `HEAP_STARTUP_WAIT_TIMEOUT_S` | `90` | 等待目标日志超时。 |
-| `HEAP_STARTUP_DRY_RUN` | `0` | 为 `1` 时只打印配置，不执行采集。 |
-| `TRACE_PROCESSOR` | 自动探测 | trace processor。 |
-| `TRACECONV` | 自动探测 | traceconv。 |
+
+| 变量                            | 默认值                                                                   | 说明                  |
+| ----------------------------- | --------------------------------------------------------------------- | ------------------- |
+| `HEAP_STARTUP_APP`            | `com.tencent.dhwdxkty.trunk.profiler`                                 | 目标包名。               |
+| `HEAP_STARTUP_ACTIVITY`       | `com.tencent.dhwdxkty.trunk.profiler/com.dhplugin.unity.MainActivity` | 启动 Activity。        |
+| `HEAP_STARTUP_PATTERN`        | `LAN 更新流程开始`                                                          | 业务启动完成日志。           |
+| `HEAP_STARTUP_WAIT_TIMEOUT_S` | `90`                                                                  | 等待目标日志超时。           |
+| `HEAP_STARTUP_DRY_RUN`        | `0`                                                                   | 为 `1` 时只打印配置，不执行采集。 |
+| `TRACE_PROCESSOR`             | 自动探测                                                                  | trace processor。    |
+| `TRACECONV`                   | 自动探测                                                                  | traceconv。          |
+
 
 输出：终端输出 `CONFIG|...`、`BASELINE|...`、`CASE|...` 和 `RESULT|...` 行；采集文件保存到 `PerfData/mem/startup_eval_<时间戳>_<标签>/`。
 
@@ -505,20 +568,24 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 
 参数说明：参数原样透传给 `heap_analyzer/query_heap_alloc_stacks_by_symbol.py`。
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--trace` | 最近 trace | 指定 trace。 |
-| `--symbol` | 不默认强塞 | 按符号筛选调用栈。 |
-| `--limit` | `0` | wrapper 默认不打印长明细。 |
-| `--classify-config` | `heap_analyzer/fs.ini` | 分类配置。 |
-| `-h, --help` | 无 | 打印用法。 |
+
+| 参数                  | 默认值                    | 说明                |
+| ------------------- | ---------------------- | ----------------- |
+| `--trace`           | 最近 trace               | 指定 trace。         |
+| `--symbol`          | 不默认强塞                  | 按符号筛选调用栈。         |
+| `--limit`           | `0`                    | wrapper 默认不打印长明细。 |
+| `--classify-config` | `heap_analyzer/fs.ini` | 分类配置。             |
+| `-h, --help`        | 无                      | 打印用法。             |
+
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
+
+| 变量                      | 默认值            | 说明             |
+| ----------------------- | -------------- | -------------- |
 | `HEAP_PROFILE_DATA_DIR` | `PerfData/mem` | 最近 trace 搜索目录。 |
-| `PYTHON` | 自动探测 | 指定 Python。 |
+| `PYTHON`                | 自动探测           | 指定 Python。     |
+
 
 ## `heap_analyzer/query_heap_alloc_stacks_by_symbol.py`
 
@@ -537,20 +604,22 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 
 参数说明：
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--trace` | 内置历史路径 | symbolized trace 路径；实际使用建议显式指定或通过 wrapper。 |
-| `--symbol` | `il2cpp::vm::Class::Init` | 调用栈匹配符号子串；配合 `--all-allocations` 时忽略。 |
-| `--all-allocations` | 关闭 | 不按符号过滤，分析全部分配栈。 |
-| `--trace-processor` | 内置默认路径 | trace processor 可执行文件。 |
-| `--limit` | `50` | 终端输出分配栈数量，`0` 表示只输出摘要和文件。 |
-| `--speedscope-out` | 空 | 输出 speedscope JSON；相对路径写入 trace 同级 `heap_analyze/`。 |
-| `--pprof-out` | 空 | 输出 pprof；不带路径时写入 `heap_analyze/native_heap.pprof.pb.gz`。 |
-| `--speedscope-weight` | `positive-net` | `positive-net` 只看正向净分配；`absolute-net` 看净变化绝对值。 |
-| `--classify-config` | 空 | 按 fs.ini 对分配栈分类。 |
-| `--classify-speedscope-dir` | 空 | 每分类输出 speedscope 的目录。 |
-| `--classify-summary-out` | 自动路径 | 分类统计 XLSX 输出路径。 |
-| `--classify-summary-speedscope-out` | 自动路径 | 分类汇总 speedscope 输出路径。 |
+
+| 参数                                  | 默认值                       | 说明                                                       |
+| ----------------------------------- | ------------------------- | -------------------------------------------------------- |
+| `--trace`                           | 内置历史路径                    | symbolized trace 路径；实际使用建议显式指定或通过 wrapper。               |
+| `--symbol`                          | `il2cpp::vm::Class::Init` | 调用栈匹配符号子串；配合 `--all-allocations` 时忽略。                    |
+| `--all-allocations`                 | 关闭                        | 不按符号过滤，分析全部分配栈。                                          |
+| `--trace-processor`                 | 内置默认路径                    | trace processor 可执行文件。                                   |
+| `--limit`                           | `50`                      | 终端输出分配栈数量，`0` 表示只输出摘要和文件。                                |
+| `--speedscope-out`                  | 空                         | 输出 speedscope JSON；相对路径写入 trace 同级 `heap_analyze/`。      |
+| `--pprof-out`                       | 空                         | 输出 pprof；不带路径时写入 `heap_analyze/native_heap.pprof.pb.gz`。 |
+| `--speedscope-weight`               | `positive-net`            | `positive-net` 只看正向净分配；`absolute-net` 看净变化绝对值。           |
+| `--classify-config`                 | 空                         | 按 fs.ini 对分配栈分类。                                         |
+| `--classify-speedscope-dir`         | 空                         | 每分类输出 speedscope 的目录。                                    |
+| `--classify-summary-out`            | 自动路径                      | 分类统计 XLSX 输出路径。                                          |
+| `--classify-summary-speedscope-out` | 自动路径                      | 分类汇总 speedscope 输出路径。                                    |
+
 
 输出：
 
@@ -583,12 +652,14 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 
 参数说明：该文件不是命令行工具，没有 CLI 参数。主要函数参数如下。
 
-| 函数 | 参数 | 说明 |
-| --- | --- | --- |
-| `parse_classification_config(path)` | `path` | 读取 fs.ini 分类配置。 |
-| `classify_items(items, rules, stack_getter)` | `items/rules/stack_getter` | 按规则顺序分类。 |
-| `build_hierarchy_entries(classified, remaining)` | 分类结果 | 生成带父子层级的分类节点。 |
-| `write_xlsx(path, sheets)` | 输出路径和 sheet 数据 | 写出 xlsx。 |
+
+| 函数                                               | 参数                         | 说明              |
+| ------------------------------------------------ | -------------------------- | --------------- |
+| `parse_classification_config(path)`              | `path`                     | 读取 fs.ini 分类配置。 |
+| `classify_items(items, rules, stack_getter)`     | `items/rules/stack_getter` | 按规则顺序分类。        |
+| `build_hierarchy_entries(classified, remaining)` | 分类结果                       | 生成带父子层级的分类节点。   |
+| `write_xlsx(path, sheets)`                       | 输出路径和 sheet 数据             | 写出 xlsx。        |
+
 
 ## `heap_analyzer/heap_alloc_stacks_by_symbol.sql`
 
@@ -644,21 +715,23 @@ MALLOC_SHMEM_SIZE_BYTES=268435456 \
 
 参数说明：该脚本不接收位置参数，使用环境变量配置。
 
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `TOTAL_BYTES` | `1073741824` | demo 计划持有的 malloc 总量。 |
-| `START_DELAY_SECONDS` | `10` | 启动后延迟分配时间。 |
-| `ALLOC_SECONDS` | `60` | 分配持续时间。 |
-| `HOLD_SECONDS` | `20` | 分配完成后保持 live 的时间。 |
-| `DURATION_MS` | `(START_DELAY_SECONDS + ALLOC_SECONDS + 5) * 1000` | Perfetto 采集时长。 |
-| `MALLOC_SAMPLING_INTERVAL_BYTES` | `4096` | heapprofd 采样间隔。 |
-| `MALLOC_SHMEM_SIZE_BYTES` | `268435456` | heapprofd shmem 大小。 |
-| `TRACE_PROCESSOR` | 自动探测 | trace processor。 |
-| `ANDROID_SDK_ROOT` | 自动探测 | Android SDK。 |
-| `ANDROID_NDK_ROOT` | 自动探测 | Android NDK。 |
-| `ANDROID_BUILD_TOOLS` | 自动探测 | build-tools 目录。 |
-| `ANDROID_JAR` | 自动探测 | android.jar。 |
-| `UNITY_ANDROID_ROOT` | Unity 2022.3.62 AndroidPlayer | Windows 默认工具链根目录。 |
+
+| 环境变量                             | 默认值                                                | 说明                    |
+| -------------------------------- | -------------------------------------------------- | --------------------- |
+| `TOTAL_BYTES`                    | `1073741824`                                       | demo 计划持有的 malloc 总量。 |
+| `START_DELAY_SECONDS`            | `10`                                               | 启动后延迟分配时间。            |
+| `ALLOC_SECONDS`                  | `60`                                               | 分配持续时间。               |
+| `HOLD_SECONDS`                   | `20`                                               | 分配完成后保持 live 的时间。     |
+| `DURATION_MS`                    | `(START_DELAY_SECONDS + ALLOC_SECONDS + 5) * 1000` | Perfetto 采集时长。        |
+| `MALLOC_SAMPLING_INTERVAL_BYTES` | `4096`                                             | heapprofd 采样间隔。       |
+| `MALLOC_SHMEM_SIZE_BYTES`        | `268435456`                                        | heapprofd shmem 大小。   |
+| `TRACE_PROCESSOR`                | 自动探测                                               | trace processor。      |
+| `ANDROID_SDK_ROOT`               | 自动探测                                               | Android SDK。          |
+| `ANDROID_NDK_ROOT`               | 自动探测                                               | Android NDK。          |
+| `ANDROID_BUILD_TOOLS`            | 自动探测                                               | build-tools 目录。       |
+| `ANDROID_JAR`                    | 自动探测                                               | android.jar。          |
+| `UNITY_ANDROID_ROOT`             | Unity 2022.3.62 AndroidPlayer                      | Windows 默认工具链根目录。     |
+
 
 输出：
 
@@ -707,14 +780,16 @@ heapprofd.cumulative.live_bytes 接近 demo.expected_live_bytes
 
 环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ANDROID_SDK_ROOT` | 自动探测 | Android SDK。 |
-| `ANDROID_NDK_ROOT` | 自动探测 | Android NDK。 |
-| `ANDROID_BUILD_TOOLS` | 自动探测 | build-tools。 |
-| `ANDROID_JAR` | 自动探测 | android.jar。 |
-| `UNITY_ANDROID_ROOT` | Unity 2022.3.62 AndroidPlayer | Windows 默认工具链根目录。 |
-| `PYTHON` | 自动探测 | 校验脚本使用的 Python。 |
+
+| 变量                    | 默认值                           | 说明                |
+| --------------------- | ----------------------------- | ----------------- |
+| `ANDROID_SDK_ROOT`    | 自动探测                          | Android SDK。      |
+| `ANDROID_NDK_ROOT`    | 自动探测                          | Android NDK。      |
+| `ANDROID_BUILD_TOOLS` | 自动探测                          | build-tools。      |
+| `ANDROID_JAR`         | 自动探测                          | android.jar。      |
+| `UNITY_ANDROID_ROOT`  | Unity 2022.3.62 AndroidPlayer | Windows 默认工具链根目录。 |
+| `PYTHON`              | 自动探测                          | 校验脚本使用的 Python。   |
+
 
 输出：
 
@@ -752,13 +827,15 @@ meminfo_android_demo/build_demo_apk.sh
 
 参数说明：无位置参数，使用工具链环境变量。
 
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ANDROID_SDK_ROOT` | 自动探测 | Android SDK。 |
-| `ANDROID_NDK_ROOT` | 自动探测 | Android NDK。 |
-| `ANDROID_BUILD_TOOLS` | 自动探测 | build-tools。 |
-| `ANDROID_JAR` | 自动探测 | android.jar。 |
-| `UNITY_ANDROID_ROOT` | Unity 2022.3.62 AndroidPlayer | Windows 默认工具链根目录。 |
+
+| 环境变量                  | 默认值                           | 说明                |
+| --------------------- | ----------------------------- | ----------------- |
+| `ANDROID_SDK_ROOT`    | 自动探测                          | Android SDK。      |
+| `ANDROID_NDK_ROOT`    | 自动探测                          | Android NDK。      |
+| `ANDROID_BUILD_TOOLS` | 自动探测                          | build-tools。      |
+| `ANDROID_JAR`         | 自动探测                          | android.jar。      |
+| `UNITY_ANDROID_ROOT`  | Unity 2022.3.62 AndroidPlayer | Windows 默认工具链根目录。 |
+
 
 默认兼容策略：Windows Git Bash 下直接调用 NDK `clang++`、`dx.jar`、`apksigner.jar` 和 JDK `jar`，避免 `.cmd/.bat` 与空格路径问题。
 
@@ -778,10 +855,12 @@ meminfo_android_demo/build_demo_apk.sh
 
 参数说明：
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--baseline` | 必填 | baseline `dumpsys meminfo` 文本。 |
-| `--after` | 必填 | after `dumpsys meminfo` 文本。 |
+
+| 参数           | 默认值 | 说明                             |
+| ------------ | --- | ------------------------------ |
+| `--baseline` | 必填  | baseline `dumpsys meminfo` 文本。 |
+| `--after`    | 必填  | after `dumpsys meminfo` 文本。    |
+
 
 命令：
 
@@ -815,10 +894,12 @@ source fsbootcmd_push_to_phone.sh
 
 可调整项：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `phonePath` | `/data/local/tmp` | 设备端目录，脚本内固定赋值。 |
-| `cfgName` | `FSBootCmdLine.cfg` | 配置文件名，脚本内固定赋值。 |
+
+| 变量          | 默认值                 | 说明             |
+| ----------- | ------------------- | -------------- |
+| `phonePath` | `/data/local/tmp`   | 设备端目录，脚本内固定赋值。 |
+| `cfgName`   | `FSBootCmdLine.cfg` | 配置文件名，脚本内固定赋值。 |
+
 
 ## `pprof.sh`
 
@@ -840,9 +921,11 @@ source fsbootcmd_push_to_phone.sh
 
 参数说明：
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `$@` | 无 | 原样传给 `go tool pprof -http=0.0.0.0:8001`。 |
+
+| 参数   | 默认值 | 说明                                       |
+| ---- | --- | ---------------------------------------- |
+| `$@` | 无   | 原样传给 `go tool pprof -http=0.0.0.0:8001`。 |
+
 
 ## `common_tools.sh`
 
@@ -859,15 +942,17 @@ source fsbootcmd_push_to_phone.sh
 
 参数说明：该文件不是命令行入口，没有位置参数。主要函数参数如下。
 
-| 函数 | 参数 | 默认行为 |
-| --- | --- | --- |
-| `select_python` | 无 | 依次找 `PYTHON`、`python3`、`python`、`py`。 |
+
+| 函数                                                 | 参数           | 默认行为                                                |
+| -------------------------------------------------- | ------------ | --------------------------------------------------- |
+| `select_python`                                    | 无            | 依次找 `PYTHON`、`python3`、`python`、`py`。               |
 | `select_perfetto_tool tool perfetto_root override` | 工具名、根目录、覆盖路径 | 根据 Windows/Linux 优先级选择 trace processor 或 traceconv。 |
-| `select_android_sdk_root` | 无 | 优先环境变量，再回退 Unity AndroidPlayer/SDK。 |
-| `select_android_ndk_root` | 无 | 优先环境变量，再回退 Unity AndroidPlayer/NDK。 |
-| `select_build_tools_dir sdk_root` | SDK 根目录 | 优先 `ANDROID_BUILD_TOOLS`，再找 build-tools。 |
-| `select_android_jar sdk_root` | SDK 根目录 | 优先 `ANDROID_JAR`，再找 android.jar。 |
-| `run_host_tool tool args...` | 工具和参数 | Windows Git Bash 下处理 `.cmd/.bat` 与路径转换。 |
+| `select_android_sdk_root`                          | 无            | 优先环境变量，再回退 Unity AndroidPlayer/SDK。                 |
+| `select_android_ndk_root`                          | 无            | 优先环境变量，再回退 Unity AndroidPlayer/NDK。                 |
+| `select_build_tools_dir sdk_root`                  | SDK 根目录      | 优先 `ANDROID_BUILD_TOOLS`，再找 build-tools。            |
+| `select_android_jar sdk_root`                      | SDK 根目录      | 优先 `ANDROID_JAR`，再找 android.jar。                    |
+| `run_host_tool tool args...`                       | 工具和参数        | Windows Git Bash 下处理 `.cmd/.bat` 与路径转换。             |
+
 
 ## `config.sh`
 
@@ -925,10 +1010,12 @@ python -B -m unittest -v test_mmap_phys_analyzer.py
 
 可选环境变量：
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MMAP_PHYS_TEST_OUTPUT` | 临时目录 | 保留测试生成的 Perfetto JSON。 |
+
+| 变量                                 | 默认值  | 说明                       |
+| ---------------------------------- | ---- | ------------------------ |
+| `MMAP_PHYS_TEST_OUTPUT`            | 临时目录 | 保留测试生成的 Perfetto JSON。   |
 | `MMAP_PHYS_TEST_SPEEDSCOPE_OUTPUT` | 临时目录 | 保留测试生成的 speedscope JSON。 |
+
 
 ### `test_run_mmap_phys_profile.sh`
 

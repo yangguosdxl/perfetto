@@ -4,7 +4,7 @@
 脚本会同时完成三件事：
 1. 启动 Perfetto，采集 mmap/munmap/mremap syscall 和 mmap 调用栈。
 2. 周期性拉取 /proc/<pid>/smaps，作为真实物理内存 PSS/RSS 快照。
-3. 可选调用 mmap_phys_analyzer.py，生成 Perfetto JSON 和 Speedscope 火焰图。
+3. 可选调用 mmap_phys_analyzer.py，生成 Perfetto JSON 和 pprof 数据。
 """
 
 import argparse
@@ -38,6 +38,7 @@ TRACE_HEALTH_STATS = (
     "traced_buf_abi_violations",
     "perf_cpu_lost_records",
     "perf_aux_lost",
+    "perf_samples_skipped_dataloss",
     "ftrace_cpu_overrun_delta",
     "ftrace_cpu_commit_overrun_delta",
     "ftrace_cpu_dropped_events_delta",
@@ -489,6 +490,10 @@ def summarize_trace_health(rows):
               "perf_cpu_lost_records",
               "perf_aux_lost",
           }),
+      "perf_samples_skipped_dataloss":
+          sum_stats({
+              "perf_samples_skipped_dataloss",
+          }),
       "ftrace_data_loss":
           sum_stats({
               "ftrace_cpu_overrun_delta",
@@ -527,6 +532,13 @@ def print_trace_health(summary):
     print(f"  WARN: linux.perf 每 CPU ring buffer 丢样本计数="
           f"{summary['perf_data_loss']}，建议增大 --perf-ring-buffer-pages "
           "或降低采样压力")
+  perf_samples_skipped = int(summary.get("perf_samples_skipped_dataloss", 0))
+  if perf_samples_skipped == 0:
+    print("  OK: traced_perf 内部未报告调用栈 sample 丢失")
+  else:
+    print(f"  WARN: traced_perf 内部调用栈 sample 丢失计数="
+          f"{perf_samples_skipped}，通常表示 reader 到 "
+          "unwinder 队列 load shedding，可降低采样压力或减少展开成本")
 
 
 def check_trace_health(args, trace_path: str):
@@ -575,6 +587,37 @@ def parse_meminfo_summary(text: str):
     elif re.match(r"^TOTAL\s+-?[\d,]+", line) and numbers:
       summary["total_pss_bytes"] = numbers[0] * 1024
   return summary
+
+
+def parse_meminfo_table_rows(text: str):
+  """解析 dumpsys meminfo 主表行；只取能和 smaps 对账的基础列。"""
+  rows = {}
+  for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or ":" in line:
+      continue
+    match = re.search(r"-?[\d,]+", line)
+    if not match:
+      continue
+    name = line[:match.start()].strip()
+    if not name or set(name) <= {"-"}:
+      continue
+    if name not in MEMINFO_MAIN_TABLE_ROW_NAMES:
+      continue
+    numbers = [
+        int(item.replace(",", "")) for item in re.findall(r"-?[\d,]+", line)
+    ]
+    if not numbers:
+      continue
+    item = {
+        "pss_bytes": numbers[0] * 1024,
+    }
+    if len(numbers) >= 5:
+      item["rss_bytes"] = numbers[4] * 1024
+    if name == "Native Heap" and len(numbers) >= 3:
+      item["heap_alloc_bytes"] = numbers[-2] * 1024
+    rows[name] = item
+  return rows
 
 
 def capture_meminfo(name: str, output_dir: str) -> str:
@@ -925,6 +968,389 @@ def query_mmap_summary(trace_processor: str, trace_path: str, pid: int,
   return build_mmap_summary_from_syscalls(syscalls, pid, smaps_dir)
 
 
+SMAPS_MEMINFO_CATEGORY_ORDER = (
+    "Native Heap",
+    "Dalvik Heap",
+    "Stack",
+    "Ashmem",
+    "Other dev",
+    ".so mmap",
+    ".jar mmap",
+    ".apk mmap",
+    ".ttf mmap",
+    ".dex mmap",
+    ".oat mmap",
+    ".art mmap",
+    "Other mmap",
+    "Unknown",
+)
+
+MEMINFO_MAIN_TABLE_EXTRA_ROWS = (
+    "Dalvik Other",
+    "Gfx dev",
+    "EGL mtrack",
+    "GL mtrack",
+    "Other mtrack",
+)
+
+MEMINFO_MAIN_TABLE_ROW_NAMES = (
+    set(SMAPS_MEMINFO_CATEGORY_ORDER) | set(MEMINFO_MAIN_TABLE_EXTRA_ROWS) |
+    {"TOTAL"}
+)
+
+
+def classify_smaps_path_for_meminfo(pathname: str) -> str:
+  """把 smaps pathname 粗分到接近 dumpsys meminfo 主表的类别。"""
+  path = (pathname or "").strip()
+  if not path:
+    return "Unknown"
+  lower = path.lower()
+  if (lower == "[heap]" or lower.startswith("[anon:scudo:") or
+      lower.startswith("[anon:libc_malloc") or "jemalloc" in lower):
+    return "Native Heap"
+  if ".art" in lower:
+    return ".art mmap"
+  if ".oat" in lower:
+    return ".oat mmap"
+  if ".vdex" in lower or ".dex" in lower:
+    return ".dex mmap"
+  if ".so" in lower:
+    return ".so mmap"
+  if ".jar" in lower:
+    return ".jar mmap"
+  if ".apk" in lower:
+    return ".apk mmap"
+  if ".ttf" in lower or ".otf" in lower or ".ttc" in lower:
+    return ".ttf mmap"
+  if lower.startswith("[anon:dalvik") or lower.startswith("[anon:art"):
+    return "Dalvik Heap"
+  if lower.startswith("[stack") or lower.endswith(" stack]"):
+    return "Stack"
+  if "ashmem" in lower:
+    return "Ashmem"
+  if lower.startswith("/dev/") or "dmabuf" in lower:
+    return "Other dev"
+  if lower.startswith("[anon:") or lower.startswith("[anon_shmem:"):
+    return "Unknown"
+  return "Other mmap"
+
+
+def find_latest_smaps_path(smaps_dir: str) -> Optional[str]:
+  """返回时间戳最大的 smaps 文件。"""
+  if not smaps_dir or not os.path.isdir(smaps_dir):
+    return None
+  import mmap_phys_analyzer as analyzer
+
+  candidates = []
+  for root, _, files in os.walk(smaps_dir):
+    for file_name in files:
+      path = os.path.join(root, file_name)
+      try:
+        ts = analyzer.parse_timestamp_from_name(path, "auto")
+      except ValueError:
+        continue
+      candidates.append((ts, path))
+  if not candidates:
+    return None
+  return max(candidates, key=lambda item: item[0])[1]
+
+
+def summarize_smaps_snapshot(smaps_path: str):
+  """按 meminfo 近似类别汇总一份 smaps 快照。"""
+  import mmap_phys_analyzer as analyzer
+
+  categories = {}
+  for vma in analyzer.parse_smaps(smaps_path):
+    name = classify_smaps_path_for_meminfo(vma.pathname)
+    item = categories.setdefault(name, {
+        "name": name,
+        "pss_bytes": 0,
+        "rss_bytes": 0,
+        "virtual_bytes": 0,
+        "private_dirty_bytes": 0,
+        "private_clean_bytes": 0,
+        "shared_dirty_bytes": 0,
+        "shared_clean_bytes": 0,
+        "vma_count": 0,
+    })
+    item["pss_bytes"] += vma.pss_kb * 1024
+    item["rss_bytes"] += vma.rss_kb * 1024
+    item["virtual_bytes"] += max(0, vma.end - vma.start)
+    item["private_dirty_bytes"] += vma.private_dirty_kb * 1024
+    item["private_clean_bytes"] += vma.private_clean_kb * 1024
+    item["shared_dirty_bytes"] += vma.shared_dirty_kb * 1024
+    item["shared_clean_bytes"] += vma.shared_clean_kb * 1024
+    item["vma_count"] += 1
+
+  ordered = sorted(
+      categories.values(),
+      key=lambda item: (-item["pss_bytes"], item["name"]))
+  return {
+      "path":
+          smaps_path,
+      "total_pss_bytes":
+          sum(item["pss_bytes"] for item in ordered),
+      "total_rss_bytes":
+          sum(item["rss_bytes"] for item in ordered),
+      "total_virtual_bytes":
+          sum(item["virtual_bytes"] for item in ordered),
+      "categories":
+          ordered,
+  }
+
+
+def build_smaps_meminfo_categories(smaps_summary, meminfo_rows):
+  smaps_by_name = {
+      item["name"]: item for item in smaps_summary.get("categories", [])
+  } if smaps_summary else {}
+  names = []
+  for name in SMAPS_MEMINFO_CATEGORY_ORDER:
+    if name in smaps_by_name or name in meminfo_rows:
+      names.append(name)
+  for name in sorted(set(smaps_by_name) | set(meminfo_rows)):
+    if name not in names and name != "TOTAL":
+      names.append(name)
+
+  categories = []
+  for name in names:
+    smaps_pss = int(smaps_by_name.get(name, {}).get("pss_bytes", 0))
+    meminfo_pss = int(meminfo_rows.get(name, {}).get("pss_bytes", 0))
+    categories.append({
+        "name": name,
+        "smaps_pss_bytes": smaps_pss,
+        "meminfo_pss_bytes": meminfo_pss,
+        "smaps_minus_meminfo_pss_bytes": smaps_pss - meminfo_pss,
+        "smaps_vma_count": int(smaps_by_name.get(name, {}).get("vma_count", 0)),
+    })
+  return categories
+
+
+def build_memory_health_report(mmap_summary,
+                               meminfo_summary,
+                               meminfo_rows,
+                               trace_health=None,
+                               smaps_dir: Optional[str] = None):
+  validation = build_memory_validation_status(mmap_summary, trace_health)
+  smaps_path = find_latest_smaps_path(smaps_dir) if smaps_dir else None
+  smaps_summary = summarize_smaps_snapshot(smaps_path) if smaps_path else None
+  categories = build_smaps_meminfo_categories(smaps_summary, meminfo_rows)
+  smaps_by_name = {
+      item["name"]: item for item in smaps_summary.get("categories", [])
+  } if smaps_summary else {}
+
+  meminfo_total = int(meminfo_summary.get("total_pss_bytes", 0))
+  smaps_total = int(smaps_summary.get("total_pss_bytes", 0)) if smaps_summary else 0
+  native_heap_smaps = int(smaps_by_name.get("Native Heap", {}).get(
+      "pss_bytes", 0))
+  native_heap_meminfo = int(meminfo_summary.get("native_heap_pss_bytes", 0))
+  health_checks = {
+      "perfetto_trace_buffer": {
+          "status":
+              "pass" if int_value((trace_health or {}).get(
+                  "perfetto_data_loss")) == 0 else "fail",
+          "data_loss":
+              int_value((trace_health or {}).get("perfetto_data_loss")),
+      },
+      "ftrace_kernel_buffer": {
+          "status":
+              "pass" if int_value((trace_health or {}).get(
+                  "ftrace_data_loss")) == 0 else "fail",
+          "data_loss":
+              int_value((trace_health or {}).get("ftrace_data_loss")),
+          "read_events":
+              int_value((trace_health or {}).get("ftrace_read_events")),
+      },
+      "perf_callstack_buffer": {
+          "status":
+              "pass" if int_value((trace_health or {}).get(
+                  "perf_data_loss")) == 0 else "fail",
+          "data_loss":
+              int_value((trace_health or {}).get("perf_data_loss")),
+      },
+      "traced_perf_profiler": {
+          "status":
+              "pass" if int_value((trace_health or {}).get(
+                  "perf_samples_skipped_dataloss")) == 0 else "fail",
+          "data_loss":
+              int_value((trace_health or {}).get(
+                  "perf_samples_skipped_dataloss")),
+      },
+      "mmap_syscalls": {
+          "status":
+              "pass" if int_value(mmap_summary.get("syscall_events")) > 0 else
+              "fail",
+          "events":
+              int_value(mmap_summary.get("syscall_events")),
+          "lifecycle_events":
+              int_value(mmap_summary.get("lifecycle_events")),
+      },
+      "smaps": {
+          "status":
+              "pass" if int_value(mmap_summary.get("smaps_snapshots")) > 0 else
+              "fail",
+          "snapshots":
+              int_value(mmap_summary.get("smaps_snapshots")),
+          "latest_path":
+              smaps_path or "",
+      },
+  }
+  return {
+      "units":
+          "bytes",
+      "health": {
+          "status":
+              validation["status"],
+          "issues":
+              validation["issues"],
+          "checks":
+              health_checks,
+          "explanation": [
+              ("健康状态只说明 mmap syscall events、smaps 快照和 Perfetto "
+               "buffer 在本次采集中是否可用。"),
+              ("mmap PSS 是 mmap 生命周期与 smaps VMA 地址重叠后的总量，"
+               "不是 Android meminfo Native Heap 的同义词。"),
+              ("Native Heap 对齐主要看 smaps 中 Native Heap 类别 "
+               "([anon:scudo:*] 等) 与 dumpsys meminfo Native Heap PSS。"),
+          ],
+      },
+      "alignment": {
+          "mmap_pss_bytes": int_value(mmap_summary.get("pss_bytes")),
+          "smaps": {
+              "latest_path": smaps_path or "",
+              "total_pss_bytes": smaps_total,
+              "total_rss_bytes": int(
+                  smaps_summary.get("total_rss_bytes", 0)
+              ) if smaps_summary else 0,
+          },
+          "meminfo": {
+              "total_pss_bytes": meminfo_total,
+              "native_heap_pss_bytes": native_heap_meminfo,
+              "native_heap_alloc_bytes": int(
+                  meminfo_summary.get("native_heap_alloc_bytes", 0)),
+          },
+          "native_heap": {
+              "smaps_pss_bytes": native_heap_smaps,
+              "meminfo_pss_bytes": native_heap_meminfo,
+              "smaps_minus_meminfo_pss_bytes":
+                  native_heap_smaps - native_heap_meminfo,
+          },
+          "total": {
+              "smaps_pss_bytes": smaps_total,
+              "meminfo_total_pss_bytes": meminfo_total,
+              "smaps_minus_meminfo_total_pss_bytes":
+                  smaps_total - meminfo_total,
+              "note":
+                  ("smaps 总 PSS 不包含 memtrack HAL 上报的 GL/EGL mtrack 等"
+                   "非 VMA 口径，通常不要求等于 meminfo TOTAL PSS。"),
+          },
+          "categories":
+              categories,
+      },
+  }
+
+
+def markdown_cell(value) -> str:
+  return str(value).replace("\n", " ").replace("|", "\\|")
+
+
+def markdown_table(headers, rows) -> list[str]:
+  lines = [
+      "| " + " | ".join(markdown_cell(header) for header in headers) + " |",
+      "| " + " | ".join("---" for _ in headers) + " |",
+  ]
+  for row in rows:
+    lines.append("| " + " | ".join(markdown_cell(cell) for cell in row) + " |")
+  return lines
+
+
+def build_memory_health_report_markdown(report) -> str:
+  health = report["health"]
+  checks = health["checks"]
+  alignment = report["alignment"]
+  native = alignment["native_heap"]
+  ranked = sorted(
+      alignment["categories"],
+      key=lambda item: abs(item["smaps_pss_bytes"]) + abs(
+          item["meminfo_pss_bytes"]),
+      reverse=True)
+  lines = [
+      "# mmap 健康报告",
+      "",
+      "## 1. 健康说明",
+      "",
+  ]
+  lines.extend(
+      markdown_table(("项目", "值"), (("status", health["status"]),
+                                  ("issues", ", ".join(health["issues"]) or
+                                   "none"))))
+  lines.extend(["", "### 采集检查", ""])
+  lines.extend(
+      markdown_table((
+          "检查项",
+          "状态",
+          "数据",
+      ), (
+          ("Perfetto trace buffer", checks["perfetto_trace_buffer"]["status"],
+           f"data_loss={checks['perfetto_trace_buffer']['data_loss']}"),
+          ("ftrace kernel buffer", checks["ftrace_kernel_buffer"]["status"],
+           "data_loss={data_loss}, read_events={read_events}".format(
+               **checks["ftrace_kernel_buffer"])),
+          ("linux.perf callstack buffer",
+           checks["perf_callstack_buffer"]["status"],
+           f"data_loss={checks['perf_callstack_buffer']['data_loss']}"),
+          ("traced_perf profiler", checks["traced_perf_profiler"]["status"],
+           f"data_loss={checks['traced_perf_profiler']['data_loss']}"),
+          ("mmap syscalls", checks["mmap_syscalls"]["status"],
+           "events={events}, lifecycle={lifecycle_events}".format(
+               **checks["mmap_syscalls"])),
+          ("smaps", checks["smaps"]["status"],
+           "snapshots={snapshots}, latest={latest_path}".format(
+               **checks["smaps"])),
+      )))
+  lines.extend(["", "### 说明", ""])
+  for item in health.get("explanation", []):
+    lines.append(f"- {item}")
+
+  lines.extend(["", "## 2. smaps 与 meminfo 对齐", ""])
+  lines.extend(
+      markdown_table(("指标", "值"), (
+          ("latest smaps", alignment["smaps"]["latest_path"] or "-"),
+          ("mmap PSS", format_mib(alignment["mmap_pss_bytes"])),
+          ("smaps total PSS", format_mib(alignment["smaps"]["total_pss_bytes"])),
+          ("smaps total RSS", format_mib(alignment["smaps"]["total_rss_bytes"])),
+          ("meminfo TOTAL PSS",
+           format_mib(alignment["meminfo"]["total_pss_bytes"])),
+          ("Native Heap smaps PSS", format_mib(native["smaps_pss_bytes"])),
+          ("Native Heap meminfo PSS", format_mib(native["meminfo_pss_bytes"])),
+          ("Native Heap delta",
+           format_mib(native["smaps_minus_meminfo_pss_bytes"])),
+          ("smaps - meminfo TOTAL",
+           format_mib(alignment["total"]
+                      ["smaps_minus_meminfo_total_pss_bytes"])),
+      )))
+  lines.extend(["", "### smaps 分类", ""])
+  lines.extend(
+      markdown_table((
+          "类别",
+          "smaps PSS",
+          "meminfo PSS",
+          "delta",
+          "VMA 数",
+      ), [(
+          item["name"],
+          format_mib(item["smaps_pss_bytes"]),
+          format_mib(item["meminfo_pss_bytes"]),
+          format_mib(item["smaps_minus_meminfo_pss_bytes"]),
+          item["smaps_vma_count"],
+      ) for item in ranked]))
+  lines.extend(["", f"> {alignment['total']['note']}"])
+  return "\n".join(lines) + "\n"
+
+
+def print_memory_health_report(report):
+  print(build_memory_health_report_markdown(report), end="")
+
+
 def build_memory_validation_status(mmap_summary, trace_health):
   issues = []
   if int_value(mmap_summary.get("smaps_snapshots")) > 0 and int_value(
@@ -937,6 +1363,8 @@ def build_memory_validation_status(mmap_summary, trace_health):
       issues.append("ftrace_data_loss")
     if int_value(trace_health.get("perf_data_loss")) > 0:
       issues.append("perf_data_loss")
+    if int_value(trace_health.get("perf_samples_skipped_dataloss")) > 0:
+      issues.append("perf_samples_skipped_dataloss")
   return {
       "status": "fail" if issues else "pass",
       "issues": issues,
@@ -946,9 +1374,18 @@ def build_memory_validation_status(mmap_summary, trace_health):
 def write_memory_validation_report(output_dir: str,
                                    mmap_summary,
                                    meminfo_path: str,
-                                   trace_health=None) -> str:
+                                   trace_health=None,
+                                   smaps_dir: Optional[str] = None) -> str:
   with open(meminfo_path, "r", encoding="utf-8") as fd:
-    meminfo = parse_meminfo_summary(fd.read())
+    meminfo_text = fd.read()
+  meminfo = parse_meminfo_summary(meminfo_text)
+  meminfo_rows = parse_meminfo_table_rows(meminfo_text)
+  health_report = build_memory_health_report(
+      mmap_summary,
+      meminfo,
+      meminfo_rows,
+      trace_health=trace_health,
+      smaps_dir=smaps_dir)
   report = {
       "units": "bytes",
       "note": ("验证只检查 mmap syscall events + smaps 的采集健康；"
@@ -958,11 +1395,19 @@ def write_memory_validation_report(output_dir: str,
       "validation": build_memory_validation_status(mmap_summary, trace_health),
       "meminfo": meminfo,
       "comparison": {},
+      "health_report": health_report,
       "sources": {
           "meminfo": meminfo_path,
           "mmap": "mmap syscall events + smaps",
       },
   }
+  health_path = os.path.join(output_dir, "mmap_health_report.json")
+  with open(health_path, "w", encoding="utf-8") as fd:
+    json.dump(health_report, fd, ensure_ascii=False, indent=2)
+    fd.write("\n")
+  health_md_path = os.path.join(output_dir, "mmap_health_report.md")
+  with open(health_md_path, "w", encoding="utf-8") as fd:
+    fd.write(build_memory_health_report_markdown(health_report))
   path = os.path.join(output_dir, "memory_validation.json")
   with open(path, "w", encoding="utf-8") as fd:
     json.dump(report, fd, ensure_ascii=False, indent=2)
@@ -975,6 +1420,9 @@ def write_memory_validation_report(output_dir: str,
   if report["validation"]["issues"]:
     print("  validation issues: " + ", ".join(report["validation"]["issues"]))
   print(f"验证报告已保存: {path}")
+  print_memory_health_report(health_report)
+  print(f"健康报告已保存: {health_md_path}")
+  print(f"健康报告 JSON 已保存: {health_path}")
   return path
 
 
@@ -1007,8 +1455,12 @@ def collect_memory_validation(args,
     print("跳过 meminfo 对比：采样结束后未成功保存 dumpsys meminfo", file=sys.stderr)
     return {"trace_health": trace_health, "report_path": ""}
 
-  report_path = write_memory_validation_report(args.output, mmap_summary,
-                                               meminfo_path, trace_health)
+  report_path = write_memory_validation_report(
+      args.output,
+      mmap_summary,
+      meminfo_path,
+      trace_health,
+      smaps_dir=os.path.join(args.output, "smaps"))
   return {"trace_health": trace_health, "report_path": report_path}
 
 
@@ -1032,13 +1484,17 @@ def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
       str(pid),
       "--output",
       os.path.join(args.output, "mmap_phys_attribution.json"),
-      "--speedscope-output",
-      os.path.join(args.output, "mmap_phys_attribution.speedscope.json"),
+      "--pprof-output",
+      os.path.join(args.output, "mmap_phys_attribution.pprof.pb.gz"),
   ]
   if args.trace_processor:
     cmd.extend(["--trace-processor", args.trace_processor])
   if getattr(args, "classify_config", None):
     cmd.extend(["--classify-config", args.classify_config])
+    cmd.extend(
+        ["--classify-summary-pprof-out",
+         "mmap_classification_summary.pprof.pb.gz"])
+    cmd.extend(["--classify-pprof-dir", "pprof_categories"])
   top_n = getattr(args, "top_n", None)
   if top_n is not None:
     cmd.extend(["--top-n", str(top_n)])

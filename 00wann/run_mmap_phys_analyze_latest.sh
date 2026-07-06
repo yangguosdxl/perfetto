@@ -17,6 +17,7 @@ usage() {
 
 常用覆盖:
   MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
+  ./run_mmap_phys_analyze_latest.sh --latestdir PerfData/mmap_phys/<时间戳> --pid 1234
   ./run_mmap_phys_analyze_latest.sh --pid 1234 --top-n 25
   ./run_mmap_phys_analyze_latest.sh --trace <trace> --smaps-dir <smaps> --pid <pid>
 EOF
@@ -69,6 +70,60 @@ has_arg() {
   done
   return 1
 }
+
+is_native_windows_python() {
+  local python_bin=$1
+  if ! is_windows_git_bash; then
+    return 1
+  fi
+  case "$python_bin" in
+    /usr/bin/*|/bin/*)
+      return 1
+      ;;
+    /[a-zA-Z]/*|[a-zA-Z]:*|*.exe|*.EXE)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+python_absolute_path_arg() {
+  local python_bin=$1
+  local path=$2
+  if [[ "$path" == /* ]] && is_native_windows_python "$python_bin" && command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+latest_dir_override=
+analyzer_args=()
+while (($#)); do
+  case "$1" in
+    --latestdir)
+      shift
+      if (($# == 0)) || [[ "$1" == --* ]]; then
+        echo "FATAL: --latestdir 需要目录参数" >&2
+        exit 1
+      fi
+      latest_dir_override=$1
+      shift
+      ;;
+    --latestdir=*)
+      latest_dir_override=${1#*=}
+      if [[ -z "$latest_dir_override" ]]; then
+        echo "FATAL: --latestdir 需要目录参数" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    *)
+      analyzer_args+=("$1")
+      shift
+      ;;
+  esac
+done
 
 find_latest_capture_dir() {
   local data_dir=${MMAP_PHYS_DATA_DIR:-PerfData/mmap_phys}
@@ -144,33 +199,48 @@ SQL
       }'
 }
 
-latest_dir=$(find_latest_capture_dir || true)
+if [[ -n "$latest_dir_override" ]]; then
+  latest_dir=$latest_dir_override
+  if [[ ! -d "$latest_dir" ]]; then
+    echo "FATAL: --latestdir 指定目录不存在: $latest_dir" >&2
+    exit 1
+  fi
+  if [[ ! -d "$latest_dir/smaps" ]]; then
+    echo "FATAL: --latestdir 指定目录缺少 smaps: $latest_dir/smaps" >&2
+    exit 1
+  fi
+else
+  latest_dir=$(find_latest_capture_dir || true)
+fi
 if [[ -z "$latest_dir" ]]; then
   echo "FATAL: 找不到可分析的 mmap 采集目录: ${MMAP_PHYS_DATA_DIR:-PerfData/mmap_phys}" >&2
   exit 1
 fi
 
-latest_trace=$(select_trace_path "$latest_dir")
+if ! latest_trace=$(select_trace_path "$latest_dir"); then
+  echo "FATAL: mmap 采集目录缺少 trace: $latest_dir" >&2
+  exit 1
+fi
 latest_smaps_dir="$latest_dir/smaps"
 latest_output="$latest_dir/mmap_phys_attribution.json"
-latest_speedscope_output="$latest_dir/mmap_phys_attribution.speedscope.json"
+latest_pprof_output="$latest_dir/mmap_phys_attribution.pprof.pb.gz"
 
 trace_processor=${TRACE_PROCESSOR:-}
 if [[ -z "$trace_processor" && -n "${PerfettoRoot:-}" ]]; then
   trace_processor=$(select_perfetto_tool trace_processor_shell "$PerfettoRoot" "" || true)
 fi
-user_trace_processor=$(get_arg_value "--trace-processor" "$@" || true)
+user_trace_processor=$(get_arg_value "--trace-processor" "${analyzer_args[@]}" || true)
 if [[ -n "$user_trace_processor" ]]; then
   trace_processor="$user_trace_processor"
 fi
 
-effective_trace=$(get_arg_value "--trace" "$@" || true)
+effective_trace=$(get_arg_value "--trace" "${analyzer_args[@]}" || true)
 if [[ -z "$effective_trace" ]]; then
   effective_trace="$latest_trace"
 fi
 
 auto_pid=
-if ! has_arg "--pid" "$@"; then
+if ! has_arg "--pid" "${analyzer_args[@]}"; then
   app=${MMAP_PHYS_APP:-com.tencent.dhwdxkty.trunk.profiler}
   if [[ -z "$trace_processor" || ! -x "$trace_processor" ]]; then
     echo "FATAL: 未传 --pid，且找不到可执行 trace_processor_shell: ${trace_processor:-<empty>}" >&2
@@ -186,8 +256,15 @@ if ! has_arg "--pid" "$@"; then
   fi
 fi
 
+python_bin=$(select_python)
+analyzer_path=$(python_absolute_path_arg "$python_bin" "$script_dir/mmap_phys_analyzer.py")
+trace_processor_for_python=$trace_processor
+if [[ -n "$trace_processor_for_python" ]]; then
+  trace_processor_for_python=$(python_absolute_path_arg "$python_bin" "$trace_processor_for_python")
+fi
+
 cmd=(
-  "$(select_python)" -u -B "$script_dir/mmap_phys_analyzer.py"
+  "$python_bin" -u -B "$analyzer_path"
   --trace "$latest_trace"
   --smaps-dir "$latest_smaps_dir"
 )
@@ -196,16 +273,17 @@ if [[ -n "$auto_pid" ]]; then
 fi
 cmd+=(
   --output "$latest_output"
-  --speedscope-output "$latest_speedscope_output"
+  --pprof-output "$latest_pprof_output"
 )
-if [[ -n "$trace_processor" ]]; then
-  cmd+=(--trace-processor "$trace_processor")
+if [[ -n "$trace_processor_for_python" ]]; then
+  cmd+=(--trace-processor "$trace_processor_for_python")
 fi
 cmd+=(
   --classify-config heap_analyzer/fs.ini
-  --classify-speedscope-dir mmap_categories
+  --classify-summary-pprof-out mmap_classification_summary.pprof.pb.gz
+  --classify-pprof-dir pprof_categories
   --top-n 0
-  "$@"
+  "${analyzer_args[@]}"
 )
 
 echo "最近 mmap 目录: $latest_dir"

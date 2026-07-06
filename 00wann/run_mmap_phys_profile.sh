@@ -9,7 +9,11 @@ export PERFETTO_SYMBOLIZER_MODE=index
 export PERFETTO_BINARY_PATH='./workspace/allsymbols/arm64-v8a'
 source config.sh
 source common_tools.sh
-export PATH="$PerfettoRoot/buildtools/linux64/clang/bin:$PATH"
+if is_windows_git_bash; then
+  export PATH="$PerfettoRoot/buildtools/win/clang/bin:$PerfettoRoot/buildtools/linux64/clang/bin:$PATH"
+else
+  export PATH="$PerfettoRoot/buildtools/linux64/clang/bin:$PATH"
+fi
 
 app=${MMAP_PHYS_APP:-com.tencent.dhwdxkty.trunk.profiler}
 python_bin=$(select_python)
@@ -19,7 +23,11 @@ traceconv=$(select_perfetto_tool traceconv "$PerfettoRoot" "${TRACECONV:-}" || t
 default_analyzer_args=(--classify-config heap_analyzer/fs.ini --top-n 0)
 
 source fsbootcmd_push_to_phone.sh
-adb push debugconfig.txt /sdcard/Android/data/$app/files
+if [[ "$app" == "com.fs.t.prf" || "$app" == "com.tencent.dhwdxkty.trunk.profiler" ]]; then
+  adb push debugconfig.txt /sdcard/Android/data/$app/files
+else
+  echo "跳过 FS debugconfig push: $app"
+fi
 
 "$python_bin" collect_mmap_phys_data.py \
   --name "$app" \

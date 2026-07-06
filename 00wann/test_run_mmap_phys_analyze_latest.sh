@@ -27,7 +27,15 @@ cat >"$tmpdir/bin/python3" <<'EOF'
 set -euo pipefail
 printf 'python3 %s\n' "$*" >>"${TEST_LOG:?}"
 EOF
-chmod +x "$tmpdir/perfetto/out/linux_clang_release/trace_processor_shell" "$tmpdir/bin/python3"
+cat >"$tmpdir/bin/python.exe" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'python.exe %s\n' "$*" >>"${TEST_LOG:?}"
+EOF
+chmod +x \
+  "$tmpdir/perfetto/out/linux_clang_release/trace_processor_shell" \
+  "$tmpdir/bin/python3" \
+  "$tmpdir/bin/python.exe"
 
 mkdir -p \
   "$tmpdir/PerfData/mmap_phys/2026-06-05_10-08-27/smaps" \
@@ -70,8 +78,24 @@ if ! grep -Fq -- "--classify-config heap_analyzer/fs.ini" "$TEST_LOG"; then
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq -- "--classify-speedscope-dir mmap_categories" "$TEST_LOG"; then
-  echo "wrapper 应默认输出每个分类的 speedscope 文件"
+if ! grep -Fq -- "--pprof-output PerfData/mmap_phys/2026-06-05_17-40-36/mmap_phys_attribution.pprof.pb.gz" "$TEST_LOG"; then
+  echo "wrapper 应默认输出 mmap pprof 文件"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq -- "--classify-pprof-dir pprof_categories" "$TEST_LOG"; then
+  echo "wrapper 应默认输出每个分类的 pprof 文件"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq -- "--classify-summary-pprof-out mmap_classification_summary.pprof.pb.gz" "$TEST_LOG"; then
+  echo "wrapper 应默认输出分类汇总 pprof 文件"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if grep -Fq -- "--speedscope-output" "$TEST_LOG" ||
+    grep -Fq -- "--classify-speedscope-dir" "$TEST_LOG"; then
+  echo "wrapper 默认不应再输出 speedscope 文件"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -107,4 +131,47 @@ if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_10-08-27/mmap_trace.perf
   echo "用户显式 --trace 应追加在默认 trace 之后以覆盖默认值"
   cat "$TEST_LOG"
   exit 1
+fi
+
+: >"$TEST_LOG"
+./run_mmap_phys_analyze_latest.sh \
+  --latestdir PerfData/mmap_phys/2026-06-05_10-08-27 \
+  --pid 1357 >"$tmpdir/latestdir.out"
+
+if ! grep -Fq -- "最近 mmap 目录: PerfData/mmap_phys/2026-06-05_10-08-27" "$tmpdir/latestdir.out"; then
+  echo "--latestdir 应覆盖最终 latest_dir"
+  cat "$tmpdir/latestdir.out"
+  exit 1
+fi
+if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_10-08-27/mmap_trace.perfetto-trace" "$TEST_LOG"; then
+  echo "--latestdir 应使用指定目录中的 trace"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq -- "--smaps-dir PerfData/mmap_phys/2026-06-05_10-08-27/smaps" "$TEST_LOG"; then
+  echo "--latestdir 应使用指定目录中的 smaps"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if grep -Fq -- "--latestdir" "$TEST_LOG"; then
+  echo "--latestdir 是 wrapper 参数，不应透传给 analyzer"
+  cat "$TEST_LOG"
+  exit 1
+fi
+
+if command -v cygpath >/dev/null 2>&1; then
+  : >"$TEST_LOG"
+  PYTHON=python.exe ./run_mmap_phys_analyze_latest.sh --pid 1357 >"$tmpdir/native_python.out"
+  expected_analyzer_path=$(cygpath -w "$tmpdir/mmap_phys_analyzer.py")
+  if ! grep -Fq -- "python.exe -u -B $expected_analyzer_path" "$TEST_LOG"; then
+    echo "native Windows python.exe should receive mmap_phys_analyzer.py as a Windows path"
+    cat "$TEST_LOG"
+    exit 1
+  fi
+  expected_trace_processor_path=$(cygpath -w "$tmpdir/perfetto/out/linux_clang_release/trace_processor_shell")
+  if ! grep -Fq -- "--trace-processor $expected_trace_processor_path" "$TEST_LOG"; then
+    echo "native Windows python.exe should receive trace_processor as a Windows path"
+    cat "$TEST_LOG"
+    exit 1
+  fi
 fi

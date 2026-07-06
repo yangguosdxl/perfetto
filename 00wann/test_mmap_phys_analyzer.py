@@ -4,6 +4,7 @@
 import json
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -49,6 +50,35 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       rows = analyzer.run_tp_query("fake-tp", "fake-trace", "select 1")
 
     self.assertEqual(rows, [{"ts": "214992732002882", "utid": "7"}])
+
+  def test_write_mmap_pprof_outputs_go_pprof_readable_profile(self):
+    """mmap pprof 输出应能被 go tool pprof 读取，并保留调用栈和 PSS 口径。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      output_path = os.path.join(tmpdir, "mmap_phys_attribution.pprof.pb.gz")
+      analyzer.write_mmap_pprof(output_path, [{
+          "stack_id": 7,
+          "stack": ["AllocateByMmap [libgame.so]", "GameInit [libgame.so]"],
+          "pss_bytes": 12 * 1024,
+          "rss_bytes": 16 * 1024,
+          "virtual_bytes": 32 * 1024,
+          "private_dirty_bytes": 8 * 1024,
+          "private_clean_bytes": 4 * 1024,
+          "shared_dirty_bytes": 2 * 1024,
+          "shared_clean_bytes": 1 * 1024,
+          "range_count": 3,
+      }], "mmap pprof test")
+
+      result = subprocess.run(
+          ["go", "tool", "pprof", "-raw", output_path],
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+          text=True,
+          check=False)
+
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn("pss_bytes", result.stdout)
+    self.assertIn("AllocateByMmap [libgame.so]", result.stdout)
+    self.assertIn("GameInit [libgame.so]", result.stdout)
 
   def test_collector_csv_parser_strips_appended_trace_processor_log(self):
     """trace_processor 日志贴到 CSV 行尾时，也不能污染字段值。"""
@@ -202,6 +232,44 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       self.assertEqual(calls[0][0], ["traceconv", "symbolize", raw_trace])
       self.assertEqual(calls[0][1]["env"]["PERFETTO_BINARY_PATH"], "/symbols")
 
+  def test_trace_health_includes_traced_perf_internal_dataloss(self):
+    """traced_perf 内部 enqueue 丢样应进入调用栈健康检查。"""
+    self.assertIn("perf_samples_skipped_dataloss", collector.TRACE_HEALTH_STATS)
+    rows = [
+        {
+            "name": "perf_samples_skipped_dataloss",
+            "idx": "",
+            "value": "2078",
+        },
+        {
+            "name": "perf_cpu_lost_records",
+            "idx": "0",
+            "value": "0",
+        },
+    ]
+
+    summary = collector.summarize_trace_health(rows)
+
+    self.assertEqual(summary["perf_data_loss"], 0)
+    self.assertEqual(summary["perf_samples_skipped_dataloss"], 2078)
+
+  def test_memory_validation_fails_on_traced_perf_internal_dataloss(self):
+    """调用栈采样内部丢样应让健康状态失败，避免主功能漏报。"""
+    status = collector.build_memory_validation_status(
+        {
+            "syscall_events": 1,
+            "smaps_snapshots": 1,
+        },
+        {
+            "perfetto_data_loss": 0,
+            "ftrace_data_loss": 0,
+            "perf_data_loss": 0,
+            "perf_samples_skipped_dataloss": 2078,
+        })
+
+    self.assertEqual(status["status"], "fail")
+    self.assertIn("perf_samples_skipped_dataloss", status["issues"])
+
   def test_perfetto_config_collects_raw_syscall_enter_and_exit(self):
     """采集 mmap 归因必须同时拿到 syscall 参数和返回值。"""
     config = collector.build_perfetto_config(
@@ -221,7 +289,6 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("ring_buffer_pages: 4096", config)
     self.assertIn("ring_buffer_read_period_ms: 100", config)
-
 
   def test_perfetto_config_default_perf_ring_buffer_matches_fs_startup(self):
     """默认 mmap 调用栈采样使用 FS 启动场景实测无丢样配置。"""
@@ -361,6 +428,15 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn("heap_analyzer/fs.ini", cmd)
     self.assertIn("--top-n", cmd)
     self.assertIn("0", cmd)
+    self.assertIn("--pprof-output", cmd)
+    self.assertIn(os.path.join(tmpdir, "mmap_phys_attribution.pprof.pb.gz"),
+                  cmd)
+    self.assertIn("--classify-summary-pprof-out", cmd)
+    self.assertIn("mmap_classification_summary.pprof.pb.gz", cmd)
+    self.assertIn("--classify-pprof-dir", cmd)
+    self.assertIn("pprof_categories", cmd)
+    self.assertNotIn("--speedscope-output", cmd)
+    self.assertNotIn("--classify-speedscope-dir", cmd)
 
   def test_collect_cli_no_longer_exposes_malloc_collection(self):
     """mmap 采集脚本不再暴露 malloc/heapprofd 采集参数。"""
@@ -854,6 +930,137 @@ TOTAL SWAP PSS: 7,000K
     self.assertEqual(summary["native_heap_pss_bytes"], 12000 * 1024)
     self.assertEqual(summary["native_heap_alloc_bytes"], 32000 * 1024)
     self.assertEqual(summary["total_pss_bytes"], 50000 * 1024)
+
+  def test_parse_dumpsys_meminfo_table_rows(self):
+    """健康报告需要按 dumpsys meminfo 主表行对齐 smaps 分类。"""
+    text = """
+Applications Memory Usage (in Kilobytes):
+Uptime: 17752662 Realtime: 24252356
+** MEMINFO in pid 27959 [com.example.meminfodemo] **
+  Native Heap   861733   861668        0        0   865884   973924   868955    95606
+ Dalvik Other     6660     1392        0        0    12560
+     .so mmap   105159    11600    85980        0   178848
+    GL mtrack     4232     4232        0        0     4232
+      Unknown   444950   444700      240        0   446116
+        TOTAL  1870560  1659564   186700        0  2049392  1002631   873086   120182
+ App Summary
+           Java Heap:     8876                          39984
+ TOTAL PSS:  1870560
+"""
+
+    rows = collector.parse_meminfo_table_rows(text)
+
+    self.assertNotIn("** MEMINFO in pid", rows)
+    self.assertNotIn("Java Heap", rows)
+    self.assertEqual(rows["Native Heap"]["pss_bytes"], 861733 * 1024)
+    self.assertEqual(rows["Dalvik Other"]["pss_bytes"], 6660 * 1024)
+    self.assertEqual(rows[".so mmap"]["pss_bytes"], 105159 * 1024)
+    self.assertEqual(rows["GL mtrack"]["pss_bytes"], 4232 * 1024)
+    self.assertEqual(rows["Unknown"]["pss_bytes"], 444950 * 1024)
+    self.assertEqual(rows["TOTAL"]["rss_bytes"], 2049392 * 1024)
+
+  def test_smaps_snapshot_is_classified_for_meminfo_alignment(self):
+    """最后一份 smaps 应按接近 meminfo 主表的类别汇总。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      smaps_path = os.path.join(tmpdir, "2000.smaps")
+      with open(smaps_path, "w", encoding="utf-8") as fd:
+        fd.write("""1000-2000 rw-p 00000000 00:00 0 [anon:scudo:primary]
+Rss:                  12 kB
+Pss:                  12 kB
+Private_Dirty:        12 kB
+2000-3000 r-xp 00000000 00:00 0 /data/app/libfoo.so
+Rss:                   8 kB
+Pss:                   8 kB
+Private_Clean:         8 kB
+3000-4000 rw-p 00000000 00:00 0
+Rss:                   4 kB
+Pss:                   4 kB
+Private_Dirty:         4 kB
+4000-5000 rw-p 00000000 00:00 0 /dev/mali0
+Rss:                   6 kB
+Pss:                   6 kB
+Private_Dirty:         6 kB
+""")
+
+      summary = collector.summarize_smaps_snapshot(smaps_path)
+
+    by_name = {item["name"]: item for item in summary["categories"]}
+    self.assertEqual(summary["total_pss_bytes"], 30 * 1024)
+    self.assertEqual(by_name["Native Heap"]["pss_bytes"], 12 * 1024)
+    self.assertEqual(by_name[".so mmap"]["pss_bytes"], 8 * 1024)
+    self.assertEqual(by_name["Unknown"]["pss_bytes"], 4 * 1024)
+    self.assertEqual(by_name["Other dev"]["pss_bytes"], 6 * 1024)
+
+  def test_memory_validation_writes_health_report_with_smaps_alignment(self):
+    """采集结束报告应包含健康说明、smaps 分类和 meminfo 对齐差值。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      smaps_dir = os.path.join(tmpdir, "smaps")
+      os.mkdir(smaps_dir)
+      smaps_path = os.path.join(smaps_dir, "2000.smaps")
+      with open(smaps_path, "w", encoding="utf-8") as fd:
+        fd.write("""1000-2000 rw-p 00000000 00:00 0 [anon:scudo:primary]
+Rss:                  12 kB
+Pss:                  12 kB
+Private_Dirty:        12 kB
+2000-3000 r-xp 00000000 00:00 0 /data/app/libfoo.so
+Rss:                   8 kB
+Pss:                   8 kB
+Private_Clean:         8 kB
+""")
+      meminfo_path = os.path.join(tmpdir, "dumpsys_meminfo.txt")
+      with open(meminfo_path, "w", encoding="utf-8") as fd:
+        fd.write("""  Native Heap       12       12        0        0       16       12        4
+     .so mmap        7        0        7        0        8
+        TOTAL       30       12        7        0       40       12        4
+""")
+
+      out = io.StringIO()
+      with mock.patch.object(sys, "stdout", out):
+        report_path = collector.write_memory_validation_report(
+            output_dir=tmpdir,
+            mmap_summary={
+                "pss_bytes": 20 * 1024,
+                "rss_bytes": 20 * 1024,
+                "virtual_bytes": 8192,
+                "syscall_events": 2,
+                "smaps_snapshots": 1,
+            },
+            meminfo_path=meminfo_path,
+            trace_health={
+                "perfetto_data_loss": 0,
+                "ftrace_data_loss": 0,
+                "perf_data_loss": 0,
+            },
+            smaps_dir=smaps_dir)
+
+      with open(report_path, "r", encoding="utf-8") as fd:
+        report = json.load(fd)
+      health_path = os.path.join(tmpdir, "mmap_health_report.json")
+      with open(health_path, "r", encoding="utf-8") as fd:
+        health_file = json.load(fd)
+      health_md_path = os.path.join(tmpdir, "mmap_health_report.md")
+      with open(health_md_path, "r", encoding="utf-8") as fd:
+        health_md = fd.read()
+
+    self.assertEqual(report["health_report"]["health"]["status"], "pass")
+    self.assertEqual(health_file["alignment"]["smaps"]["latest_path"],
+                     smaps_path)
+    self.assertIn("# mmap 健康报告", health_md)
+    self.assertIn("| 检查项 | 状态 | 数据 |", health_md)
+    self.assertIn("| 类别 | smaps PSS | meminfo PSS | delta | VMA 数 |",
+                  health_md)
+    self.assertIn("| Native Heap |", health_md)
+    self.assertIn("| .so mmap |", health_md)
+    self.assertIn("| 检查项 | 状态 | 数据 |", out.getvalue())
+    self.assertEqual(
+        report["health_report"]["alignment"]["native_heap"]
+        ["smaps_minus_meminfo_pss_bytes"], 0)
+    category_names = [
+        item["name"]
+        for item in report["health_report"]["alignment"]["categories"]
+    ]
+    self.assertIn("Native Heap", category_names)
+    self.assertIn(".so mmap", category_names)
 
   def test_query_mmap_validation_syscalls_does_not_read_callstacks(self):
     """mmap 验证只查目标进程 raw syscall，不读取 mmap 调用栈。"""

@@ -6,13 +6,13 @@
 哪个 mmap 调用栈，最终占用了多少真实物理内存？
 ```
 
-它不是只统计 mmap 的虚拟地址大小，而是把 Perfetto 中采到的 mmap 调用栈、mmap/munmap/mremap 生命周期，以及 `/proc/<pid>/smaps` 中的 PSS/RSS 快照做地址重叠归因，最终输出 Perfetto UI 和 Speedscope 可加载的 JSON。
+它不是只统计 mmap 的虚拟地址大小，而是把 Perfetto 中采到的 mmap 调用栈、mmap/munmap/mremap 生命周期，以及 `/proc/<pid>/smaps` 中的 PSS/RSS 快照做地址重叠归因，最终输出 Perfetto UI 可加载的 JSON 和 go tool pprof 可加载的数据。
 
 默认入口同时采集 `mmap` 调用栈和 `libc.malloc` Native heap profile。本文把两个用途明确分开：
 
 ```text
 主功能
-  -> 采 mmap 调用栈，输出 mmap 物理内存归因 JSON 和 Speedscope 火焰图。
+  -> 采 mmap 调用栈，输出 mmap 物理内存归因 JSON 和 pprof 数据。
 
 验证模式
   -> 不采 mmap 调用栈，只做无栈 mmap 事件健康检查。
@@ -76,15 +76,22 @@ test_mmap_phys_analyzer.py
 --classify-config heap_analyzer/fs.ini --top-n 0
 ```
 
-因此默认结果会启用 `fs.ini` 分类，并让普通 Perfetto JSON / 默认 Speedscope 也保留全部
+因此默认结果会启用 `fs.ini` 分类，并让普通 Perfetto JSON / 默认 pprof 也保留全部
 mmap 调用栈。显式传入新的 `--classify-config` 或 `--top-n` 时，用户参数会排在默认值
 之后生效，只改变本次运行的输出口径。
 
-默认目标进程：
+默认目标进程来自 `MMAP_PHYS_APP`。当前 `config.sh` 默认值为：
 
 ```text
-com.tencent.dhwdxkty.trunk.profiler
+com.fs.t.prf
 ```
+
+命令行前缀里的 `MMAP_PHYS_APP=...` 会覆盖 `config.sh` 默认值；如果没有任何配置，
+脚本内部回退到 `com.tencent.dhwdxkty.trunk.profiler`。
+
+`run_mmap_phys_profile.sh` 只会在目标包是 `com.fs.t.prf` 或
+`com.tencent.dhwdxkty.trunk.profiler` 时向应用外部目录推送 FS 专用
+`debugconfig.txt`；demo/其他包会跳过该步骤，避免 Android/data 权限阻塞无栈验证。
 
 默认 trace processor：
 
@@ -136,20 +143,23 @@ mmap_phys_analyzer.py
 mmap_phys_attribution.json
   -> Perfetto UI 可加载的 mmap 调用栈物理内存归因结果。
 
-mmap_phys_attribution.speedscope.json
-  -> Speedscope 可加载的 mmap PSS 火焰图。
+mmap_phys_attribution.pprof.pb.gz
+  -> go tool pprof 可加载的 mmap PSS/RSS/virtual 调用栈数据。
 
 mmap_classification_summary.xlsx
   -> 默认 fs.ini 分类生成的 PSS/RSS/virtual 汇总表。
 
-mmap_classification_summary.speedscope.json
-  -> 默认 fs.ini 分类生成的分类汇总 Speedscope 火焰图。
+mmap_classification_summary.pprof.pb.gz
+  -> 默认 fs.ini 分类生成的分类汇总 pprof 数据。
+
+pprof_categories/*.pprof.pb.gz
+  -> 默认 fs.ini 分类生成的每分类 mmap 调用栈 pprof 数据。
 
 memory_validation.json
   -> 随采集生成的验证报告；只作为量级校验，不是主功能结果。
 ```
 
-主功能必须优先看 `mmap_phys_attribution.json` 和 Speedscope 火焰图。`memory_validation.json` 不能替代调用栈归因。
+主功能必须优先看 `mmap_phys_attribution.json` 和 pprof 数据。`memory_validation.json` 不能替代调用栈归因。
 
 ## 验证模式：无栈 mmap 事件健康校验
 
@@ -184,6 +194,14 @@ PerfData/mmap_phys/<时间戳>/
 memory_validation.json
   -> mmap 事件健康状态、mmap PSS 汇总和 meminfo 快照参考。
 
+mmap_health_report.md
+  -> 采集结束后写出的 Markdown 健康报告；同样会打印到终端。
+  -> 优先用表格展示 Perfetto/ftrace/perf 丢数说明、mmap syscall/smaps
+     健康状态、最后一份 smaps 与 dumpsys meminfo 主表的分类对齐。
+
+mmap_health_report.json
+  -> 与 Markdown 健康报告同源的机器可读 JSON。
+
 dumpsys_meminfo.txt
   -> adb shell dumpsys meminfo <package> 原始输出。
 
@@ -191,7 +209,7 @@ mmap_trace.perfetto-trace 和 smaps/
   -> 验证报告的原始输入。
 ```
 
-验证模式不会生成新的 `mmap_phys_attribution.json` 和 `mmap_phys_attribution.speedscope.json`，因为当前运行没有采集 mmap 调用栈。它适合回答“无栈 mmap 事件是否能采到、smaps 是否能汇总”，不适合回答“哪个调用栈占了物理内存”，也不再回答“malloc live 是否接近 Native Heap Alloc”。
+验证模式不会生成新的 `mmap_phys_attribution.json`、`mmap_phys_attribution.pprof.pb.gz` 或 `mmap_phys_attribution.speedscope.json`，因为当前运行没有采集 mmap 调用栈。它适合回答“无栈 mmap 事件是否能采到、smaps 是否能汇总”，不适合回答“哪个调用栈占了物理内存”，也不再回答“malloc live 是否接近 Native Heap Alloc”。
 
 ## 常用参数
 
@@ -282,12 +300,117 @@ data_sources {
 }
 ```
 
-
 当前默认 `ring_buffer_pages: 32768`、`ring_buffer_read_period_ms: 25` 来自 FS
 启动 mmap 调用栈采样实测无 `perf_cpu_lost_records` 的配置。该 buffer 是每 CPU
 4 KiB 页数，主要用于吸收启动期 mmap tracepoint 的短时峰值；如果
 `memory_validation.json` 中 `trace_health.perf_data_loss` 非 0，先检查
 linux.perf ring buffer，不要优先增大 Perfetto 全局 `--buffer-kb`。
+
+### traced_perf 内部 perf sample 丢失口径
+
+`trace_health.perf_data_loss` 和 `trace_health.perf_samples_skipped_dataloss`
+是两个不同层级的丢样：
+
+```text
+perf_data_loss
+  -> trace_processor stats: perf_cpu_lost_records
+  -> kernel per-cpu perf ring buffer overrun
+  -> 处理方向：增大 ring_buffer_pages，缩短 ring_buffer_read_period_ms，或降低采样输入。
+
+perf_samples_skipped_dataloss
+  -> trace_processor stats: perf_samples_skipped_dataloss
+  -> traced_perf 内部 reader 到 unwinder 队列阶段 load shedding
+  -> 处理方向：降低单条样本展开成本、削平 reader 批量输入、提高 unwinder 队列上限，
+     或降低调用栈采样压力。
+```
+
+主功能 mmap 调用栈采样在 Perfetto 内部的大致位置如下：
+
+```text
+raw_syscalls:sys_enter id == 222
+  -> kernel 产生 perf sample
+  -> 写入每 CPU perf ring buffer
+  -> traced_perf reader 按 ring_buffer_read_period_ms 读取 ring buffer
+  -> reader 把包含 pid/tid、timestamp、cpu、用户栈/内核栈 payload 的 sample
+     放入 unwinder queue
+  -> unwinder 展开调用栈，写出带 callsite_id 的 PerfSample
+  -> trace_processor 导入 __intrinsic_perf_sample.callsite_id 和 stack_profile 表
+  -> mmap_phys_analyzer.py 用 mmap enter 附近的 callsite_id 做 mmap 物理归因
+```
+
+`PROFILER_SKIP_UNWIND_ENQUEUE` 有两个来源：一是 traced_perf 判断 unwinder queue
+中已排队样本的 footprint 超过 `max_enqueued_footprint_kb` 派生的字节阈值；二是
+unwinder queue 已满，reader 申请写入槽位失败。trace_processor 导入该 marker 后
+递增 `perf_samples_skipped_dataloss`。这表示 kernel ring buffer 可能已经成功被读取，
+但该 sample 没有进入调用栈展开阶段，因此不会产生可供 mmap 归因使用的
+`callsite_id`。
+
+当前 `collect_mmap_phys_data.py` 生成的 Perfetto 配置没有设置
+`max_enqueued_footprint_kb`。Perfetto 源码中未设置时会按 `0` 计算
+`max_enqueued_footprint_bytes`，而 `perf_producer.cc` 只有在该值非 0 时才执行
+footprint 阈值检查。因此当前配置下该阈值等价于关闭；看到
+`perf_samples_skipped_dataloss` 时，更可能是 unwinder queue 写入失败/队列满。
+
+输入输出可以按下面理解：
+
+```text
+输入：
+  perf sample(timestamp、pid/tid、cpu、raw stack payload、tracepoint counter)
+
+成功输出：
+  __intrinsic_perf_sample.callsite_id
+  stack_profile_callsite / stack_profile_frame / stack_profile_symbol
+
+失败输出：
+  sample_skipped_reason = PROFILER_SKIP_UNWIND_ENQUEUE
+  trace_processor stats.perf_samples_skipped_dataloss += 1
+  没有可用于 mmap stack attribution 的 callsite_id
+```
+
+当前分析器只读取 `__intrinsic_perf_sample` 中 `callsite_id IS NOT NULL` 的行，并在
+mmap enter 附近匹配最近 sample；缺失 callsite 的 mmap 不会进入最终调用栈归因。
+因此 `perf_samples_skipped_dataloss` 非 0 时，主功能健康检查会失败，归因结果不应
+作为最终结论。
+
+Perfetto 源码依据（路径相对 Perfetto 根目录）：
+
+```text
+src/trace_processor/storage/stats.h
+  -> perf_cpu_lost_records: kernel buffer overrun，建议降低采样频率或增大 ring_buffer_pages。
+  -> perf_samples_skipped_dataloss: profiler(traced_perf) 内部丢样，常见原因是 load shedding。
+
+src/profiling/perf/perf_producer.cc
+  -> max_enqueued_footprint_bytes 非 0 且超过 footprint 上限时 EmitSkippedSample(..., kUnwindEnqueue)。
+  -> unwinder queue BeginWrite 失败时也 EmitSkippedSample(..., kUnwindEnqueue)。
+  -> kUnwindEnqueue 写成 PerfSample::PROFILER_SKIP_UNWIND_ENQUEUE。
+
+src/trace_processor/importers/proto/profile_module.cc
+  -> PROFILER_SKIP_UNWIND_ENQUEUE 导入为 stats.perf_samples_skipped_dataloss。
+
+protos/perfetto/config/profiling/perf_event_config.proto
+  -> ring_buffer_pages / ring_buffer_read_period_ms 控制 kernel ring buffer。
+  -> max_enqueued_footprint_kb 控制 unwinder queue footprint 上限。
+
+src/profiling/perf/event_config.cc
+  -> ring_buffer_read_period_ms 参与每次读取 tick 的 sample limit 估算。
+  -> max_enqueued_footprint_kb 转换成 max_enqueued_footprint_bytes；未设置时为 0。
+```
+
+调参顺序：
+
+1. 如果 `perf_data_loss` 非 0，先调 kernel perf ring buffer：保持
+   `ring_buffer_pages` 为 2 的幂，按 `8192/100ms -> 16384/50ms -> 32768/50ms
+   -> 32768/25ms` 递进。
+2. 如果 `perf_data_loss=0` 但 `perf_samples_skipped_dataloss` 非 0，说明问题已不在
+   kernel ring buffer。先加 `--no-kernel-frames`，减少每条 sample 的栈 payload 和
+   unwinder 成本；mmap 归因通常主要依赖用户态栈。
+3. 如果仍非 0，可在 `--no-kernel-frames` 的基础上尝试更短的
+   `--perf-ring-buffer-read-period-ms 10`，用更频繁读取削平 reader 批量入队峰值；这会
+   增加 traced_perf 唤醒和 CPU 开销，必须复查目标场景影响。
+4. 如果仍非 0，说明 unwinder 持续跟不上输入。当前 `max_enqueued_footprint_kb` 未设置，
+   等价于 `0`，不会触发 footprint 阈值丢样；新增这个旋钮并调大不能解决当前队列满路径。
+5. 最后的手段是降低采样压力。当前配置 `period: 1` 表示每次 mmap enter 都尝试取栈；
+   降低采样频率会改变“每个 mmap 都尽量归因”的语义，只能在接受归因完整性下降时使用。
 
 ### `raw_syscalls` 与 `syscall_events` 的区别
 
@@ -366,17 +489,17 @@ smaps/
 mmap_phys_attribution.json
   -> 主功能输出：Perfetto UI 可加载的 Chrome JSON trace。
 
-mmap_phys_attribution.speedscope.json
-  -> 主功能输出：Speedscope 可加载的火焰图 JSON。
+mmap_phys_attribution.pprof.pb.gz
+  -> 主功能输出：go tool pprof 可加载的 mmap PSS/RSS/virtual 调用栈数据。
 
 mmap_classification_summary.xlsx
   -> 传 --classify-config 时生成：按 fs.ini 层级分类的 PSS/RSS 汇总表。
 
-mmap_classification_summary.speedscope.json
-  -> 传 --classify-config 时生成：分类汇总 Speedscope 火焰图。
+mmap_classification_summary.pprof.pb.gz
+  -> 传 --classify-summary-pprof-out 时生成：分类汇总 pprof 数据。
 
-mmap_categories/
-  -> 传 --classify-speedscope-dir mmap_categories 时生成：每分类 mmap 调用栈火焰图。
+pprof_categories/
+  -> 传 --classify-pprof-dir pprof_categories 时生成：每分类 mmap 调用栈 pprof 数据。
 
 dumpsys_meminfo.txt
   -> `adb shell dumpsys meminfo <package>` 原始输出。
@@ -404,6 +527,18 @@ dumpsys_meminfo.txt
 
 memory_validation.json
   -> 验证模式主输出：mmap 事件健康报告和 meminfo 快照参考。
+
+mmap_health_report.md
+  -> 终端“mmap 健康报告”的 Markdown 版本，便于人工阅读和归档。
+  -> 健康检查、smaps/meminfo 对齐和 smaps 分类优先使用 Markdown 表格。
+
+mmap_health_report.json
+  -> 终端“mmap 健康报告”的 JSON 版本，便于脚本读取。
+  -> `alignment.categories` 按接近 Android meminfo 主表的类别汇总最后一份
+     smaps：Native Heap、Dalvik Heap、Stack、Ashmem、Other dev、
+     .so/.jar/.apk/.ttf/.dex/.oat/.art mmap、Other mmap、Unknown。
+  -> meminfo 侧只解析主表行；`** MEMINFO in pid ...` 标题、`App Summary`
+     和 `TOTAL PSS:` 摘要行不进入逐类对齐。
 ```
 
 实际验证过的输出示例：
@@ -414,9 +549,11 @@ memory_validation.json
   mmap_trace.perfetto-trace
   smaps/
   mmap_phys_attribution.json
-  mmap_phys_attribution.speedscope.json
+  mmap_phys_attribution.pprof.pb.gz
   dumpsys_meminfo.txt
   memory_validation.json
+  mmap_health_report.md
+  mmap_health_report.json
 ```
 
 ## smaps 提取 mmap 物理占用逻辑
@@ -696,7 +833,7 @@ load_snapshots(smaps_dir)
 2. 如果只要“最新物理内存占用”，理论上只需要最后一个 smaps 快照。
    做法是先把 mmap/munmap/mremap 生命周期推进到最后一个 snapshot.ts，
    得到该时刻仍 live 的 mmap ranges，再与最后一个 smaps VMA 做地址重叠。
-   这就是 metadata.final_summary 和默认 Speedscope 的最终口径。
+   这就是 metadata.final_summary 和默认 pprof 的最终口径。
 
 3. 当前实现仍会按时间从早到晚处理每个快照。
    对每个 snapshot.ts，只先应用 event.ts <= snapshot.ts 的 mmap/munmap/mremap
@@ -707,9 +844,9 @@ load_snapshots(smaps_dir)
    多个周期的重叠计算服务于时间线展示、增长/回落观察和采集健康诊断，
    不是把最终物理占用算出来的必要条件。
 
-5. final_summary 和默认 Speedscope 使用最后一个 smaps 快照。
+5. final_summary 和默认 pprof 使用最后一个 smaps 快照。
    build_chrome_trace() 每处理一个快照都会更新 final_stats，循环结束后用最终
-   final_stats 生成 metadata.final_summary 和 Speedscope。
+   final_stats 生成 metadata.final_summary 和 pprof 数据。
 
 6. memory_validation.json 的无栈 mmap 汇总也使用相同推进逻辑。
    它会遍历所有快照，但最终报告的 mmap.pss_bytes 来自最后一个快照的 final_stats。
@@ -741,7 +878,7 @@ smaps snapshots:
 输出：
   Perfetto counter 会有 S1/S2/S3/S4 四个时刻。
   metadata.final_summary 使用 S4 的归因结果。
-  Speedscope 权重也使用 S4 的 pss_bytes。
+  pprof 的 pss_bytes 也使用 S4 的 pss_bytes。
 ```
 
 对每个 smaps 快照，分析器按时间推进 live ranges：
@@ -939,7 +1076,7 @@ vma.start <= range.start < vma.end
 
 这个兜底用于避免“有 mmap 返回地址但没有 length”时完全丢失物理归因。它比有限
 长度 range 粗糙：同一 VMA 内多个未知长度 mmap 会按候选数量和重叠权重分摊，
-不会让 Speedscope 总 PSS 超过 smaps 原始 PSS，但调用栈粒度会受 VMA 合并影响。
+不会让 pprof 总 PSS 超过 smaps 原始 PSS，但调用栈粒度会受 VMA 合并影响。
 
 ### 输出和 top_n 的关系
 
@@ -969,10 +1106,10 @@ total mmap PSS/RSS
 等价于分类数据源内部强制使用 `--top-n 0`。因此：
 
 ```text
-普通 Perfetto JSON / 默认 Speedscope
+普通 Perfetto JSON
   -> 仍受 --top-n 控制，避免输出过大。
 
-分类 summary / 分类 Speedscope
+pprof 和分类 summary
   -> 使用全量调用栈 summary，不受 --top-n 截断。
   -> 只要最终快照中有该调用栈，分类统计就会覆盖到。
 ```
@@ -1006,17 +1143,17 @@ sum(metadata.final_summary[].pss_bytes)
   <= 最终快照 total mmap PSS/RSS counter 中的 pss_bytes
   <= 同一 smaps 文件原始 PSS 总和
 
-Speedscope sum(weights)
+pprof pss_bytes 总量
   <= sum(metadata.final_summary[].pss_bytes)
 ```
 
-如果 Speedscope 或 final_summary 的 PSS 大于同一快照原始 smaps PSS，优先怀疑
+如果 pprof 或 final_summary 的 PSS 大于同一快照原始 smaps PSS，优先怀疑
 同一 VMA 被多个调用栈重复归因，或使用了不匹配的 smaps 快照和 trace 时间轴。
 
 ## 多周期归因结果怎么看
 
-多周期归因结果主要看 `mmap_phys_attribution.json`，不要用默认 Speedscope 判断
-增长/回落过程。默认 Speedscope 使用最后一个 smaps 快照的 `pss_bytes` 生成火焰图，
+多周期归因结果主要看 `mmap_phys_attribution.json`，不要用 pprof 判断
+增长/回落过程。pprof 使用最后一个 smaps 快照的 `pss_bytes` 生成调用树数据，
 适合看最终时刻“哪个调用栈占得最多”；Perfetto JSON 里的 counter 才能看每个
 smaps 周期的变化。
 
@@ -1237,32 +1374,34 @@ stack
   -> 完整 mmap 调用栈。
 ```
 
-### Speedscope 火焰图
+### pprof 数据
 
 打开：
 
 ```text
-PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json
+PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.pprof.pb.gz
 ```
 
-加载到：
+加载方式：
 
-```text
-https://www.speedscope.app/
+```bash
+go tool pprof -http=0.0.0.0:8001 PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.pprof.pb.gz
 ```
 
-火焰图权重单位是 bytes，当前按 `pss_bytes` 输出。也就是说，PSS 为 0 的 mmap 调用栈不会出现在 Speedscope 权重中，但仍会保留在 Perfetto JSON 的 `metadata.final_summary` 里。
+pprof 默认 sample type 是 `pss_bytes`，同时写入 `rss_bytes`、`virtual_bytes`、`private_dirty_bytes`、`private_clean_bytes`、`shared_dirty_bytes`、`shared_clean_bytes` 和 `range_count`。PSS 为 0 且其他 sample 也为 0 的 mmap 调用栈不会进入 pprof，但仍会保留在 Perfetto JSON 的 `metadata.final_summary` 里。
 
 校验口径：
 
 ```text
-Speedscope total_weight
+pprof pss_bytes 总量
   <= metadata.final_summary 中的 PSS 汇总
   <= Perfetto JSON 里的 total mmap PSS/RSS counter
   <= 同一 smaps 快照的原始总 PSS
 ```
 
-如果 Speedscope 总权重大于目标进程 smaps 原始 PSS，说明归因重复计数，不能把该火焰图当作物理内存结果。
+如果 pprof `pss_bytes` 总量大于目标进程 smaps 原始 PSS，说明归因重复计数，不能把该 pprof 当作物理内存结果。
+
+Speedscope 仍可作为手动可选输出；需要时显式传 `--speedscope-output`，分类火焰图显式传 `--classify-summary-speedscope-out` 或 `--classify-speedscope-dir`。
 
 ### fs.ini 分类输出
 
@@ -1290,13 +1429,14 @@ python -u -B mmap_phys_analyzer.py \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
-  --speedscope-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json \
+  --pprof-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.pprof.pb.gz \
   --classify-config heap_analyzer/fs.ini \
-  --classify-speedscope-dir mmap_categories \
+  --classify-summary-pprof-out mmap_classification_summary.pprof.pb.gz \
+  --classify-pprof-dir pprof_categories \
   --top-n 50
 ```
 
-上例中普通 JSON 和默认 Speedscope 只保留前 50 个调用栈；分类输出仍使用全量最终
+上例中普通 JSON 只保留前 50 个调用栈；分类输出和 pprof 仍使用全量最终
 summary，相当于分类口径使用 `--top-n 0`。
 
 分类输出文件：
@@ -1307,13 +1447,13 @@ mmap_classification_summary.xlsx
   -> Summary sheet 输出全量、classified_total、remaining 的 PSS/RSS/virtual 汇总。
   -> Tree sheet 按 fs.ini 的 / 层级输出父分类、叶子分类和 remaining。
 
-mmap_classification_summary.speedscope.json
-  -> 默认写到 --output 同级目录。
-  -> 每个叶子分类和 remaining 作为一个 sample，权重是 pss_bytes。
+mmap_classification_summary.pprof.pb.gz
+  -> 传 --classify-summary-pprof-out 时写到 --output 同级目录。
+  -> 每个叶子分类和 remaining 作为一个 sample，默认 sample type 是 pss_bytes。
 
-mmap_categories/*.speedscope.json
-  -> 只有传 --classify-speedscope-dir 时生成。
-  -> 每个分类叶子、父分类和 remaining 各输出一个 mmap 调用栈火焰图。
+pprof_categories/*.pprof.pb.gz
+  -> 只有传 --classify-pprof-dir 时生成。
+  -> 每个分类叶子、父分类和 remaining 各输出一个 mmap 调用栈 pprof。
 ```
 
 可选路径参数：
@@ -1327,11 +1467,17 @@ mmap_categories/*.speedscope.json
 
 --classify-speedscope-dir
   -> 指定每分类 speedscope 目录；相对路径写到 --output 同级目录。
+
+--classify-summary-pprof-out
+  -> 指定分类汇总 pprof 路径；相对路径写到 --output 同级目录。
+
+--classify-pprof-dir
+  -> 指定每分类 pprof 目录；相对路径写到 --output 同级目录。
 ```
 
 分类主指标仍是 `pss_bytes`。`rss_bytes`、`virtual_bytes`、
 `private_dirty_bytes`、`private_clean_bytes`、`shared_dirty_bytes` 和
-`shared_clean_bytes` 会一起写入 xlsx，便于和原始 smaps 口径对账。
+`shared_clean_bytes` 会一起写入 xlsx 和 pprof，便于和原始 smaps 口径对账。
 
 ### 验证报告 memory_validation.json
 
@@ -1339,14 +1485,18 @@ mmap_categories/*.speedscope.json
 
 ```text
 PerfData/mmap_phys/<时间戳>/memory_validation.json
+PerfData/mmap_phys/<时间戳>/mmap_health_report.md
+PerfData/mmap_phys/<时间戳>/mmap_health_report.json
 ```
 
-验证报告属于“验证模式”口径，用于回答：
+`memory_validation.json` 保留原始验证字段；`mmap_health_report.md` 是同一批输入生成的
+终端 Markdown 健康报告，`mmap_health_report.json` 保留机器可读版本。验证报告属于“验证模式”口径，用于回答：
 
 ```text
 无栈 mmap syscall 事件是否可采；
 smaps 是否能与无栈 mmap 生命周期汇总出最终 PSS；
 dumpsys meminfo 是否已在采样结束后保存为同一轮验证的参考快照。
+最后一份 smaps 按接近 meminfo 主表的类别汇总后，与 meminfo 是否同量级。
 ```
 
 验证流程：
@@ -1359,6 +1509,11 @@ sys_mmap / sys_munmap / sys_mremap
 dumpsys meminfo
   -> 解析 Native Heap PSS / Native Heap Alloc / TOTAL PSS
   -> 采样结束后立即获取，后续 trace 健康检查和离线分析只复用这个文件
+
+最后一份 smaps
+  -> 按 pathname 粗分为 Native Heap、Dalvik Heap、Stack、Ashmem、Other dev、
+     .so/.jar/.apk/.ttf/.dex/.oat/.art mmap、Other mmap、Unknown
+  -> 与 dumpsys meminfo 主表同名行做 PSS 对齐，输出 delta
 ```
 
 关键字段：
@@ -1370,19 +1525,27 @@ mmap.pss_bytes
 meminfo.native_heap_alloc_bytes
   -> dumpsys meminfo Native Heap 的 Heap Alloc；无栈验证只记录该快照字段，不与 malloc live 对比。
 
-trace_health.heapprofd_data_loss
-  -> 来自 trace_processor stats 中的 heapprofd_buffer_overran /
-     heapprofd_missing_packet / heapprofd_non_finalized_profile 汇总。
-  -> 无栈验证不启用 heapprofd，正常不会出现该问题；如果主功能启用 heapprofd 时大于 0，
-     表示 malloc profile 数据不完整，脚本会在终端输出 WARN。
+health_report.health.checks
+  -> Perfetto 顶层 trace buffer、ftrace 内核 buffer、linux.perf callstack buffer、
+     traced_perf profiler、mmap syscall events 和 smaps 快照的 pass/fail 说明。
 
-trace_health.heapprofd_errors
-  -> 来自 trace_processor stats 中的 heapprofd_client_error 汇总。
-  -> 无栈验证不启用 heapprofd，正常不会出现该问题；主功能启用 heapprofd 时大于 0
-     会在 validation.issues 中写入 heapprofd_errors。
+trace_health.perf_samples_skipped_dataloss
+  -> traced_perf 内部调用栈 sample 丢失数；来自 trace_processor stats 中的
+     perf_samples_skipped_dataloss。
+  -> 非 0 表示调用栈归因可能缺样，主功能结果不应作为最终结论。
+
+health_report.alignment.native_heap
+  -> smaps Native Heap 类 VMA 与 meminfo Native Heap PSS 的对齐结果。
+  -> smaps 侧主要来自 [anon:scudo:*]、[heap]、[anon:libc_malloc*] 等 VMA。
+
+health_report.alignment.categories
+  -> 最后一份 smaps 与 dumpsys meminfo 主表的逐类 PSS 对齐。
+  -> meminfo 侧只接受主表行名，避免把 pid、Uptime 或 App Summary 摘要误当分类。
+  -> mmap PSS 是 mmap 生命周期与 smaps VMA 地址重叠后的总量；它不是
+     meminfo Native Heap PSS 的同义词，正常不要求两者相等。
 ```
 
-注意：验证报告是测试口径，主要看 mmap 事件健康和 smaps 汇总是否可用。它不提供调用栈归因，也不替代 `mmap_phys_attribution.json` 和 Speedscope 火焰图。
+注意：验证报告是测试口径，主要看 mmap 事件健康和 smaps 汇总是否可用。它不提供调用栈归因，也不替代 `mmap_phys_attribution.json` 和 pprof 数据。`mmap_health_report.md/json` 中的 smaps 分类是为了和 meminfo 对账，不是 Android framework `dumpsys meminfo` 的源码级复刻；GL/EGL mtrack 等 memtrack HAL 数据通常不在 smaps VMA 总 PSS 内。
 
 ## 独立 heapprofd malloc APK demo
 
@@ -1451,17 +1614,30 @@ PerfData/mmap_phys/<最近时间戳>/
   -> 读取 smaps/
   -> 未传 --pid 时，按 MMAP_PHYS_APP 从 trace 中查询目标 pid
   -> 输出 mmap_phys_attribution.json
-  -> 输出 mmap_phys_attribution.speedscope.json
+  -> 输出 mmap_phys_attribution.pprof.pb.gz
   -> 输出 mmap_classification_summary.xlsx
-  -> 输出 mmap_classification_summary.speedscope.json
-  -> 输出 mmap_categories/*.speedscope.json
+  -> 输出 mmap_classification_summary.pprof.pb.gz
+  -> 输出 pprof_categories/*.pprof.pb.gz
 ```
+
+需要重跑某个历史采集目录时，可以用 `--latestdir` 指定 wrapper 的 latest dir：
+
+```bash
+./run_mmap_phys_analyze_latest.sh \
+  --latestdir PerfData/mmap_phys/<时间戳> \
+  --pid 1234
+```
+
+`--latestdir` 只由包装脚本消费，不会透传给 `mmap_phys_analyzer.py`。指定目录必须存在，且目录下必须有 `smaps/`，trace 仍按 `symbolized-trace` 优先、缺失时回退 `mmap_trace.perfetto-trace`。
+
+在 Git Bash/MSYS 下如果 `select_python` 选中 Windows 原生 Python，包装脚本会把传给 Python 的绝对脚本路径和 `trace_processor` 路径转换为 Windows 路径，避免 `/d/...` 被 Windows Python 按当前盘解释成 `D:\d\...`。
 
 默认追加给 `mmap_phys_analyzer.py` 的参数：
 
 ```bash
 --classify-config heap_analyzer/fs.ini \
---classify-speedscope-dir mmap_categories \
+--classify-summary-pprof-out mmap_classification_summary.pprof.pb.gz \
+--classify-pprof-dir pprof_categories \
 --top-n 0
 ```
 
@@ -1485,7 +1661,7 @@ python -u -B mmap_phys_analyzer.py \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <目标 pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
-  --speedscope-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.speedscope.json \
+  --pprof-output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.pprof.pb.gz \
   --trace-processor $PerfettoRoot/out/linux_clang_release/trace_processor_shell
 ```
 
@@ -1506,6 +1682,25 @@ mmap/munmap/mremap syscall 和 `stats` 健康信息，不读取
 这样 `libil2cpp.so` 等业务 so 才能按 `workspace/allsymbols/arm64-v8a`
 中的符号文件解析。
 
+Windows 下还需要保证 `traceconv.exe` 能启动同工具链目录里的
+`llvm-symbolizer.exe`。`PERFETTO_BINARY_PATH` 只告诉 Perfetto 去哪里找带符号
+so；如果 `PATH` 缺少 `PerfettoRoot/buildtools/win/clang/bin`，`traceconv
+symbolize` 可能仍会生成 `module_symbols.address_symbols.address`，但没有
+`address_symbols.lines.function_name`。Perfetto 导入这类 symbols packet 时不会写入
+`stack_profile_symbol`，pprof 侧就只能看到地址、导出空分类，或者把
+`libil2cpp.so` 归到粗粒度的 `il2cpp/other`。`run_mmap_phys_profile.sh` 在
+Windows Git Bash 下会自动补这个 `PATH`；如果手动重跑符号化，需要同步设置。
+
+判断这个问题时可以先看两处：
+
+```bash
+trace_processor_shell symbolized-trace -q "select count(*) from stack_profile_symbol"
+traceconv text symbols | grep -A20 'libil2cpp.so'
+```
+
+如果第一条为 0，第二条只有 `address:` 而没有 `function_name:`，说明符号文件路径或
+`llvm-symbolizer.exe` 启动环境仍不完整。
+
 离线分析阶段再复用 Native heap 符号查询脚本的性能思路：
 
 ```text
@@ -1522,7 +1717,7 @@ Python 内存中展开 stack_profile_callsite parent 链和 inline frame
         |
         v
 优先使用 frame.symbol_set_id -> stack_profile_symbol.name 作为 UI 一致符号名，
-每个 inline 符号作为独立 frame 输出到 Speedscope
+每个 inline 符号作为独立 frame 输出到 pprof 和可选 Speedscope
 ```
 
 这样避免在 trace_processor SQL 里递归展开调用栈；同时 syscall 查询不会先全量扫描
@@ -1553,13 +1748,17 @@ bash test_run_mmap_phys_analyze_latest.sh
 10. mmap 验证 SQL 不读取调用栈表，也不读取 heap_profile_allocation。
 11. memory_validation.json 会输出 mmap 事件健康状态，不输出 malloc/native heap 口径校验。
 12. 默认采集时长是 75000 ms，且 dumpsys meminfo 早于 trace 健康检查和离线分析保存。
-13. 主分析 syscall 查询会先按目标 pid 缩小 ftrace 事件，再扫描 args。
-14. mmap 主分析会按 heap_profile.py 风格把 `traceconv symbolize` 的符号包拼成 `symbolized-trace`。
-15. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
-16. smaps 文件名中的设备 uptime ns 不会在 auto 模式下被误判为 ms，避免 Chrome JSON 时间戳溢出。
-17. Chrome JSON counter 事件只输出数值 args，字符串详情放到 instant details 事件，避免 Perfetto 导入时报 `json_parser_failure`。
-18. run_mmap_phys_profile.sh 默认启用 `--classify-config heap_analyzer/fs.ini --top-n 0`，采集脚本会把这两个参数转交给离线分析器。
-19. run_mmap_phys_analyze_latest.sh 默认选择最近的 `symbolized-trace`，自动查询 pid，并允许用户参数覆盖默认输出口径。
+13. mmap_health_report.md 会以 Markdown 表格输出健康说明、最后一份 smaps 分类，以及 smaps 与 meminfo 主表 PSS 对齐；mmap_health_report.json 保留机器可读版本。
+14. memory_validation.json 会把 traced_perf 内部 `perf_samples_skipped_dataloss` 纳入 trace_health 和 validation.issues。
+15. 主分析 syscall 查询会先按目标 pid 缩小 ftrace 事件，再扫描 args。
+16. mmap 主分析会按 heap_profile.py 风格把 `traceconv symbolize` 的符号包拼成 `symbolized-trace`。
+17. mmap 调用栈展示优先使用 `stack_profile_symbol.name`，并把 inline 符号拆成独立 frame。
+18. smaps 文件名中的设备 uptime ns 不会在 auto 模式下被误判为 ms，避免 Chrome JSON 时间戳溢出。
+19. Chrome JSON counter 事件只输出数值 args，字符串详情放到 instant details 事件，避免 Perfetto 导入时报 `json_parser_failure`。
+20. run_mmap_phys_profile.sh 默认启用 `--classify-config heap_analyzer/fs.ini --top-n 0`，采集脚本会把这两个参数转交给离线分析器，并默认生成 pprof 数据。
+21. run_mmap_phys_analyze_latest.sh 默认选择最近的 `symbolized-trace`，自动查询 pid，默认生成 pprof 数据，并允许用户参数覆盖默认输出口径。
+22. mmap 调用栈采样默认 linux.perf ring buffer 为 `32768/25ms`，并允许显式参数覆盖。
+23. Windows Git Bash 下 run_mmap_phys_profile.sh 会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，避免 `traceconv.exe` 找不到 `llvm-symbolizer.exe` 导致 `libil2cpp.so` 只有地址、没有函数符号。
 ```
 
 保留单元测试落盘输出：
@@ -1589,18 +1788,25 @@ syscall events: 99220
 lifecycle events: 19
 smaps snapshots: 21
 写入: PerfData/mmap_phys/2026-06-02_12-51-13/mmap_phys_attribution.json
-写入火焰图: PerfData/mmap_phys/2026-06-02_12-51-13/mmap_phys_attribution.speedscope.json
+pprof 输出完成: PerfData/mmap_phys/2026-06-02_12-51-13/mmap_phys_attribution.pprof.pb.gz，samples=1，frames=30
 dumpsys meminfo 已保存: PerfData/mmap_phys/2026-06-02_12-51-13/dumpsys_meminfo.txt
 验证报告已保存: PerfData/mmap_phys/2026-06-02_12-51-13/memory_validation.json
+# mmap 健康报告
+## 1. 健康说明
+| 检查项 | 状态 | 数据 |
+## 2. smaps 与 meminfo 对齐
+| 类别 | smaps PSS | meminfo PSS | delta | VMA 数 |
+健康报告已保存: PerfData/mmap_phys/2026-06-02_12-51-13/mmap_health_report.md
+健康报告 JSON 已保存: PerfData/mmap_phys/2026-06-02_12-51-13/mmap_health_report.json
 ```
 
 结果检查：
 
 ```text
 metadata.final_summary 条目数: 8
-Speedscope frames: 30
-Speedscope samples: 1
-Speedscope total_weight: 4096 bytes
+pprof samples: 1
+pprof frames: 30
+pprof pss_bytes: 4096 bytes
 ```
 
 示例非零归因：
@@ -1618,7 +1824,7 @@ stack: mmap [libc.so] -> android::MemoryHeapBase::mapfd [libbinder.so]
 ```text
 1. 归因基于 smaps 快照时刻的当前物理占用，不是 mmap 发生瞬间的物理占用。
 2. mmap 虚拟大小不等于真实物理占用，最终以 PSS/RSS 为准。
-3. 当前 Speedscope 火焰图按 PSS 输出，PSS 为 0 的栈不会显示在火焰图中。
+3. 当前 pprof 默认 sample type 是 PSS，PSS 为 0 且其他 sample 也为 0 的栈不会显示在 pprof 中。
 4. 部分设备 raw_syscalls 只暴露 mmap 返回地址，不暴露 length；分析器会用返回地址所在 VMA 做归因。
 5. 只有采到 perf 调用栈的 mmap 会进入最终归因，避免全局 syscall 噪声。
 6. 如果采集窗口内没有新的 mmap 调用栈，结果可能为空；需要触发目标 App 行为。
