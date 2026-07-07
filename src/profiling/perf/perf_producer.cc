@@ -16,6 +16,8 @@
 
 #include "src/profiling/perf/perf_producer.h"
 
+#include <inttypes.h>
+
 #include <map>
 #include <optional>
 #include <random>
@@ -99,6 +101,10 @@ bool IsCpuOnline(uint32_t cpu) {
     return false;
   }
   return base::StartsWith(res, "1");
+}
+
+bool ShouldLogUnwindEnqueueDrop(uint64_t count) {
+  return count <= 8 || (count & (count - 1)) == 0;
 }
 
 // TODO(rsavitski): one thing that perf tool does is consult the cpumask
@@ -934,10 +940,35 @@ bool PerfProducer::ReadAndParsePerCpuBuffer(EventReader* reader,
     // that are waiting in the unwinding queue.
     uint64_t max_footprint_bytes = event_config.max_enqueued_footprint_bytes();
     uint64_t sample_stack_size = sample->stack.size();
+    auto& queue = unwinding_worker_->unwind_queue();
+    QueueDebugState queue_debug = queue.GetDebugState();
+    if (queue_debug.size > ds.max_unwind_queue_size)
+      ds.max_unwind_queue_size = queue_debug.size;
+    if (sample_stack_size > ds.max_unwind_sample_stack_bytes)
+      ds.max_unwind_sample_stack_bytes = sample_stack_size;
     if (max_footprint_bytes) {
       uint64_t footprint_bytes = unwinding_worker_->GetEnqueuedFootprint();
+      if (footprint_bytes > ds.max_unwind_queue_footprint_bytes)
+        ds.max_unwind_queue_footprint_bytes = footprint_bytes;
       if (footprint_bytes + sample_stack_size >= max_footprint_bytes) {
-        PERFETTO_DLOG("Skipping sample enqueueing due to footprint limit.");
+        ds.unwind_enqueue_footprint_limit_skips++;
+        if (ShouldLogUnwindEnqueueDrop(
+                ds.unwind_enqueue_footprint_limit_skips)) {
+          PERFETTO_LOG(
+              "traced_perf unwind enqueue skipped: reason=footprint_limit "
+              "ds=%zu count=%" PRIu64
+              " pid=%d tid=%d cpu=%u "
+              "queue_size=%" PRIu64 "/%" PRIu64 " queue_read_pos=%" PRIu64
+              " queue_write_pos=%" PRIu64 " footprint_kb=%" PRIu64
+              " max_footprint_kb=%" PRIu64 " sample_stack_kb=%" PRIu64,
+              static_cast<size_t>(ds_id),
+              ds.unwind_enqueue_footprint_limit_skips,
+              static_cast<int>(sample->common.pid),
+              static_cast<int>(sample->common.tid), sample->common.cpu,
+              queue_debug.size, queue_debug.capacity, queue_debug.read_pos,
+              queue_debug.write_pos, footprint_bytes / 1024,
+              max_footprint_bytes / 1024, sample_stack_size / 1024);
+        }
         EmitSkippedSample(ds_id, std::move(sample.value()),
                           SampleSkipReason::kUnwindEnqueue);
         continue;
@@ -945,15 +976,38 @@ bool PerfProducer::ReadAndParsePerCpuBuffer(EventReader* reader,
     }
 
     // Push the sample into the unwinding queue if there is room.
-    auto& queue = unwinding_worker_->unwind_queue();
     WriteView write_view = queue.BeginWrite();
     if (write_view.valid) {
       queue.at(write_view.write_pos) =
           UnwindEntry{ds_id, std::move(sample.value())};
       queue.CommitWrite();
       unwinding_worker_->IncrementEnqueuedFootprint(sample_stack_size);
+      uint64_t footprint_bytes = unwinding_worker_->GetEnqueuedFootprint();
+      if (footprint_bytes > ds.max_unwind_queue_footprint_bytes)
+        ds.max_unwind_queue_footprint_bytes = footprint_bytes;
     } else {
-      PERFETTO_DLOG("Unwinder queue full, skipping sample");
+      queue_debug = queue.GetDebugState();
+      if (queue_debug.size > ds.max_unwind_queue_size)
+        ds.max_unwind_queue_size = queue_debug.size;
+      uint64_t footprint_bytes = unwinding_worker_->GetEnqueuedFootprint();
+      if (footprint_bytes > ds.max_unwind_queue_footprint_bytes)
+        ds.max_unwind_queue_footprint_bytes = footprint_bytes;
+      ds.unwind_enqueue_queue_full_skips++;
+      if (ShouldLogUnwindEnqueueDrop(ds.unwind_enqueue_queue_full_skips)) {
+        PERFETTO_LOG(
+            "traced_perf unwind enqueue skipped: reason=queue_full "
+            "ds=%zu count=%" PRIu64
+            " pid=%d tid=%d cpu=%u "
+            "queue_size=%" PRIu64 "/%" PRIu64 " queue_read_pos=%" PRIu64
+            " queue_write_pos=%" PRIu64 " footprint_kb=%" PRIu64
+            " sample_stack_kb=%" PRIu64,
+            static_cast<size_t>(ds_id), ds.unwind_enqueue_queue_full_skips,
+            static_cast<int>(sample->common.pid),
+            static_cast<int>(sample->common.tid), sample->common.cpu,
+            queue_debug.size, queue_debug.capacity, queue_debug.read_pos,
+            queue_debug.write_pos, footprint_bytes / 1024,
+            sample_stack_size / 1024);
+      }
       EmitSkippedSample(ds_id, std::move(sample.value()),
                         SampleSkipReason::kUnwindEnqueue);
     }
@@ -1243,6 +1297,24 @@ void PerfProducer::PostFinishDataSourceStop(DataSourceInstanceID ds_id) {
   });
 }
 
+void PerfProducer::LogUnwindEnqueueDiagnostics(DataSourceInstanceID ds_id,
+                                               const DataSourceState& ds) {
+  if (!ds.unwind_enqueue_footprint_limit_skips &&
+      !ds.unwind_enqueue_queue_full_skips) {
+    return;
+  }
+  PERFETTO_LOG(
+      "traced_perf unwind enqueue summary: ds=%zu "
+      "footprint_limit_skips=%" PRIu64 " queue_full_skips=%" PRIu64
+      " max_queue_size=%" PRIu64 "/%u max_footprint_kb=%" PRIu64
+      " max_sample_stack_kb=%" PRIu64 " max_enqueued_footprint_kb=%" PRIu64,
+      static_cast<size_t>(ds_id), ds.unwind_enqueue_footprint_limit_skips,
+      ds.unwind_enqueue_queue_full_skips, ds.max_unwind_queue_size,
+      kUnwindQueueCapacity, ds.max_unwind_queue_footprint_bytes / 1024,
+      ds.max_unwind_sample_stack_bytes / 1024,
+      ds.event_config.max_enqueued_footprint_bytes() / 1024);
+}
+
 void PerfProducer::FinishDataSourceStop(DataSourceInstanceID ds_id) {
   PERFETTO_LOG("FinishDataSourceStop(%zu)", static_cast<size_t>(ds_id));
   auto ds_it = data_sources_.find(ds_id);
@@ -1253,6 +1325,7 @@ void PerfProducer::FinishDataSourceStop(DataSourceInstanceID ds_id) {
   }
   DataSourceState& ds = ds_it->second;
   PERFETTO_CHECK(ds.status == DataSourceState::Status::kShuttingDown);
+  LogUnwindEnqueueDiagnostics(ds_id, ds);
 
   ds.trace_writer->Flush();
   data_sources_.erase(ds_it);
@@ -1285,6 +1358,7 @@ void PerfProducer::PurgeDataSource(DataSourceInstanceID ds_id) {
                static_cast<size_t>(ds_id));
 
   unwinding_worker_->PostPurgeDataSource(ds_id);
+  LogUnwindEnqueueDiagnostics(ds_id, ds);
 
   // Write a packet indicating the abrupt stop.
   {

@@ -40,7 +40,7 @@
 namespace perfetto {
 namespace profiling {
 
-constexpr static uint32_t kUnwindQueueCapacity = 1024;
+constexpr static uint32_t kUnwindQueueCapacity = 4096;
 
 // Unwinds and symbolises callstacks. For userspace this uses the sampled stack
 // and register state (see |ParsedSample|). For kernelspace, the kernel itself

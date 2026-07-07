@@ -35,6 +35,13 @@ struct ReadView {
   uint64_t write_pos;
 };
 
+struct QueueDebugState {
+  uint64_t read_pos;
+  uint64_t write_pos;
+  uint64_t capacity;
+  uint64_t size;
+};
+
 // Single-writer, single-reader ring buffer of fixed-size entries (of any
 // default-constructible type). Size of the buffer is static for the lifetime of
 // UnwindQueue, and must be a power of two.
@@ -56,6 +63,8 @@ class UnwindQueue {
   UnwindQueue& operator=(UnwindQueue&&) = delete;
 
   T& at(uint64_t pos) { return data_[pos % QueueSize]; }
+
+  static constexpr uint32_t capacity() { return QueueSize; }
 
   WriteView BeginWrite() {
     uint64_t rd = rd_pos_.load(std::memory_order_acquire);
@@ -80,6 +89,13 @@ class UnwindQueue {
 
   void CommitNewReadPosition(uint64_t pos) {
     rd_pos_.store(pos, std::memory_order_release);
+  }
+
+  QueueDebugState GetDebugState() const {
+    uint64_t rd = rd_pos_.load(std::memory_order_acquire);
+    uint64_t wr = wr_pos_.load(std::memory_order_acquire);
+    uint64_t size = wr >= rd ? wr - rd : 0;
+    return QueueDebugState{rd, wr, QueueSize, size};
   }
 
  private:

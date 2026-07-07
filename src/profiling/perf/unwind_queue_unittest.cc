@@ -15,12 +15,20 @@
  */
 
 #include "src/profiling/perf/unwind_queue.h"
+#include "src/profiling/perf/unwinding.h"
 
 #include "test/gtest_and_gmock.h"
 
 namespace perfetto {
 namespace profiling {
 namespace {
+
+static_assert(kUnwindQueueCapacity == 4096u,
+              "traced_perf unwinder queue capacity is expected to be 4096");
+
+TEST(UnwindQueueTest, TracedPerfQueueCapacity) {
+  ASSERT_EQ(kUnwindQueueCapacity, 4096u);
+}
 
 TEST(UnwindQueueTest, SinglePass) {
   static constexpr uint32_t kCapacity = 4;

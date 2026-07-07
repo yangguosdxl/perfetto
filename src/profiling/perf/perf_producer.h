@@ -164,6 +164,12 @@ class PerfProducer : public Producer,
     // Additional state for EventConfig.TargetFilter: command lines we have
     // decided to unwind, up to a total of additional_cmdline_count values.
     base::FlatSet<std::string> additional_cmdlines;
+
+    uint64_t unwind_enqueue_footprint_limit_skips = 0;
+    uint64_t unwind_enqueue_queue_full_skips = 0;
+    uint64_t max_unwind_queue_size = 0;
+    uint64_t max_unwind_queue_footprint_bytes = 0;
+    uint64_t max_unwind_sample_stack_bytes = 0;
   };
 
   // For |EmitSkippedSample|.
@@ -209,6 +215,8 @@ class PerfProducer : public Producer,
                              const CommonSampleData& sample,
                              bool has_process_context);
   void EmitSample(DataSourceInstanceID ds_id, CompletedSample sample);
+  void LogUnwindEnqueueDiagnostics(DataSourceInstanceID ds_id,
+                                   const DataSourceState& ds);
   void EmitRingBufferLoss(DataSourceInstanceID ds_id,
                           size_t cpu,
                           uint64_t records_lost);
