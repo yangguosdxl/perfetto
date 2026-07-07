@@ -52,6 +52,75 @@ class ClassificationTest(unittest.TestCase):
     self.assertEqual(
         [item.item["id"] for item in entry_by_path[("remaining",)].items], [3])
 
+  def test_hierarchy_entries_group_children_next_to_parent_category(self):
+    """分类明细文件编号应按大分类分组，而不是被 fs.ini 交错顺序打散。"""
+    rules = [
+        classification.ClassificationRule("il2cpp/meta", ("Class::Init",)),
+        classification.ClassificationRule("hybridclr/runtime", ("LoadHotfix",)),
+        classification.ClassificationRule("il2cpp/other", ("il2cpp",)),
+        classification.ClassificationRule("unity3d/asset", ("AssetBundle",)),
+    ]
+    items = [
+        {"id": 1, "stack": ("Leaf", "Class::Init")},
+        {"id": 2, "stack": ("Leaf", "LoadHotfix")},
+        {"id": 3, "stack": ("Leaf", "il2cpp")},
+        {"id": 4, "stack": ("Leaf", "AssetBundle")},
+        {"id": 5, "stack": ("Leaf", "Other")},
+    ]
+    classified, remaining = classification.classify_items(
+        items, rules, lambda item: item["stack"])
+
+    entries = classification.build_hierarchy_entries(classified, remaining)
+
+    self.assertEqual([entry.path for entry in entries], [
+        ("il2cpp",),
+        ("il2cpp", "meta"),
+        ("il2cpp", "other"),
+        ("hybridclr",),
+        ("hybridclr", "runtime"),
+        ("unity3d",),
+        ("unity3d", "asset"),
+        ("remaining",),
+    ])
+
+  def test_summary_hierarchy_entries_group_children_next_to_parent_category(
+      self):
+    """分类 summary 的树状输出顺序应和明细 pprof 文件编号一致。"""
+    summary = {
+        "categories": [
+            {
+                "name": "il2cpp/meta",
+                "keywords": ["Class::Init"],
+                "bytes": 1,
+            },
+            {
+                "name": "hybridclr/runtime",
+                "keywords": ["LoadHotfix"],
+                "bytes": 2,
+            },
+            {
+                "name": "il2cpp/other",
+                "keywords": ["il2cpp"],
+                "bytes": 3,
+            },
+        ],
+        "remaining": {
+            "bytes": 4,
+        },
+    }
+
+    entries = classification.build_summary_hierarchy_entries(
+        summary, ("bytes",))
+
+    self.assertEqual([entry["path"] for entry in entries], [
+        ("il2cpp",),
+        ("il2cpp", "meta"),
+        ("il2cpp", "other"),
+        ("hybridclr",),
+        ("hybridclr", "runtime"),
+        ("remaining",),
+    ])
+
   def test_first_matching_rule_wins_when_ui_and_hybridclr_keywords_overlap(
       self):
     """同时命中 UIManager 和 hybridclr 时，应按 fs.ini 顺序优先归入 UI。"""
@@ -76,6 +145,36 @@ class ClassificationTest(unittest.TestCase):
 
     self.assertEqual([item.item["id"] for item in classified[0][1]], [1])
     self.assertEqual(classified[1][1], [])
+    self.assertEqual(remaining, [])
+
+  def test_classification_ignores_cpp_function_parameter_lists(self):
+    """分类关键字不应命中 C++ 函数参数表中的类型名。"""
+    rules = [
+        classification.ClassificationRule("unity3d/TypeTree", ("TypeTree",)),
+        classification.ClassificationRule("unity3d/SerializedFile",
+                                          ("SerializedFile",)),
+    ]
+    items = [
+        {
+            "id": 1,
+            "stack": (
+                "SerializedFile::ReadObject(long, ObjectCreationMode, bool, "
+                "TypeTree const**, bool*, Object&, CacheReaderBase*) const "
+                "[libunity.so]",
+                "Root",
+            ),
+        },
+        {
+            "id": 2,
+            "stack": ("BuildTypeTree(int) [libunity.so]", "Root"),
+        },
+    ]
+
+    classified, remaining = classification.classify_items(
+        items, rules, lambda item: item["stack"])
+
+    self.assertEqual([item.item["id"] for item in classified[0][1]], [2])
+    self.assertEqual([item.item["id"] for item in classified[1][1]], [1])
     self.assertEqual(remaining, [])
 
   def test_sanitize_filename_keeps_portable_category_name(self):

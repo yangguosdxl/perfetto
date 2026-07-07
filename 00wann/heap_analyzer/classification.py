@@ -30,6 +30,30 @@ class HierarchyEntry:
   is_leaf: bool
 
 
+def _group_paths_with_children(ordered_paths: list[tuple[str, ...]]
+                              ) -> list[tuple[str, ...]]:
+  """按分类树先序输出路径，让父分类和子分类编号相邻。"""
+  children_by_parent: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
+  seen: set[tuple[str, ...]] = set()
+  for path in ordered_paths:
+    if not path or path in seen:
+      continue
+    seen.add(path)
+    parent = path[:-1]
+    children_by_parent.setdefault(parent, []).append(path)
+
+  grouped: list[tuple[str, ...]] = []
+
+  def visit(path: tuple[str, ...]) -> None:
+    grouped.append(path)
+    for child in children_by_parent.get(path, []):
+      visit(child)
+
+  for root_path in children_by_parent.get((), []):
+    visit(root_path)
+  return grouped
+
+
 def parse_classification_config(path: str) -> list[ClassificationRule]:
   """解析 fs.ini 分类规则。
 
@@ -78,6 +102,31 @@ def category_path(name: str) -> tuple[str, ...]:
   return tuple(part.strip() for part in name.split("/") if part.strip())
 
 
+def strip_cpp_parameter_lists(frame: str) -> str:
+  """移除符号名里的 C++ 函数参数表，避免分类命中参数类型。"""
+  symbol, separator, mapping = frame.rpartition(" [")
+  if not separator:
+    symbol = frame
+    mapping = ""
+
+  output: list[str] = []
+  depth = 0
+  for char in symbol:
+    if char == "(":
+      depth += 1
+      continue
+    if char == ")" and depth:
+      depth -= 1
+      continue
+    if depth == 0:
+      output.append(char)
+
+  cleaned = "".join(output)
+  if separator:
+    return f"{cleaned}{separator}{mapping}"
+  return cleaned
+
+
 def classify_items(
     items: Iterable[Any],
     rules: list[ClassificationRule],
@@ -94,7 +143,8 @@ def classify_items(
     matched: list[ClassifiedItem] = []
     next_remaining: list[ClassifiedItem] = []
     for item in remaining:
-      stack_text = "\n".join(item.stack_leaf_to_root)
+      stack_text = "\n".join(
+          strip_cpp_parameter_lists(frame) for frame in item.stack_leaf_to_root)
       if any(keyword in stack_text for keyword in rule.keywords):
         matched.append(item)
       else:
@@ -142,7 +192,7 @@ def build_hierarchy_entries(
           keywords=keywords_by_leaf.get(path, ()),
           items=tuple(items_by_path[path]),
           is_leaf=path in leaf_paths,
-      ) for path in ordered_paths
+      ) for path in _group_paths_with_children(ordered_paths)
   ]
 
 
@@ -187,7 +237,7 @@ def build_summary_hierarchy_entries(
   return [{
       **items_by_path[path],
       "is_leaf": path in leaf_paths,
-  } for path in ordered_paths]
+  } for path in _group_paths_with_children(ordered_paths)]
 
 
 def ensure_parent_dir(path: str) -> None:

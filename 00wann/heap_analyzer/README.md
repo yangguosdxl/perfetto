@@ -316,6 +316,11 @@ net_alloc_mib: 145.111
 
 分类规则按文件顺序执行。一个分配栈命中某个分类后，会从后续分类中移除；没有命中的分配栈会进入 `remaining`。
 
+分类匹配会先移除 C++ 符号名里的函数参数表，再做关键字子串匹配。例如
+`SerializedFile::ReadObject(..., TypeTree const**, ...)` 不会因为参数类型里的
+`TypeTree` 命中 `unity3d/TypeTree`；但 `BuildTypeTree(...)` 这类函数名本身包含
+`TypeTree` 的栈仍会命中。原始调用栈输出不受影响，pprof/speedscope 仍保留完整符号。
+
 使用 `--classify-config` 时，脚本默认分析全部 `heap_profile_allocation`，不会被默认 `--symbol` 值过滤。只有显式传入 `--symbol ...` 时，才会先按该符号筛选调用栈，再对筛选后的分配栈分类。
 
 对全部 Native heap 分配栈分类，默认输出 pprof 分类结果；如需 speedscope 明细，再额外传入 `--classify-speedscope-dir`：
@@ -344,6 +349,8 @@ python -B heap_analyzer/query_heap_alloc_stacks_by_symbol.py \
 - `native_heap.pprof.pb.gz`：全部匹配分配栈的明细 profile；分类模式下每个 sample 会带 `category` 和 `category_type` 标签，可用 pprof 的 `tagfocus` / `tagshow` 过滤。
 - `category_summary.pprof.pb.gz`：分类汇总 profile；每个 sample 对应一个叶子分类或 `remaining`，调用栈形态为 `Native heap summary / classified / 大分类 / 子分类`。
 - `pprof_categories/*.pprof.pb.gz`：每个父分类、叶子分类和 `remaining` 的明细 profile；父分类文件聚合所有子分类，叶子分类文件对应具体规则。
+
+`pprof_categories` 和分类 speedscope 文件名前的两位序号按分类树先序生成：大分类首次出现顺序仍来自 `fs.ini`，但输出时同一大分类的父节点和所有子分类会连续编号。这个排序只影响文件名和树状展示，不改变 `fs.ini` 从上到下的命中优先级。
 
 常用 pprof 查看方式：
 
