@@ -320,7 +320,7 @@ perf_data_loss
 perf_samples_skipped_dataloss
   -> trace_processor stats: perf_samples_skipped_dataloss
   -> traced_perf 内部 reader 到 unwinder 队列阶段 load shedding
-  -> 处理方向：降低单条样本展开成本、削平 reader 批量输入、提高 unwinder 队列上限，
+  -> 处理方向：降低单条样本展开成本、削平 reader 批量输入、避免固定 unwinder queue 被打满，
      或降低调用栈采样压力。
 ```
 
@@ -333,10 +333,71 @@ raw_syscalls:sys_enter id == 222
   -> traced_perf reader 按 ring_buffer_read_period_ms 读取 ring buffer
   -> reader 把包含 pid/tid、timestamp、cpu、用户栈/内核栈 payload 的 sample
      放入 unwinder queue
-  -> unwinder 展开调用栈，写出带 callsite_id 的 PerfSample
-  -> trace_processor 导入 __intrinsic_perf_sample.callsite_id 和 stack_profile 表
+  -> Unwinder 线程取出 ParsedSample，展开为 CompletedSample(frames, build_ids)
+  -> PerfProducer 把 frames/build_ids intern 成 callstack_iid，并写入 PerfSample
+  -> trace_processor 把 callstack_iid 导入为 __intrinsic_perf_sample.callsite_id 和 stack_profile 表
   -> mmap_phys_analyzer.py 用 mmap enter 附近的 callsite_id 做 mmap 物理归因
 ```
+
+#### unwinder queue 消费和 callsite_id 生成链路
+
+`unwinder queue` 的写入方是 traced_perf 的 reader，也就是
+`PerfProducer::ReadRingBuffers()` 读取每 CPU perf ring buffer 后，在
+`ReadAndParsePerCpuBuffer()` 中把需要调用栈展开的 `ParsedSample` 写入队列。每次读完一批
+kernel ring buffer，reader 会调用 `unwinding_worker_->PostProcessQueue()` 唤醒 unwinder。
+
+`unwinder queue` 的消费方是 `Unwinder`。`Unwinder::ProcessQueue()` 运行在专用的
+unwinder task runner/线程上，调用 `ConsumeAndUnwindReadySamples()` 取队列快照并遍历
+未消费条目。只有目标进程的 `/proc/<pid>/maps` 和 `/proc/<pid>/mem` fd 已准备好，或者
+该 sample 只需要处理 kernel callchain 时，才会调用 `UnwindSample()`。用户态展开使用
+`libunwindstack` 或 frame pointer unwinder；kernel frames 由 kernel 提供的 callchain
+做符号化。
+
+队列容量不是 Perfetto 配置项，而是 traced_perf 编译期常量：
+
+```text
+src/profiling/perf/unwinding.h
+  kUnwindQueueCapacity = 4096
+
+src/profiling/perf/unwind_queue.h
+  UnwindQueue<UnwindEntry, QueueSize>
+  -> single-writer/single-reader 固定大小 ring buffer
+  -> wr - rd >= QueueSize 时 BeginWrite() 返回 invalid
+```
+
+因此 `--perf-ring-buffer-pages` 和 `--perf-ring-buffer-read-period-ms` 控制的是
+kernel perf ring buffer，不控制 unwinder queue 的 4096 个槽位。`max_enqueued_footprint_kb`
+控制的是已排队 sample stack payload 的可选内存阈值，也不改变槽位数；当前脚本未设置该字段，
+等价于 `0`，footprint 阈值检查关闭。
+
+展开成功后的数据流不是直接写出 trace_processor 的 `callsite_id`：
+
+```text
+Unwinder::UnwindSample()
+  input : ParsedSample(common, regs, stack, kernel_ips)
+  output: CompletedSample(common, frames, build_ids, unwind_error)
+
+PerfProducer::EmitSample()
+  -> callstack_trie_.CreateCallsite(frames, build_ids)
+  -> 写 InternedData(callstacks/frames/mappings/strings)
+  -> 写 TracePacket.perf_sample.callstack_iid
+
+trace_processor ProfileModule::ParsePerfSample()
+  -> 读取 PerfSample.callstack_iid
+  -> StackProfileSequenceState::FindOrInsertCallstack()
+  -> StackProfileTracker::InternCallsite()
+  -> 写 stack_profile_callsite / stack_profile_frame 等表
+  -> 写 perf_sample.callsite_id
+
+mmap_phys_analyzer.py
+  -> 只读取 __intrinsic_perf_sample 中 callsite_id IS NOT NULL 的行
+  -> 按 utid 和时间窗口匹配 mmap enter 附近最近的 sample
+```
+
+所以 `perf_samples_skipped_dataloss` 影响 mmap 归因的具体方式是：这些 sample 在
+reader 到 unwinder 入队阶段已经被跳过，没有进入 `UnwindSample()`，不会产生
+`CompletedSample`，也就没有 `callstack_iid`；trace_processor 最终无法给该 sample 生成
+`callsite_id`。
 
 `PROFILER_SKIP_UNWIND_ENQUEUE` 有两个来源：一是 traced_perf 判断 unwinder queue
 中已排队样本的 footprint 超过 `max_enqueued_footprint_kb` 派生的字节阈值；二是
@@ -351,6 +412,26 @@ unwinder queue 已满，reader 申请写入槽位失败。trace_processor 导入
 footprint 阈值检查。因此当前配置下该阈值等价于关闭；看到
 `perf_samples_skipped_dataloss` 时，更可能是 unwinder queue 写入失败/队列满。
 
+本地 Perfetto 已把 `kUnwindQueueCapacity` 从 1024 提到 4096，并在 traced_perf 入队失败路径
+加了诊断日志。日志会按前 8 次和 2 的幂次数采样输出，避免 data loss 很多时刷屏：
+
+```text
+traced_perf unwind enqueue skipped: reason=queue_full ...
+traced_perf unwind enqueue skipped: reason=footprint_limit ...
+traced_perf unwind enqueue summary:
+  footprint_limit_skips=...
+  queue_full_skips=...
+  max_queue_size=.../4096
+  max_footprint_kb=...
+  max_sample_stack_kb=...
+  max_enqueued_footprint_kb=...
+```
+
+判读方式：`queue_full_skips > 0` 表示固定槽位队列被打满；`footprint_limit_skips > 0`
+表示命中 `max_enqueued_footprint_kb` 派生的 footprint 上限；`max_queue_size` 接近
+`4096/4096` 时说明 reader 入队峰值已经顶到队列容量。当前脚本没有设置
+`max_enqueued_footprint_kb`，所以正常情况下 `footprint_limit_skips` 应为 0。
+
 输入输出可以按下面理解：
 
 ```text
@@ -358,8 +439,9 @@ footprint 阈值检查。因此当前配置下该阈值等价于关闭；看到
   perf sample(timestamp、pid/tid、cpu、raw stack payload、tracepoint counter)
 
 成功输出：
-  __intrinsic_perf_sample.callsite_id
-  stack_profile_callsite / stack_profile_frame / stack_profile_symbol
+  traced_perf trace packet: PerfSample.callstack_iid + InternedData callstacks/frames
+  trace_processor tables: __intrinsic_perf_sample.callsite_id +
+                          stack_profile_callsite / stack_profile_frame / stack_profile_symbol
 
 失败输出：
   sample_skipped_reason = PROFILER_SKIP_UNWIND_ENQUEUE
@@ -380,12 +462,25 @@ src/trace_processor/storage/stats.h
   -> perf_samples_skipped_dataloss: profiler(traced_perf) 内部丢样，常见原因是 load shedding。
 
 src/profiling/perf/perf_producer.cc
+  -> ReadRingBuffers() 读完一批 kernel perf ring buffer 后 PostProcessQueue() 唤醒 unwinder。
+  -> reader 把 ParsedSample 写入 unwinder queue；队列满时 BeginWrite 失败。
   -> max_enqueued_footprint_bytes 非 0 且超过 footprint 上限时 EmitSkippedSample(..., kUnwindEnqueue)。
   -> unwinder queue BeginWrite 失败时也 EmitSkippedSample(..., kUnwindEnqueue)。
+  -> EmitSample() 把 CompletedSample.frames/build_ids intern 成 callstack_iid 并写入 PerfSample。
   -> kUnwindEnqueue 写成 PerfSample::PROFILER_SKIP_UNWIND_ENQUEUE。
+
+src/profiling/perf/unwinding.h / unwind_queue.h / unwinding.cc
+  -> kUnwindQueueCapacity = 4096，固定大小 single-writer/single-reader ring buffer。
+  -> Unwinder::ProcessQueue() / ConsumeAndUnwindReadySamples() 消费队列。
+  -> UnwindSample() 把 ParsedSample 展开成 CompletedSample(frames, build_ids)。
 
 src/trace_processor/importers/proto/profile_module.cc
   -> PROFILER_SKIP_UNWIND_ENQUEUE 导入为 stats.perf_samples_skipped_dataloss。
+  -> PerfSample.callstack_iid 经 FindOrInsertCallstack() 变成 perf_sample.callsite_id。
+
+src/trace_processor/importers/proto/stack_profile_sequence_state.cc
+src/trace_processor/importers/common/stack_profile_tracker.cc
+  -> interned callstack/frame 转成 stack_profile_callsite / stack_profile_frame 表。
 
 protos/perfetto/config/profiling/perf_event_config.proto
   -> ring_buffer_pages / ring_buffer_read_period_ms 控制 kernel ring buffer。
@@ -404,9 +499,11 @@ src/profiling/perf/event_config.cc
 2. 如果 `perf_data_loss=0` 但 `perf_samples_skipped_dataloss` 非 0，说明问题已不在
    kernel ring buffer。先加 `--no-kernel-frames`，减少每条 sample 的栈 payload 和
    unwinder 成本；mmap 归因通常主要依赖用户态栈。
-3. 如果仍非 0，可在 `--no-kernel-frames` 的基础上尝试更短的
-   `--perf-ring-buffer-read-period-ms 10`，用更频繁读取削平 reader 批量入队峰值；这会
-   增加 traced_perf 唤醒和 CPU 开销，必须复查目标场景影响。
+3. 缩短 `--perf-ring-buffer-read-period-ms` 主要用于减少 kernel perf ring buffer overrun；
+   它不会降低 sample 产生速率，也不会提高 unwinder 吞吐。对
+   `perf_samples_skipped_dataloss`，只有在确认问题来自 reader 单次批量入队峰值过大时，
+   才可能通过更频繁、更小批次读取来缓解；如果 unwinder 平均处理速度已经低于输入速度，
+   缩短读取周期只会更频繁地喂队列，不能解决队列满。
 4. 如果仍非 0，说明 unwinder 持续跟不上输入。当前 `max_enqueued_footprint_kb` 未设置，
    等价于 `0`，不会触发 footprint 阈值丢样；新增这个旋钮并调大不能解决当前队列满路径。
 5. 最后的手段是降低采样压力。当前配置 `period: 1` 表示每次 mmap enter 都尝试取栈；
@@ -1419,7 +1516,14 @@ libvulkan
 
 分类规则按文件顺序匹配。某条 mmap 调用栈命中一个分类后，不会再进入后续分类；
 未命中的调用栈进入 `remaining`。分类名中的 `/` 会生成父子层级，父节点聚合所有
-子分类。
+子分类。分类输出文件名前的序号按分类树先序生成：大分类首次出现顺序仍来自
+`fs.ini`，但同一大分类的父节点和子分类会连续编号；这个排序只影响输出文件名和
+树状展示，不改变匹配优先级。
+
+分类匹配会先移除 C++ 符号名里的函数参数表，再做关键字子串匹配。例如
+`SerializedFile::ReadObject(..., TypeTree const**, ...)` 不会因为参数类型里的
+`TypeTree` 命中 `unity3d/TypeTree`；但 `BuildTypeTree(...)` 这类函数名本身包含
+`TypeTree` 的栈仍会命中。原始调用栈输出不受影响，pprof/speedscope 仍保留完整符号。
 
 离线分析示例：
 
@@ -1454,6 +1558,7 @@ mmap_classification_summary.pprof.pb.gz
 pprof_categories/*.pprof.pb.gz
   -> 只有传 --classify-pprof-dir 时生成。
   -> 每个分类叶子、父分类和 remaining 各输出一个 mmap 调用栈 pprof。
+  -> 文件名前两位序号按大分类分组，父分类和子分类相邻。
 ```
 
 可选路径参数：

@@ -268,12 +268,16 @@ PerfData/mmap_phys/<时间戳>/
 ```bash
 # 第一优先级：降低每条样本的展开成本；mmap 归因通常主要依赖用户态栈
 ./run_mmap_phys_profile.sh --no-kernel-frames
-
-# 如果仍然只是 perf_samples_skipped_dataloss 非 0，可尝试缩短读取周期来削峰，但要复查采集开销
-./run_mmap_phys_profile.sh --no-kernel-frames --perf-ring-buffer-read-period-ms 10
 ```
 
+缩短 `--perf-ring-buffer-read-period-ms` 主要用于减少 kernel perf ring buffer overrun；它不会降低 sample 产生速率，也不会提高 unwinder 吞吐。对 `perf_samples_skipped_dataloss`，只有在确认问题来自 reader 单次批量入队峰值过大时，才可能通过更频繁、更小批次读取来缓解；如果 unwinder 平均处理速度已经低于输入速度，缩短读取周期只会更频繁地喂队列，不能解决队列满。
+
 当前脚本没有设置 `max_enqueued_footprint_kb`，Perfetto 侧等价于 `0`，即关闭 footprint 阈值检查；因此当前这类 `perf_samples_skipped_dataloss` 更可能来自 unwinder queue 写入失败/队列满，而不是命中 footprint 上限。若仍非 0，继续规避主要是降低调用栈采样压力；这会带来归因完整性的取舍。
+
+本地 Perfetto 的 traced_perf unwinder queue 已从 1024 扩到 4096；若仍出现
+`perf_samples_skipped_dataloss`，看 logcat 中 `traced_perf unwind enqueue skipped` 和
+`traced_perf unwind enqueue summary`：`queue_full_skips` 表示队列满，`footprint_limit_skips`
+表示命中 `max_enqueued_footprint_kb`，`max_queue_size=.../4096` 可判断峰值是否顶到容量。
 
 额外环境变量：
 
@@ -633,6 +637,8 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
   <自定义 speedscope 输出>
 ```
 
+`pprof_categories` 内分类文件名前的两位序号按分类树先序生成：大分类首次出现顺序来自 `fs.ini`，同一大分类的父分类和子分类连续编号；规则命中优先级仍按 `fs.ini` 文件顺序执行。
+
 验收要点：`net_alloc_bytes` 是带符号净变化，可能为负；看最终净增长用带符号值，看变化规模用 `--speedscope-weight absolute-net`。
 
 ## `heap_analyzer/classification.py`
@@ -646,8 +652,9 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 2. 规则按文件顺序匹配。
 3. 一条调用栈命中一个分类后，不再进入后续分类。
 4. 未命中的调用栈进入 remaining。
-5. 分类名中的 / 会展开为层级，父节点聚合子分类。
-6. 可写出不依赖 openpyxl 的 xlsx 文件。
+5. 匹配前会移除 C++ 函数参数表，避免参数类型名触发分类；函数名本身的关键字仍可命中。
+6. 分类名中的 / 会展开为层级，父节点聚合子分类。
+7. 可写出不依赖 openpyxl 的 xlsx 文件。
 ```
 
 参数说明：该文件不是命令行工具，没有 CLI 参数。主要函数参数如下。
@@ -657,7 +664,7 @@ HEAP_STARTUP_DRY_RUN=1 ./run_heap_startup_eval.sh 45000 268435456 512 256
 | ------------------------------------------------ | -------------------------- | --------------- |
 | `parse_classification_config(path)`              | `path`                     | 读取 fs.ini 分类配置。 |
 | `classify_items(items, rules, stack_getter)`     | `items/rules/stack_getter` | 按规则顺序分类。        |
-| `build_hierarchy_entries(classified, remaining)` | 分类结果                       | 生成带父子层级的分类节点。   |
+| `build_hierarchy_entries(classified, remaining)` | 分类结果                       | 生成带父子层级的分类节点；输出顺序按大分类聚合，让父分类和子分类文件编号相邻。 |
 | `write_xlsx(path, sheets)`                       | 输出路径和 sheet 数据             | 写出 xlsx。        |
 
 
@@ -977,7 +984,8 @@ export PerfettoRoot='../../perfetto'
 2. 后续非空行为该分类关键字。
 3. 规则按文件顺序匹配。
 4. 分类名中的 / 表示层级。
-5. 未匹配项进入 remaining。
+5. 分类输出文件编号按大分类聚合，父分类和子分类相邻。
+6. 未匹配项进入 remaining。
 ```
 
 参数说明：配置文件无参数；通过 `--classify-config heap_analyzer/fs.ini` 传给分析工具。
