@@ -289,8 +289,9 @@ data_sources {
       }
       callstack_sampling {
         scope {
-          target_cmdline: "com.tencent.dhwdxkty.trunk.profiler"
+          target_cmdline: "com.fs.t.prf"
         }
+        user_frames: UNWIND_DWARF
         kernel_frames: true
       }
       ring_buffer_pages: 32768
@@ -305,6 +306,10 @@ data_sources {
 4 KiB 页数，主要用于吸收启动期 mmap tracepoint 的短时峰值；如果
 `memory_validation.json` 中 `trace_health.perf_data_loss` 非 0，先检查
 linux.perf ring buffer，不要优先增大 Perfetto 全局 `--buffer-kb`。
+主功能配置显式设置 `user_frames: UNWIND_DWARF`；这是 mmap 归因所需的用户态调用栈
+来源。`kernel_frames: true` 也应保留用于主功能验收，因为 mmap tracepoint sample
+可能全部以 kernel cpu_mode 进入 trace_processor；关闭 kernel frames 后即使
+`perf_samples_skipped_dataloss=0`，也可能得到 `callsite_id` 全空的 trace。
 
 ### traced_perf 内部 perf sample 丢失口径
 
@@ -497,8 +502,11 @@ src/profiling/perf/event_config.cc
    `ring_buffer_pages` 为 2 的幂，按 `8192/100ms -> 16384/50ms -> 32768/50ms
    -> 32768/25ms` 递进。
 2. 如果 `perf_data_loss=0` 但 `perf_samples_skipped_dataloss` 非 0，说明问题已不在
-   kernel ring buffer。先加 `--no-kernel-frames`，减少每条 sample 的栈 payload 和
-   unwinder 成本；mmap 归因通常主要依赖用户态栈。
+   kernel ring buffer。先确认 logcat 中是否有
+   `traced_perf unwind enqueue skipped` / `traced_perf unwind enqueue summary`，并根据
+   `queue_full_skips`、`footprint_limit_skips`、`max_queue_size` 判断是否为 unwinder
+   queue 写入失败。当前本地验证使用 queue=4096 的 `traced_perf` 后
+   `perf_samples_skipped_dataloss` 降为 0。
 3. 缩短 `--perf-ring-buffer-read-period-ms` 主要用于减少 kernel perf ring buffer overrun；
    它不会降低 sample 产生速率，也不会提高 unwinder 吞吐。对
    `perf_samples_skipped_dataloss`，只有在确认问题来自 reader 单次批量入队峰值过大时，
@@ -508,6 +516,28 @@ src/profiling/perf/event_config.cc
    等价于 `0`，不会触发 footprint 阈值丢样；新增这个旋钮并调大不能解决当前队列满路径。
 5. 最后的手段是降低采样压力。当前配置 `period: 1` 表示每次 mmap enter 都尝试取栈；
    降低采样频率会改变“每个 mmap 都尽量归因”的语义，只能在接受归因完整性下降时使用。
+
+不要把 `--no-kernel-frames` 当作主功能验收的降载方案。2026-07-07 在 Pixel 6
+`1C111FDF600AW5` 上验证过：无 kernel frames 的 trace 可让
+`perf_samples_skipped_dataloss=0`，但 `__intrinsic_perf_sample.callsite_id` 仍全为
+NULL，`stack_profile_callsite` 行数为 0，无法支撑 mmap 调用栈归因。
+
+如果侧载 GN standalone 版 `traced_perf` 到 `/system/bin/traced_perf`，注意 init rc
+仍会以 `user nobody` 启动 service；这种模式可能因无法打开目标进程
+`/proc/<pid>/maps` / `mem` 而产生 `perf_samples_skipped` 或无 callsite 的样本。主功能
+验证可临时用 root 启动 standalone producer：
+
+```bash
+adb -s 1C111FDF600AW5 shell \
+  "su 0 sh -c 'killall traced_perf 2>/dev/null || true; /system/bin/traced_perf --background'"
+```
+
+随后运行主采集并保留 kernel frames。2026-07-07 验证结果：
+`PerfData/mmap_phys/2026-07-07_21-36-59`，60 秒登录场景采集，
+`perf_samples_skipped_dataloss=0`、`perf_cpu_lost_records=0`、
+`perf_samples=92046`、`samples_with_callsite=8275`；离线
+`mmap_phys_analyzer.py` 成功输出 `mmap_phys_attribution.json` 和
+`mmap_phys_attribution.pprof.pb.gz`。
 
 ### `raw_syscalls` 与 `syscall_events` 的区别
 

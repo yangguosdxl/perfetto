@@ -194,7 +194,7 @@ PerfData/mmap_phys/<时间戳>/
 默认行为：
 
 ```text
-1. 等待或启动目标进程。
+1. 等待目标进程；目标未运行时用 `MMAP_PHYS_ACTIVITY` 或解析到的 launcher Activity 执行 `am start -n`，不使用 `adb monkey`。
 2. 生成 mmap_phys_config.pbtxt。
 3. 启动设备端 perfetto。
 4. 周期保存 /proc/<pid>/smaps。
@@ -263,12 +263,7 @@ PerfData/mmap_phys/<时间戳>/
 这类丢样不等同于 Perfetto 全局 trace buffer 不够；如果
 `perfetto_data_loss=0`、`ftrace_data_loss=0`，不要优先增大 `--buffer-kb`。
 
-主功能 mmap 调用栈采样使用 `raw_syscalls:sys_enter` + `period: 1`，降低采样频率会改变“每次 mmap enter 都尝试取栈”的语义。当前 FS 启动 mmap 调用栈采样先保持 `32768/25ms`，然后按下面顺序处理 `perf_samples_skipped_dataloss`：
-
-```bash
-# 第一优先级：降低每条样本的展开成本；mmap 归因通常主要依赖用户态栈
-./run_mmap_phys_profile.sh --no-kernel-frames
-```
+主功能 mmap 调用栈采样使用 `raw_syscalls:sys_enter` + `period: 1`，降低采样频率会改变“每次 mmap enter 都尝试取栈”的语义。当前 FS 启动 mmap 调用栈采样保持 `32768/25ms`，并显式生成 `user_frames: UNWIND_DWARF`。不要用 `--no-kernel-frames` 作为主功能验收手段：mmap tracepoint sample 可能全部处于 kernel cpu_mode，关闭 kernel frames 后会出现 perf samples 存在但 `callsite_id` 全空的无效归因 trace。
 
 缩短 `--perf-ring-buffer-read-period-ms` 主要用于减少 kernel perf ring buffer overrun；它不会降低 sample 产生速率，也不会提高 unwinder 吞吐。对 `perf_samples_skipped_dataloss`，只有在确认问题来自 reader 单次批量入队峰值过大时，才可能通过更频繁、更小批次读取来缓解；如果 unwinder 平均处理速度已经低于输入速度，缩短读取周期只会更频繁地喂队列，不能解决队列满。
 
@@ -278,6 +273,18 @@ PerfData/mmap_phys/<时间戳>/
 `perf_samples_skipped_dataloss`，看 logcat 中 `traced_perf unwind enqueue skipped` 和
 `traced_perf unwind enqueue summary`：`queue_full_skips` 表示队列满，`footprint_limit_skips`
 表示命中 `max_enqueued_footprint_kb`，`max_queue_size=.../4096` 可判断峰值是否顶到容量。
+
+2026-07-07 在 Pixel 6 `1C111FDF600AW5`、`com.fs.t.prf` 上的结论：历史 loss 来自
+`PROFILER_SKIP_UNWIND_ENQUEUE -> perf_samples_skipped_dataloss`，不是
+`perf_cpu_lost_records`。安装本地 queue=4096 且带 enqueue 诊断日志的 `traced_perf` 后，
+120 秒主采集 `perf_samples_skipped_dataloss=0`。若使用 GN standalone 版
+`traced_perf` 侧载到 init service，service 仍按 `user nobody` 运行，可能因
+`/proc/<pid>/maps` 权限导致 `callsite_id` 全空；主功能归因验证时需先用 root 启动
+standalone producer，例如 `adb shell su 0 sh -c 'killall traced_perf 2>/dev/null || true; /system/bin/traced_perf --background'`，
+再运行采集。60 秒登录场景验证结果：
+`perf_samples_skipped_dataloss=0`、`perf_cpu_lost_records=0`、
+`perf_samples=92046`、`samples_with_callsite=8275`，离线归因输出
+`mmap_phys_attribution.json` 和 `mmap_phys_attribution.pprof.pb.gz` 成功。
 
 额外环境变量：
 

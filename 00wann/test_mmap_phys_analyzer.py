@@ -289,6 +289,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("ring_buffer_pages: 4096", config)
     self.assertIn("ring_buffer_read_period_ms: 100", config)
+    self.assertIn("user_frames: UNWIND_DWARF", config)
 
   def test_perfetto_config_default_perf_ring_buffer_matches_fs_startup(self):
     """默认 mmap 调用栈采样使用 FS 启动场景实测无丢样配置。"""
@@ -366,6 +367,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertIn('name: "linux.perf"', config)
     self.assertIn('name: "linux.process_stats"', config)
     self.assertIn("callstack_sampling", config)
+    self.assertIn("user_frames: UNWIND_DWARF", config)
 
   def test_validation_config_does_not_collect_mmap_callstacks(self):
     """显式验证模式不采 mmap 调用栈，也不启用 heapprofd。"""
@@ -387,6 +389,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertNotIn('name: "android.heapprofd"', config)
     self.assertNotIn('name: "linux.perf"', config)
     self.assertNotIn("callstack_sampling", config)
+    self.assertNotIn("user_frames", config)
 
   def test_collect_defaults_to_75_seconds(self):
     """默认 mmap 物理内存采集时长应为 1 分 15 秒。"""
@@ -807,7 +810,11 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       shell_calls.append(cmd)
       if cmd.startswith("pidof "):
         return pidof_outputs.pop(0)
-      return "monkey ok"
+      if cmd.startswith("cmd package resolve-activity"):
+        return ("priority=0 preferredOrder=0 match=0x108000 "
+                "specificIndex=-1 isDefault=false\n"
+                "com.example.app/.MainActivity")
+      return "start ok"
 
     with mock.patch.object(collector, "adb_shell", side_effect=fake_adb_shell), \
          mock.patch.object(collector.time, "sleep"):
@@ -816,12 +823,13 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(pid, 4321)
     self.assertEqual(shell_calls, [
         "pidof 'com.example.app' || true",
-        "monkey -p 'com.example.app' 1",
+        "cmd package resolve-activity --brief 'com.example.app'",
+        "am start -n 'com.example.app/.MainActivity'",
         "pidof 'com.example.app' || true",
     ])
 
   def test_wait_for_pid_does_not_launch_when_already_running(self):
-    """目标进程已存在时，不应额外发送 monkey 启动命令。"""
+    """目标进程已存在时，不应额外发送启动命令。"""
     shell_calls = []
 
     def fake_adb_shell(cmd, **_kwargs):

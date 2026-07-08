@@ -78,15 +78,29 @@ def format_smaps_progress_line(path: str, size_bytes: int,
   return f"smaps 快照: {path} ({size_bytes} bytes) 剩余: {max(0.0, remaining_s):.1f}s"
 
 
+def resolve_launch_activity(name: str) -> Optional[str]:
+  out = adb_shell(f"cmd package resolve-activity --brief {shell_quote(name)}")
+  for line in reversed(out.splitlines()):
+    value = line.strip()
+    if "/" in value and not value.startswith("priority="):
+      return value
+  return None
+
+
 def launch_app(name: str):
-  """目标进程未运行时，通过 monkey 发送一次启动 Intent。"""
+  """目标进程未运行时，通过 launcher Activity 固定启动。"""
   activity = os.environ.get("MMAP_PHYS_ACTIVITY", "").strip()
   if activity:
     print(f"目标进程未启动，使用 am start 启动 Activity: {activity}")
     adb_shell(f"am start -n {shell_quote(activity)}")
     return
-  print(f"目标进程未启动，尝试启动应用: {name}")
-  adb_shell(f"monkey -p {shell_quote(name)} 1")
+  activity = resolve_launch_activity(name)
+  if not activity:
+    raise RuntimeError(
+        f"目标进程未启动，且无法解析 launcher Activity: {name}。"
+        "请设置 MMAP_PHYS_ACTIVITY，或在手机上手动启动目标场景后重试。")
+  print(f"目标进程未启动，使用 am start 启动 Activity: {activity}")
+  adb_shell(f"am start -n {shell_quote(activity)}")
 
 
 def force_stop_app(name: str, timeout_s: float = 5.0):
@@ -215,6 +229,7 @@ data_sources {{
         scope {{
           target_cmdline: "{name}"
         }}
+        user_frames: UNWIND_DWARF
         kernel_frames: {kernel_frames_value}
       }}
 {perf_ring_buffer_block.rstrip()}
