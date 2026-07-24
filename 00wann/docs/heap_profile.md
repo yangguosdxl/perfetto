@@ -5,21 +5,27 @@
 默认执行时不限制采集时长。脚本会在 heapprofd 就绪后启动 FS，并等待 logcat 出现 `登录场景完成`；该日志出现后继续稳定采集 30 秒，再请求 `heap_profile.py` 进入 `Waiting for profiler shutdown...` 收尾流程：
 
 ```bash
-00wann/run_heap_profile.sh
+00wann/run_heap_profile.sh --device 1C111FDF600AW5
 ```
+
+`--device SERIAL` 指定 adb 设备序列号。Python 控制器会把该值写入本次流程的
+`ANDROID_SERIAL`，供自身 adb 命令、`fsbootcmd_push_to_phone.sh` 和 Perfetto
+`heap_profile.py` 共同继承，确保采集、启动应用和拉取 trace 使用同一台设备。未传
+`--device` 时，外部已有的 `ANDROID_SERIAL` 继续生效，否则由 adb 默认选机；显式参数
+优先于外部环境变量。
 
 人工按 Ctrl+C 时，Python 主脚本也会请求 `heap_profile.py` 停止采集。Linux 下直接转发 `SIGINT`；Windows 下 `subprocess` 不支持对子进程发送 `SIGINT`，脚本会用新进程组和 Ctrl-Break bridge 把控制台事件转换为 `heap_profile.py` 内部的 `SIGINT` 处理。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
 
 如需指定采样 interval，可把 interval 作为第一个参数传入，单位为 bytes。不传时脚本默认使用 1024。真机验证中 4096 曾出现 malloc live 与 `meminfo Native Heap Alloc` 相差百 MB 级的问题；1024 在当前设备上通过 64MiB 绝对阈值验证：
 
 ```bash
-00wann/run_heap_profile.sh 1024
+00wann/run_heap_profile.sh --device 1C111FDF600AW5 1024
 ```
 
 如需指定 heapprofd 共享缓冲区大小，可把 `shmem-size` 作为第二个参数传入，单位为 bytes。该值必须是 4096 的 2 的幂倍数且至少 8192：
 
 ```bash
-00wann/run_heap_profile.sh 1024 67108864
+00wann/run_heap_profile.sh --device 1C111FDF600AW5 1024 67108864
 ```
 
 ## 启动目标应用
@@ -80,7 +86,7 @@ Windows Git Bash 中如果没有 `python3`，入口会回退到 `python` 或 `py
 测试和手工运行也可以用 `PYTHON=python` 或 `RUN_HEAP_PROFILE_PYTHON=python`
 显式指定解释器。
 
-AI 做真机验证时不要传入 duration 参数。采集结束必须由 FS logcat 输出 `登录场景完成` 触发，日志出现后继续稳定采集 30 秒；下探采样 interval 时使用 `00wann/run_heap_profile.sh <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。历史命令中的 `45000` 只做兼容忽略，不再作为推荐用法。
+AI 做真机验证时必须传入 `--device 1C111FDF600AW5`，不要传入 duration 参数。采集结束必须由 FS logcat 输出 `登录场景完成` 触发，日志出现后继续稳定采集 30 秒；下探采样 interval 时使用 `00wann/run_heap_profile.sh --device 1C111FDF600AW5 <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh --device 1C111FDF600AW5 <interval_bytes> <shmem_size>`。历史命令中的 `45000` 只做兼容忽略，不再作为推荐用法。
 
 默认不限制等待登录场景的时间。只有显式设置 `HEAP_PROFILE_LOGIN_TIMEOUT_S=<秒>` 时，脚本才会在未等到 `登录场景完成` 时超时退出；真机验收不要设置这个变量。`HEAP_PROFILE_LOGIN_STABLE_S` 默认是 30，只用于测试或排障覆盖，真机验收保持默认值。
 
