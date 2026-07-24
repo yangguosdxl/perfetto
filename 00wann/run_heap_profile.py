@@ -7,6 +7,7 @@ SIGINT，确保人工 Ctrl+C 后仍等待 heap_profile.py 完成 trace 拉取和
 
 from __future__ import annotations
 
+import argparse
 import datetime as _datetime
 import os
 import re
@@ -625,32 +626,47 @@ def wait_for_pid(package_name: str, shutdown_requested: callable,
   return pid
 
 
-def parse_args(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
-  args = list(argv)
+def parse_args(
+    argv: list[str],
+) -> tuple[str | None, list[str], list[str], list[str]]:
+  parser = argparse.ArgumentParser(
+      description="Collect a Perfetto Native heap profile for the FS app.")
+  parser.add_argument(
+      "--device",
+      metavar="SERIAL",
+      help="adb device serial; omitted to use adb's default device selection")
+  parser.add_argument("profile_args", nargs="*", metavar="PROFILE_ARG")
+  parsed = parser.parse_args(argv)
+
+  args = list(parsed.profile_args)
   if args and args[0] == "45000":
     # 兼容历史 AI 验证入口。Native heap 采集不能再按固定时长收尾，
     # 真实结束条件必须是 FS 输出“登录场景完成”。
     args = args[1:]
+  if len(args) > 2:
+    parser.error("expected at most interval_bytes and shmem_size")
   interval_bytes = args[0] if len(args) >= 1 else "1024"
   shmem_size = args[1] if len(args) >= 2 else "8388608"
 
   duration_args: list[str] = []
   interval_args = ["-i", interval_bytes] if interval_bytes else []
   shmem_args = ["--shmem-size", shmem_size] if shmem_size else []
-  return duration_args, interval_args, shmem_args
+  return parsed.device, duration_args, interval_args, shmem_args
 
 
 def main(argv: list[str]) -> int:
+  device_serial, duration_args, interval_args, shmem_args = parse_args(argv)
   script_dir = Path(__file__).resolve().parent
   os.chdir(script_dir)
   perfetto_root = load_perfetto_root(script_dir)
   env = build_env(perfetto_root, script_dir=script_dir)
+  if device_serial:
+    env["ANDROID_SERIAL"] = device_serial
   os.environ.update(env)
 
   traceconv = resolve_perfetto_tool(perfetto_root, "traceconv", "TRACECONV")
   trace_processor = resolve_perfetto_tool(perfetto_root, "trace_processor_shell",
                                           "TRACE_PROCESSOR")
-  duration_args, interval_args, shmem_args = parse_args(argv)
 
   out_dir = script_dir / "PerfData/mem" / _datetime.datetime.now().strftime(
       "%Y-%m-%d_%H-%M-%S")
