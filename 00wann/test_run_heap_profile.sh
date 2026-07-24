@@ -28,7 +28,7 @@ cat >"$tmpdir/config.sh" <<EOF
 PerfettoRoot="$tmpdir/perfetto"
 EOF
 cat >"$tmpdir/fsbootcmd_push_to_phone.sh" <<'EOF'
-printf 'FSBOOT_ANDROID_SERIAL=%s\n' "${ANDROID_SERIAL:-}" >>"${TEST_LOG:?}"
+:
 EOF
 
 mkdir -p \
@@ -46,7 +46,6 @@ set -euo pipefail
 log_file="${TEST_LOG:?}"
 pidof_count_file="${PIDOF_COUNT_FILE:?}"
 printf 'adb %s\n' "$*" >>"$log_file"
-printf 'ADB_ANDROID_SERIAL=%s\n' "${ANDROID_SERIAL:-}" >>"$log_file"
 if [[ "$1" == "shell" && "$2" == "pidof" ]]; then
   count=$(cat "$pidof_count_file")
   count=$((count + 1))
@@ -126,8 +125,6 @@ with open(log_path, "a", encoding="utf-8") as log:
   log.write("PYTHONPATH=" + os.environ.get("PYTHONPATH", "") + "\n")
   log.write("PYTHONUNBUFFERED=" + os.environ.get("PYTHONUNBUFFERED", "") + "\n")
   log.write("PATH=" + os.environ.get("PATH", "") + "\n")
-  log.write("HEAP_PROFILE_ANDROID_SERIAL=" +
-            os.environ.get("ANDROID_SERIAL", "") + "\n")
 
 out_dir = ""
 for index, arg in enumerate(sys.argv[1:]):
@@ -215,18 +212,7 @@ EOF
   done
 fi
 
-real_python=""
-for candidate in "${PYTHON:-}" python3 python py; do
-  if [[ -n "$candidate" ]] && command -v "$candidate" >/dev/null 2>&1 && \
-     "$candidate" --version >/dev/null 2>&1; then
-    real_python=$(command -v "$candidate")
-    break
-  fi
-done
-if [[ -z "$real_python" ]]; then
-  echo "未找到可运行的 Python 解释器"
-  exit 1
-fi
+real_python=$(command -v python3 || command -v python || command -v py)
 export RUN_HEAP_PROFILE_PYTHON="$real_python"
 export RUN_HEAP_PROFILE_INNER_PYTHON="$real_python"
 export RUN_HEAP_PROFILE_EXTRA_PATH="$tmpdir/bin"
@@ -300,41 +286,6 @@ spec.loader.exec_module(module)
 env = module.build_env(perfetto_root, script_dir=script_dir)
 if env["PERFETTO_BINARY_PATH"] != os.environ["PERFETTO_BINARY_PATH"]:
   raise SystemExit("外部 PERFETTO_BINARY_PATH 应优先于脚本默认符号目录")
-PY
-
-"$real_python" - "$python_run_heap_profile_path" <<'PY'
-import contextlib
-import importlib.util
-import os
-import sys
-from pathlib import Path
-
-module_path = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("run_heap_profile", module_path)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
-
-device, duration, interval, shmem = module.parse_args(
-    ["--device", "test-device", "128", "268435456"])
-if device != "test-device":
-  raise SystemExit(f"设备参数解析错误: {device!r}")
-if duration or interval != ["-i", "128"] or shmem != ["--shmem-size", "268435456"]:
-  raise SystemExit("设备参数不应改变现有采样参数")
-
-device, duration, interval, shmem = module.parse_args([])
-if device is not None:
-  raise SystemExit("未传 --device 时不应强制选择设备")
-
-for invalid in (["--device"], ["1024", "8388608", "extra"]):
-  try:
-    with open(os.devnull, "w", encoding="utf-8") as devnull:
-      with contextlib.redirect_stderr(devnull):
-        module.parse_args(invalid)
-  except SystemExit:
-    pass
-  else:
-    raise SystemExit(f"非法参数应失败: {invalid!r}")
 PY
 
 run_script() {
@@ -558,7 +509,7 @@ export FAKE_PIDOF_NEVER=1
 export HEAP_PROFILE_APP_START_TIMEOUT_S=1
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
 set +e
-run_script_with_timeout 20 "$TEST_LOG"
+run_script_with_timeout 8 "$TEST_LOG"
 app_start_timeout_rc=$?
 set -e
 unset FAKE_PIDOF_NEVER HEAP_PROFILE_APP_START_TIMEOUT_S HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -589,7 +540,7 @@ fi
 export FAKE_AM_START_RC=37
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=2
 set +e
-run_script_with_timeout 20 "$TEST_LOG"
+run_script_with_timeout 8 "$TEST_LOG"
 app_start_failed_rc=$?
 set -e
 unset FAKE_AM_START_RC HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -615,7 +566,7 @@ fi
 export FAKE_HEAP_PROFILE_IGNORE_SIGINT=1
 export HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S=1
 set +e
-run_script_with_timeout 30 "$TEST_LOG"
+run_script_with_timeout 12 "$TEST_LOG"
 profiler_shutdown_timeout_rc=$?
 set -e
 unset FAKE_HEAP_PROFILE_IGNORE_SIGINT HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S
@@ -675,18 +626,6 @@ if ! grep -Fq -- "--shmem-size 268435456" "$TEST_LOG"; then
   cat "$TEST_LOG"
   exit 1
 fi
-
-run_script "$TEST_LOG" --device test-device 128 268435456
-for marker in \
-  "ADB_ANDROID_SERIAL=test-device" \
-  "FSBOOT_ANDROID_SERIAL=test-device" \
-  "HEAP_PROFILE_ANDROID_SERIAL=test-device"; do
-  if ! grep -Fq "$marker" "$TEST_LOG"; then
-    echo "设备序列号未传到完整采集链: $marker"
-    cat "$TEST_LOG"
-    exit 1
-  fi
-done
 
 if [[ -z "${MSYSTEM:-}" ]]; then
   export FAKE_HEAP_PROFILE_WAIT_FOR_SIGINT=1
@@ -872,7 +811,7 @@ fi
 export FAKE_LOGCAT_NO_LOGIN=1
 export HEAP_PROFILE_LOGIN_TIMEOUT_S=1
 set +e
-run_script_with_timeout 20 "$TEST_LOG"
+run_script_with_timeout 6 "$TEST_LOG"
 login_timeout_rc=$?
 set -e
 unset FAKE_LOGCAT_NO_LOGIN HEAP_PROFILE_LOGIN_TIMEOUT_S

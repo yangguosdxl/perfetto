@@ -12,7 +12,7 @@ mmap_phys_analyzer.md
 
 # native heap
 run_heap_profile.sh
-如果是在 AI 中验证 `run_heap_profile.sh`，必须使用 `--device 1C111FDF600AW5` 指定真机，不要传 duration 参数，也不要用固定时长截断采集；必须等 logcat 出现 `登录场景完成` 后继续稳定采集 30 秒，再让脚本自动收尾。需要调整采样参数时使用 `00wann/run_heap_profile.sh --device 1C111FDF600AW5 <interval_bytes> <shmem_size>`。
+如果是在 AI 中验证 `run_heap_profile.sh`，不要传 duration 参数，也不要用固定时长截断采集；必须等 logcat 出现 `登录场景完成` 后继续稳定采集 30 秒，再让脚本自动收尾。需要调整采样参数时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。
 评估 Native heap profile 对启动耗时影响时，使用 `run_heap_startup_eval.sh`，启动完成点必须按 logcat 出现 `LAN 更新流程开始` 判断；不能用 `am start -W` 的 Activity 可见时间替代业务启动完成时间。
 查Bug时要以perfetto源码为依据
 

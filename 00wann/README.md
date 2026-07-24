@@ -84,7 +84,7 @@ Native heap 调用栈分析
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | mmap 采集、mmap 验证、host 兼容性改动 | 45 秒无栈 mmap 验证：`MMAP_PHYS_APP=com.example.meminfodemo MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000` |
 | mmap 调用栈归因改动               | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景                                                                                                                       |
-| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh --device 1C111FDF600AW5`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号                                                                                 |
+| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号                                                                                                           |
 | heapprofd malloc 统计改动      | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh`                                                                                                                            |
 | meminfo demo 或解析改动         | 跑 `./run_meminfo_android_demo.sh`                                                                                                                                        |
 
@@ -410,33 +410,27 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 1. 自动选择 Python。
 2. 调用 run_heap_profile.py。
 3. 目标包名固定为 com.fs.t.prf。
-4. `--device SERIAL` 指定本次采集使用的 adb 设备；未传时沿用 `ANDROID_SERIAL` 或 adb 默认选机。
-5. 不传 duration；脚本等待 `登录场景完成` 日志出现后继续稳定采集 30 秒，再请求 Perfetto 收尾。人工 Ctrl+C 时，Windows 下通过新进程组和 Ctrl-Break bridge 触发 Perfetto 的 SIGINT 收尾。
-6. 不传 interval 时使用 1024 bytes。
-7. 不传 shmem-size 时使用 8388608 bytes。
-8. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
+4. 不传 duration；脚本等待 `登录场景完成` 日志出现后继续稳定采集 30 秒，再请求 Perfetto 收尾。人工 Ctrl+C 时，Windows 下通过新进程组和 Ctrl-Break bridge 触发 Perfetto 的 SIGINT 收尾。
+5. 不传 interval 时使用 1024 bytes。
+6. 不传 shmem-size 时使用 8388608 bytes。
+7. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
 ```
 
 命令：
 
 ```bash
 ./run_heap_profile.sh
-./run_heap_profile.sh --device 1C111FDF600AW5
 ./run_heap_profile.sh 1024
-./run_heap_profile.sh --device 1C111FDF600AW5 1024 67108864
+./run_heap_profile.sh 1024 67108864
 ```
 
 参数说明：
 
 
-| 参数                  | 默认值       | 说明                                      |
-| ------------------- | --------- | --------------------------------------- |
-| `--device SERIAL`   | adb 默认选机  | 指定 adb 设备序列号；本次采集的所有 adb 子进程使用同一设备。 |
-| `1: interval_bytes` | `1024`    | heapprofd 采样间隔，单位 bytes。                |
-| `2: shmem_size`     | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。             |
-
-未传 `--device` 时，外部已有的 `ANDROID_SERIAL` 继续生效；显式传入
-`--device` 时以命令行值为准。
+| 位置参数                | 默认值       | 说明                          |
+| ------------------- | --------- | --------------------------- |
+| `1: interval_bytes` | `1024`    | heapprofd 采样间隔，单位 bytes。    |
+| `2: shmem_size`     | `8388608` | heapprofd 共享缓冲区大小，单位 bytes。 |
 
 
 环境变量：
@@ -480,13 +474,6 @@ PerfData/mem/<时间戳>/
 
 用途：Native heap profile 的实际控制器，负责子进程管理、中断转发、启动目标 App、meminfo 抓取和采集后验证。
 
-命令：
-
-```bash
-python run_heap_profile.py --device 1C111FDF600AW5
-python run_heap_profile.py --device 1C111FDF600AW5 1024 67108864
-```
-
 默认行为：
 
 ```text
@@ -505,11 +492,10 @@ python run_heap_profile.py --device 1C111FDF600AW5 1024 67108864
 参数说明：
 
 
-| 参数                  | 默认值       | 说明                                      |
-| ------------------- | --------- | --------------------------------------- |
-| `--device SERIAL`   | adb 默认选机  | 通过 `ANDROID_SERIAL` 约束控制器及其子进程使用的设备。   |
-| `1: interval_bytes` | `1024`    | 传给 `heap_profile.py -i`。                  |
-| `2: shmem_size`     | `8388608` | 传给 `heap_profile.py --shmem-size`。        |
+| 位置参数                | 默认值       | 说明                                 |
+| ------------------- | --------- | ---------------------------------- |
+| `1: interval_bytes` | `1024`    | 传给 `heap_profile.py -i`。           |
+| `2: shmem_size`     | `8388608` | 传给 `heap_profile.py --shmem-size`。 |
 
 
 环境变量同 `run_heap_profile.sh`。
@@ -1177,5 +1163,5 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000
 
 # 5. Native heap profile AI 验证
-./run_heap_profile.sh --device 1C111FDF600AW5
+./run_heap_profile.sh
 ```
