@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-source "$script_dir/common_tools.sh"
-python_bin="${RUN_HEAP_PROFILE_PYTHON:-$(select_python)}"
-script_path="$script_dir/run_heap_profile.py"
-if is_windows_git_bash && command -v cygpath >/dev/null 2>&1; then
-  script_path=$(cygpath -w "$script_path")
-fi
-exec "$python_bin" "$script_path" "$@"
+cd "$script_dir"
+
+# 保留旧位置参数，由统一框架的 malloc 插件转交专业后端。
+exec "$script_dir/run_device_test.sh" malloc -- "$@"

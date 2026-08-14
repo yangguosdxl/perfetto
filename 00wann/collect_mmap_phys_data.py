@@ -16,9 +16,17 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+from profile_action_api import ProfileActionContext
+from profile_action_runner import (load_action_module,
+                                   resolve_action_module_path,
+                                   run_profile_action_module)
 
 ARM64_MMAP_NR = 222
 ARM64_MUNMAP_NR = 215
@@ -26,6 +34,13 @@ ARM64_MREMAP_NR = 216
 
 IS_INTERRUPTED = False
 SMAPS_HEADER_RE = re.compile(rb"^[0-9a-fA-F]+-[0-9a-fA-F]+\s+")
+LOGCAT_PID_RE = re.compile(r"\(\s*(\d+)\)")
+LOGIN_DONE_PATTERN = "登录场景完成"
+TABLE_READY_PATTERN = "RegistForGameStart.LoadOtherTable.End"
+RPC_LOCAL_PORT = int(os.environ.get("HEAP_PROFILE_RPC_LOCAL_PORT", "12346"))
+LOGIN_TIMEOUT_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_TIMEOUT_S", "0"))
+TABLE_READY_TIMEOUT_SECONDS = int(
+    os.environ.get("HEAP_PROFILE_GM_READY_TIMEOUT_S", "180"))
 
 TRACE_HEALTH_STATS = (
     "traced_buf_buffer_size",
@@ -238,6 +253,7 @@ data_sources {{
 }}
 """
 
+  duration_line = f"duration_ms: {duration_ms}\n" if duration_ms > 0 else ""
   return f"""buffers {{
   size_kb: {buffer_kb}
   fill_policy: RING_BUFFER
@@ -247,15 +263,17 @@ data_sources {{
 {process_stats_block}
 {perf_block}
 
-duration_ms: {duration_ms}
+{duration_line.rstrip()}
 write_into_file: true
 flush_period_ms: 5000
 flush_timeout_ms: 30000
 """
 
 
-def write_config(config: str, output_dir: str) -> str:
-  host_path = os.path.join(output_dir, "mmap_phys_config.pbtxt")
+def write_config(config: str,
+                 output_dir: str,
+                 filename: str = "mmap_phys_config.pbtxt") -> str:
+  host_path = os.path.join(output_dir, filename)
   with open(host_path, "w", encoding="utf-8") as fd:
     fd.write(config)
   print(f"Perfetto 配置已保存: {host_path}")
@@ -282,6 +300,132 @@ def start_perfetto(config: str, device_trace: str, no_guardrails: bool) -> int:
     raise RuntimeError(f"启动 perfetto 失败，输出: {out}") from exc
   print(f"Perfetto 已启动: pid={pid}")
   return pid
+
+
+@dataclass(frozen=True)
+class RootTracedPerfState:
+  """记录 root producer 及启动前系统状态，供异常路径精确恢复。"""
+
+  pid: int
+  original_perf_lsm_hooks: str
+  original_service_state: str
+
+
+def _run_device_adb(args: list[str], timeout: float = 5) -> subprocess.CompletedProcess:
+  """执行固定真机 adb 命令，并保留输出用于阶段校验。"""
+  return subprocess.run(
+      _device_adb_command() + args,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      check=False,
+      timeout=timeout)
+
+
+def start_root_traced_perf() -> Optional[RootTracedPerfState]:
+  """在 Perfetto 会话前启动唯一 root producer，并阻止 init 重复拉起。"""
+  enabled = os.environ.get("MMAP_PHYS_USE_ROOT_TRACED_PERF", "0").strip()
+  if enabled.lower() in ("0", "false", "no", "off"):
+    print("跳过 root traced_perf：MMAP_PHYS_USE_ROOT_TRACED_PERF=0")
+    return None
+
+  hooks = _run_device_adb(
+      ["shell", "getprop", "sys.init.perf_lsm_hooks"])
+  service = _run_device_adb(
+      ["shell", "getprop", "init.svc.traced_perf"])
+  if hooks.returncode != 0 or service.returncode != 0:
+    raise RuntimeError("读取 traced_perf 原始系统状态失败")
+  original_hooks = hooks.stdout.strip()
+  original_service = service.stdout.strip()
+
+  # traced_perf.rc 会在 linux.perf 数据源启动时根据 lazy 属性再次拉起 nobody
+  # producer。先临时关闭对应 init 条件，保证本轮只有 root producer 注册。
+  commands = (
+      ["shell", "su", "0", "setprop", "sys.init.perf_lsm_hooks", "0"],
+      ["shell", "su", "0", "setprop", "ctl.stop", "traced_perf"],
+      ["shell", "su", "0", "killall", "traced_perf"],
+  )
+  for command in commands:
+    print("+ " + " ".join(_device_adb_command() + command))
+    _run_device_adb(command)
+
+  command = ["shell", "su", "0", "/system/bin/traced_perf", "--background"]
+  print("+ " + " ".join(_device_adb_command() + command))
+  try:
+    proc = _run_device_adb(command, timeout=15)
+  except (OSError, subprocess.SubprocessError) as exc:
+    _restore_traced_perf_system_state(original_hooks, original_service)
+    raise RuntimeError(f"root traced_perf 启动异常: {exc}") from exc
+  if proc.returncode != 0:
+    _restore_traced_perf_system_state(original_hooks, original_service)
+    raise RuntimeError(
+        f"root traced_perf 启动失败，退出码={proc.returncode}|输出={proc.stdout.strip()}")
+  lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+  pid = int(lines[-1]) if lines and lines[-1].isdigit() else None
+  if pid is None:
+    _restore_traced_perf_system_state(original_hooks, original_service)
+    raise RuntimeError(
+        f"root traced_perf 启动后未找到 PID|输出={proc.stdout.strip()}|"
+        "请检查 /system/bin/traced_perf 是否支持 --background")
+
+  time.sleep(0.5)
+  processes = _run_device_adb(
+      ["shell", "ps", "-A", "-o", "USER,PID,NAME"])
+  producer_rows = [
+      line.split() for line in processes.stdout.splitlines()
+      if line.split() and line.split()[-1] == "traced_perf"
+  ]
+  valid = (processes.returncode == 0 and len(producer_rows) == 1 and
+           len(producer_rows[0]) >= 3 and producer_rows[0][0] == "root" and
+           producer_rows[0][1] == str(pid))
+  if not valid:
+    _run_device_adb(["shell", "su", "0", "kill", str(pid)])
+    _restore_traced_perf_system_state(original_hooks, original_service)
+    rows = " ; ".join(" ".join(row) for row in producer_rows) or "<empty>"
+    raise RuntimeError(f"root traced_perf 唯一性检查失败|processes={rows}")
+
+  print(
+      "root traced_perf 已就绪: "
+      f"pid={pid}|producer_count=1|lazy_init_suppressed=1")
+  return RootTracedPerfState(pid, original_hooks, original_service)
+
+
+def _restore_traced_perf_system_state(original_hooks: str,
+                                       original_service: str) -> None:
+  """恢复启动前的 init 属性和 traced_perf service 状态。"""
+  _run_device_adb([
+      "shell", "su", "0", "setprop", "sys.init.perf_lsm_hooks",
+      original_hooks
+  ])
+  action = "ctl.start" if original_service == "running" else "ctl.stop"
+  _run_device_adb(
+      ["shell", "su", "0", "setprop", action, "traced_perf"])
+
+
+def stop_root_traced_perf(state: Optional[RootTracedPerfState]) -> None:
+  """停止本轮 root producer，并恢复采集前的 init producer 状态。"""
+  if state is None:
+    return
+  proc = _run_device_adb(
+      ["shell", "su", "0", "kill", str(state.pid)])
+  if proc.returncode != 0:
+    print(f"WARN: root traced_perf 停止失败 pid={state.pid}: {proc.stdout.strip()}",
+          file=sys.stderr)
+  _restore_traced_perf_system_state(
+      state.original_perf_lsm_hooks, state.original_service_state)
+  print(
+      "traced_perf 系统状态已恢复: "
+      f"perf_lsm_hooks={state.original_perf_lsm_hooks or '<empty>'}|"
+      f"service={state.original_service_state or '<empty>'}")
+
+
+def _device_adb_command() -> list[str]:
+  """生成带固定真机序列号的 adb 前缀，避免多设备时误选目标。"""
+  command = ["adb"]
+  serial = os.environ.get("ANDROID_SERIAL", "").strip()
+  if serial:
+    command.extend(["-s", serial])
+  return command
 
 
 def device_time_ns(log: bool = True) -> int:
@@ -342,14 +486,16 @@ def collect_smaps(pid: int,
                   interval_ms: int,
                   use_su: bool,
                   duration_ms: int,
-                  run_as_package: Optional[str] = None):
+                  run_as_package: Optional[str] = None,
+                  stop_event: Optional[threading.Event] = None):
   os.makedirs(smaps_dir, exist_ok=True)
   interval_s = interval_ms / 1000.0
   duration_s = duration_ms / 1000.0
   start_s = time.monotonic()
   sample_count = 0
   progress = TwoLineProgress()
-  while not IS_INTERRUPTED and is_process_alive(perfetto_pid):
+  while (not IS_INTERRUPTED and is_process_alive(perfetto_pid) and
+         not (stop_event and stop_event.is_set())):
     ts_ns = device_time_ns(log=False)
     path = os.path.join(smaps_dir, f"{ts_ns}.smaps")
     try:
@@ -358,15 +504,22 @@ def collect_smaps(pid: int,
         fd.write(data)
       sample_count += 1
       remaining_s = duration_s - (time.monotonic() - start_s)
+      progress_text = (
+          format_smaps_progress_line(path, len(data), remaining_s)
+          if duration_ms > 0 else
+          f"smaps 快照: {path} ({len(data)} bytes) 等待测试操作结束")
       progress.update("+ adb shell cat /proc/uptime",
-                      format_smaps_progress_line(path, len(data), remaining_s))
+                      progress_text)
     except subprocess.CalledProcessError as exc:
       print(
           f"读取 smaps 失败: {exc.output.decode('utf-8', errors='replace')}",
           file=sys.stderr)
     except RuntimeError as exc:
       print(f"读取 smaps 失败: {exc}", file=sys.stderr)
-    time.sleep(interval_s)
+    if stop_event:
+      stop_event.wait(interval_s)
+    else:
+      time.sleep(interval_s)
   print(f"smaps 采样结束: {sample_count} 个快照")
   if sample_count == 0:
     raise RuntimeError("没有采集到有效 smaps 快照")
@@ -378,6 +531,75 @@ def stop_perfetto(perfetto_pid: int):
     subprocess.call(["adb", "shell", "kill", "-INT", str(perfetto_pid)])
   while is_process_alive(perfetto_pid):
     time.sleep(0.2)
+
+
+def start_logcat_capture(output_dir: str):
+  """清空旧日志并持续保存本轮 logcat。"""
+  subprocess.call(["adb", "logcat", "-c"])
+  stdout_file = open(
+      os.path.join(output_dir, "logcat.txt"), "wb")
+  stderr_file = open(
+      os.path.join(output_dir, "logcat.err.txt"), "wb")
+  process = subprocess.Popen(
+      ["adb", "logcat", "-v", "time"],
+      stdout=stdout_file,
+      stderr=stderr_file)
+  return process, stdout_file, stderr_file
+
+
+def stop_logcat_capture(process, stdout_file, stderr_file):
+  if process and process.poll() is None:
+    process.terminate()
+    try:
+      process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      process.kill()
+      process.wait(timeout=5)
+  for file_obj in (stdout_file, stderr_file):
+    if file_obj:
+      file_obj.close()
+
+
+def wait_for_app_log_pattern(logcat_path: str,
+                             pid: int,
+                             pattern: str,
+                             timeout_seconds: int) -> str:
+  """同步阶段等待：只接受当前 App PID 的完整 logcat 行。"""
+  deadline = (
+      time.monotonic() + timeout_seconds if timeout_seconds > 0 else None)
+  offset = 0
+  tail = ""
+  while not IS_INTERRUPTED:
+    if not is_process_alive(pid):
+      return "app_died"
+    if os.path.exists(logcat_path):
+      size = os.path.getsize(logcat_path)
+      if size < offset:
+        offset = 0
+        tail = ""
+      with open(logcat_path, encoding="utf-8", errors="replace") as logcat:
+        logcat.seek(offset)
+        chunk = logcat.read()
+        offset = logcat.tell()
+      if chunk:
+        text = tail + chunk
+        lines = text.splitlines(keepends=True)
+        tail = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+          tail = lines.pop()
+        for line in lines:
+          pid_match = LOGCAT_PID_RE.search(line)
+          if (pid_match and int(pid_match.group(1)) == pid and
+              pattern in line):
+            print(f"APP_LOG_READY|pattern={pattern}|pid={pid}")
+            return "ready"
+    if deadline is not None and time.monotonic() >= deadline:
+      print(
+          f"APP_LOG_WAIT=FAIL|reason=timeout|pattern={pattern}|"
+          f"pid={pid}|timeout_s={timeout_seconds}")
+      return "timeout"
+    time.sleep(0.2)
+  return "interrupted"
 
 
 def pull_trace(device_trace: str, host_trace: str):
@@ -469,6 +691,38 @@ def query_trace_health(trace_processor: str, trace_path: str):
   return parse_trace_processor_csv(proc.stdout)
 
 
+def query_target_perf_callstacks(trace_processor: str, trace_path: str,
+                                 pid: int):
+  """统计目标进程 perf 样本和已展开调用栈，防止空归因误报成功。"""
+  sql = f"""
+select
+  count(1) as perf_samples,
+  count(ps.callsite_id) as perf_callsites
+from perf_sample ps
+join thread t using (utid)
+join process p using (upid)
+where p.pid = {int(pid)}
+"""
+  print("+ " + " ".join([trace_processor, "query", trace_path, sql]))
+  proc = subprocess.run([trace_processor, "query", trace_path, sql],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False)
+  if proc.returncode != 0:
+    print("目标进程 perf 调用栈查询失败:", file=sys.stderr)
+    print(proc.stdout, file=sys.stderr)
+    return None
+  rows = parse_trace_processor_csv(
+      proc.stdout, required_columns=("perf_samples", "perf_callsites"))
+  if not rows:
+    return None
+  return {
+      "perf_samples": int_value(rows[-1].get("perf_samples")),
+      "perf_callsites": int_value(rows[-1].get("perf_callsites")),
+  }
+
+
 def summarize_trace_health(rows):
 
   def sum_stats(names):
@@ -554,9 +808,14 @@ def print_trace_health(summary):
     print(f"  WARN: traced_perf 内部调用栈 sample 丢失计数="
           f"{perf_samples_skipped}，通常表示 reader 到 "
           "unwinder 队列 load shedding，可降低采样压力或减少展开成本")
+  if "perf_samples" in summary:
+    print(
+        "  目标进程调用栈: "
+        f"samples={summary['perf_samples']}, "
+        f"callsites={summary.get('perf_callsites', 0)}")
 
 
-def check_trace_health(args, trace_path: str):
+def check_trace_health(args, trace_path: str, pid: Optional[int] = None):
   if not args.trace_processor:
     print("跳过 Perfetto buffer 健康检查：未指定 --trace-processor", file=sys.stderr)
     return
@@ -565,6 +824,11 @@ def check_trace_health(args, trace_path: str):
     print("跳过 Perfetto buffer 健康检查：stats 查询无结果", file=sys.stderr)
     return None
   summary = summarize_trace_health(rows)
+  if pid is not None:
+    callstack_health = query_target_perf_callstacks(
+        args.trace_processor, trace_path, pid)
+    if callstack_health:
+      summary.update(callstack_health)
   print_trace_health(summary)
   return summary
 
@@ -757,6 +1021,7 @@ def build_syscall_events_from_rows(rows, analyzer):
       ev = analyzer.SyscallEvent(
           ts=int(row["ts"]),
           utid=int(row["utid"]),
+          tid=int(row.get("tid") or row["utid"]),
           name=row["event_name"],
           syscall_id=None,
           ret=None,
@@ -1190,6 +1455,16 @@ def build_memory_health_report(mmap_summary,
               int_value((trace_health or {}).get(
                   "perf_samples_skipped_dataloss")),
       },
+      "perf_callstacks": {
+          "status":
+              ("not_checked" if "perf_callsites" not in (trace_health or {})
+               else "pass" if int_value((trace_health or {}).get(
+                   "perf_callsites")) > 0 else "fail"),
+          "samples":
+              int_value((trace_health or {}).get("perf_samples")),
+          "callsites":
+              int_value((trace_health or {}).get("perf_callsites")),
+      },
       "mmap_syscalls": {
           "status":
               "pass" if int_value(mmap_summary.get("syscall_events")) > 0 else
@@ -1315,6 +1590,9 @@ def build_memory_health_report_markdown(report) -> str:
            f"data_loss={checks['perf_callstack_buffer']['data_loss']}"),
           ("traced_perf profiler", checks["traced_perf_profiler"]["status"],
            f"data_loss={checks['traced_perf_profiler']['data_loss']}"),
+          ("目标进程 perf 调用栈", checks["perf_callstacks"]["status"],
+           "samples={samples}, callsites={callsites}".format(
+               **checks["perf_callstacks"])),
           ("mmap syscalls", checks["mmap_syscalls"]["status"],
            "events={events}, lifecycle={lifecycle_events}".format(
                **checks["mmap_syscalls"])),
@@ -1380,6 +1658,9 @@ def build_memory_validation_status(mmap_summary, trace_health):
       issues.append("perf_data_loss")
     if int_value(trace_health.get("perf_samples_skipped_dataloss")) > 0:
       issues.append("perf_samples_skipped_dataloss")
+    perf_callsites = int_value(trace_health.get("perf_callsites"))
+    if "perf_callsites" in trace_health and perf_callsites == 0:
+      issues.append("perf_callstacks_missing")
   return {
       "status": "fail" if issues else "pass",
       "issues": issues,
@@ -1479,7 +1760,8 @@ def collect_memory_validation(args,
   return {"trace_health": trace_health, "report_path": report_path}
 
 
-def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
+def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str,
+                 callstack_trace_path: Optional[str] = None):
   analyzer = args.analyzer
   if not analyzer:
     analyzer = os.path.join(
@@ -1502,6 +1784,8 @@ def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str):
       "--pprof-output",
       os.path.join(args.output, "mmap_phys_attribution.pprof.pb.gz"),
   ]
+  if callstack_trace_path:
+    cmd.extend(["--callstack-trace", callstack_trace_path])
   if args.trace_processor:
     cmd.extend(["--trace-processor", args.trace_processor])
   if getattr(args, "classify_config", None):
@@ -1594,6 +1878,91 @@ def prepare_output_dir(output_dir: str) -> bool:
   return True
 
 
+def finish_collection(args, pid: int, device_trace: str, trace_path: str,
+                      smaps_dir: str,
+                      callstack_device_trace: Optional[str] = None):
+  """拉回 trace，并复用同一套 meminfo、符号化、分析和健康验证。"""
+  if callstack_device_trace:
+    callstack_trace_path = os.path.join(
+        args.output, "mmap_callstack_trace.perfetto-trace")
+    pull_trace(device_trace, trace_path)
+    pull_trace(callstack_device_trace, callstack_trace_path)
+  else:
+    pull_trace(device_trace, trace_path)
+  try:
+    meminfo_path = capture_meminfo(args.name, args.output)
+  except subprocess.CalledProcessError as exc:
+    meminfo_path = ""
+    print("跳过 meminfo 对比，dumpsys meminfo 失败:", file=sys.stderr)
+    print(exc.output.decode("utf-8", errors="replace"), file=sys.stderr)
+
+  analysis_callstack_trace_path = trace_path
+  if args.mmap_callstacks:
+    analysis_callstack_trace_path = symbolize_trace(
+        getattr(args, "traceconv", None),
+        callstack_trace_path if callstack_device_trace else trace_path,
+        args.output)
+
+  trace_health = None
+  if args.mmap_callstacks:
+    trace_health = check_trace_health(args, trace_path)
+    callstack_health = (
+        check_trace_health(args, callstack_trace_path, pid)
+        if callstack_device_trace else check_trace_health(args, trace_path, pid))
+    if trace_health is None:
+      trace_health = callstack_health
+    elif callstack_health and callstack_device_trace:
+      trace_health["buffer_size_bytes"] = int(
+          trace_health.get("buffer_size_bytes", 0)) + int(
+          callstack_health.get("buffer_size_bytes", 0))
+      trace_health["bytes_written"] = int(
+          trace_health.get("bytes_written", 0)) + int(
+          callstack_health.get("bytes_written", 0))
+      trace_health["perfetto_data_loss"] = int(
+          trace_health.get("perfetto_data_loss", 0)) + int(
+          callstack_health.get("perfetto_data_loss", 0))
+      for key in (
+          "perf_data_loss", "perf_samples_skipped_dataloss",
+          "perf_samples", "perf_callsites"):
+        if key in callstack_health:
+          trace_health[key] = callstack_health[key]
+      print("合并后的 mmap 主功能健康检查:")
+      print_trace_health(trace_health)
+    elif callstack_health:
+      trace_health.update(callstack_health)
+
+  if args.mmap_callstacks and not args.no_analyze:
+    if callstack_device_trace:
+      run_analyzer(
+          args,
+          pid,
+          trace_path,
+          smaps_dir,
+          callstack_trace_path=analysis_callstack_trace_path)
+    else:
+      run_analyzer(args, pid, analysis_callstack_trace_path, smaps_dir)
+  elif not args.mmap_callstacks and not args.no_analyze:
+    print("跳过 mmap 调用栈分析：当前验证模式未采集 mmap 调用栈")
+
+  validation = collect_memory_validation(args, pid, trace_path, meminfo_path,
+                                         trace_health)
+  print("采集完成")
+  print(f"输出目录: {os.path.abspath(args.output)}")
+  validation = validation or {"trace_health": trace_health, "report_path": ""}
+  callstacks_missing = (
+      args.mmap_callstacks and trace_health is not None and
+      "perf_callsites" in trace_health and
+      int_value(trace_health["perf_callsites"]) == 0)
+  validation["status"] = 1 if callstacks_missing else 0
+  if callstacks_missing:
+    print(
+        "MMAP_PROFILE_FAILED|reason=perf_callstacks_missing|"
+        f"pid={pid}|samples={int_value((trace_health or {}).get('perf_samples'))}|"
+        "请检查 traced_perf 读取 /proc/<pid>/maps 的权限")
+  validation["output"] = args.output
+  return validation
+
+
 def run_collection(args, start_target_after_perfetto: bool = False):
   """执行一次 mmap 物理内存采集，并返回验证健康信息。"""
   if not prepare_output_dir(args.output):
@@ -1634,36 +2003,140 @@ def run_collection(args, start_target_after_perfetto: bool = False):
     if IS_INTERRUPTED:
       stop_perfetto(perfetto_pid)
 
-  pull_trace(device_trace, trace_path)
+  return finish_collection(args, pid, device_trace, trace_path, smaps_dir)
+
+
+def run_profile_controlled_collection(args, action_module):
+  """主调用栈模式：由登录后的测试协程决定采集结束时间。"""
+  if not prepare_output_dir(args.output):
+    return {"status": 1, "trace_health": None, "report_path": ""}
+  smaps_dir = os.path.join(args.output, "smaps")
+  trace_path = os.path.join(args.output, "mmap_trace.perfetto-trace")
+  trace_id = int(time.time() * 1000)
+  device_trace = f"/data/misc/perfetto-traces/mmap-lifecycle-{trace_id}"
+  callstack_device_trace = (
+      f"/data/misc/perfetto-traces/mmap-callstack-{trace_id}")
+  lifecycle_config = build_perfetto_config(
+      name=args.name,
+      duration_ms=0,
+      buffer_kb=args.buffer_kb,
+      include_ftrace=not args.no_ftrace,
+      kernel_frames=not args.no_kernel_frames,
+      perf_ring_buffer_pages=args.perf_ring_buffer_pages,
+      perf_ring_buffer_read_period_ms=args.perf_ring_buffer_read_period_ms,
+      include_mmap_callstacks=False)
+  callstack_config = build_perfetto_config(
+      name=args.name,
+      duration_ms=0,
+      buffer_kb=args.buffer_kb,
+      include_ftrace=False,
+      kernel_frames=not args.no_kernel_frames,
+      perf_ring_buffer_pages=args.perf_ring_buffer_pages,
+      perf_ring_buffer_read_period_ms=args.perf_ring_buffer_read_period_ms,
+      include_mmap_callstacks=True)
+  write_config(lifecycle_config, args.output, "mmap_lifecycle_config.pbtxt")
+  write_config(callstack_config, args.output, "mmap_callstack_config.pbtxt")
+
+  lifecycle_perfetto_pid = None
+  callstack_perfetto_pid = None
+  root_traced_perf_state = None
+  logcat_process = logcat_stdout = logcat_stderr = None
+  smaps_thread = None
+  smaps_stop = threading.Event()
+  smaps_errors = []
+  stage_failed = False
+  pid = 0
   try:
-    meminfo_path = capture_meminfo(args.name, args.output)
-  except subprocess.CalledProcessError as exc:
-    meminfo_path = ""
-    print("跳过 meminfo 对比，dumpsys meminfo 失败:", file=sys.stderr)
-    print(exc.output.decode("utf-8", errors="replace"), file=sys.stderr)
+    # 生命周期会话先于 App，完整记录启动期 mmap；调用栈会话等 PID 出现后再启，
+    # 避免首个 perf sample 在 /proc 描述符尚未可用时永久进入 FdsTimedOut。
+    root_traced_perf_state = start_root_traced_perf()
+    lifecycle_perfetto_pid = start_perfetto(
+        lifecycle_config, device_trace, args.no_guardrails)
+    force_stop_app(args.name)
+    logcat_process, logcat_stdout, logcat_stderr = start_logcat_capture(
+        args.output)
+    pid = wait_for_pid(args.name, args.wait_timeout_s)
+    callstack_perfetto_pid = start_perfetto(
+        callstack_config, callstack_device_trace, args.no_guardrails)
+    def collect_smaps_in_background():
+      try:
+        collect_smaps(
+            pid, lifecycle_perfetto_pid, smaps_dir, args.smaps_interval_ms,
+            args.use_su, 0, run_as_package=args.name,
+            stop_event=smaps_stop)
+      except Exception as exc:  # noqa: BLE001 - 主线程统一收尾后返回失败。
+        smaps_errors.append(exc)
 
-  analysis_trace_path = trace_path
-  if args.mmap_callstacks:
-    analysis_trace_path = symbolize_trace(
-        getattr(args, "traceconv", None), trace_path, args.output)
+    smaps_thread = threading.Thread(
+        target=collect_smaps_in_background, daemon=True)
+    smaps_thread.start()
 
-  trace_health = None
-  if args.mmap_callstacks:
-    trace_health = check_trace_health(args, trace_path)
+    logcat_path = os.path.join(args.output, "logcat.txt")
+    login_state = wait_for_app_log_pattern(
+        logcat_path, pid, LOGIN_DONE_PATTERN, LOGIN_TIMEOUT_SECONDS)
+    if login_state != "ready":
+      print(f"MMAP_PROFILE_FAILED|reason=login_{login_state}|pid={pid}")
+      stage_failed = True
+    else:
+      table_state = wait_for_app_log_pattern(
+          logcat_path, pid, TABLE_READY_PATTERN, TABLE_READY_TIMEOUT_SECONDS)
+      if table_state != "ready":
+        print(f"MMAP_PROFILE_FAILED|reason=table_{table_state}|pid={pid}")
+        stage_failed = True
+      else:
+        context = ProfileActionContext(
+            app=args.name,
+            pid=pid,
+            output_dir=Path(args.output).resolve(),
+            logcat_path=Path(logcat_path).resolve(),
+            adb=os.environ.get("ADB_BINARY", "adb"),
+            rpc_local_port=RPC_LOCAL_PORT,
+            android_serial=os.environ.get("ANDROID_SERIAL", ""),
+            summary_path=Path(args.output, "run_summary.txt").resolve(),
+        )
+        result = run_profile_action_module(
+            action_module,
+            context,
+            lambda: IS_INTERRUPTED,
+            lambda: is_process_alive(pid),
+        )
+        stage_failed = not result.success
+  except Exception as exc:  # noqa: BLE001 - 必须先收尾 trace 再返回失败。
+    print(
+        f"MMAP_PROFILE_FAILED|reason=collection_control_failed|"
+        f"error={type(exc).__name__}: {exc}", file=sys.stderr)
+    stage_failed = True
+  finally:
+    smaps_stop.set()
+    if smaps_thread:
+      smaps_thread.join(timeout=max(5.0, args.smaps_interval_ms / 1000.0 + 2))
+      if smaps_thread.is_alive():
+        smaps_errors.append(RuntimeError("smaps 线程未在超时内结束"))
+    if smaps_errors:
+      print(
+          "MMAP_PROFILE_FAILED|reason=smaps_collection_failed|"
+          f"error={type(smaps_errors[0]).__name__}: {smaps_errors[0]}",
+          file=sys.stderr)
+      stage_failed = True
+    stop_logcat_capture(logcat_process, logcat_stdout, logcat_stderr)
+    if callstack_perfetto_pid is not None:
+      stop_perfetto(callstack_perfetto_pid)
+    if lifecycle_perfetto_pid is not None:
+      stop_perfetto(lifecycle_perfetto_pid)
+    stop_root_traced_perf(root_traced_perf_state)
 
-  if args.mmap_callstacks and not args.no_analyze:
-    run_analyzer(args, pid, analysis_trace_path, smaps_dir)
-  elif not args.mmap_callstacks and not args.no_analyze:
-    print("跳过 mmap 调用栈分析：当前验证模式未采集 mmap 调用栈")
-
-  validation = collect_memory_validation(args, pid, trace_path, meminfo_path,
-                                         trace_health)
-
-  print("采集完成")
-  print(f"输出目录: {os.path.abspath(args.output)}")
-  validation = validation or {"trace_health": trace_health, "report_path": ""}
-  validation["status"] = 0
-  validation["output"] = args.output
+  try:
+    validation = finish_collection(
+        args, pid, device_trace, trace_path, smaps_dir,
+        callstack_device_trace=(
+            callstack_device_trace if callstack_perfetto_pid is not None else None))
+  except Exception as exc:  # noqa: BLE001 - 保留阶段失败并输出离线收尾根因。
+    print(
+        "MMAP_PROFILE_FAILED|reason=finish_collection_failed|"
+        f"error={type(exc).__name__}: {exc}", file=sys.stderr)
+    return {"status": 1, "trace_health": None, "report_path": ""}
+  if stage_failed:
+    validation["status"] = 1
   return validation
 
 
@@ -1681,7 +2154,19 @@ def main() -> int:
     return int(
         run_collection(args, start_target_after_perfetto=True).get("status", 1))
 
-  return int(run_collection(args).get("status", 1))
+  script_dir = Path(__file__).resolve().parent
+  try:
+    action_path = resolve_action_module_path(script_dir)
+    action_module = load_action_module(action_path)
+  except (OSError, RuntimeError) as exc:
+    print(f"MMAP_PROFILE_FAILED|reason=action_script_invalid|error={exc}")
+    return 1
+  print(
+      "MMAP_PROFILE_CONFIG|"
+      f"app={args.name}|buffer_kb={args.buffer_kb}|"
+      f"smaps_interval_ms={args.smaps_interval_ms}|action_script={action_path}")
+  return int(run_profile_controlled_collection(args, action_module).get(
+      "status", 1))
 
 
 if __name__ == "__main__":

@@ -47,13 +47,22 @@ Perfetto linux.perf
 
 ```text
 run_mmap_phys_profile.sh
-  -> 默认入口脚本，使用写死默认配置启动采集和分析。
+  -> 通用真机测试框架的 mmap 兼容入口。
+
+run_device_test.sh / device_test_framework/ / device_test_plugins/
+  -> 子模块提供通用引擎，项目插件运行 mmap 后端并生成统一报告。
 
 run_mmap_phys_analyze_latest.sh
   -> 离线分析包装脚本：默认使用最近一次 mmap 采集目录，补齐 fs.ini 分类和常用输出路径。
 
 collect_mmap_phys_data.py
   -> 采集脚本：启动 Perfetto，周期拉 smaps，调用离线分析器，并生成内存总量验证报告。
+
+profile_action_api.py / profile_action_runner.py
+  -> 测试模块 Context、按 App PID 检查 logcat，以及协程结束竞速。
+
+profile_actions/send_battle_record_gm.py
+  -> 默认测试模块：通过 Poco RPC 发送战斗录像 GM。
 
 mmap_phys_analyzer.py
   -> 离线分析器：读取 trace + smaps，输出归因 JSON。
@@ -70,6 +79,15 @@ test_mmap_phys_analyzer.py
 ./run_mmap_phys_profile.sh
 ```
 
+该脚本现在经 `run_device_test.sh mmap` 启动。框架配置位于 `device_test.ini`，旧
+`config.sh` 和 mmap 后端参数继续兼容；完整结构见 `docs/device_test_framework.md`。
+每轮在原 mmap 目录增加 `run_config.json`、`run_manifest.json`、`run_summary.txt` 和
+`report.md`，其中 `report.md` 链接本轮健康报告、归因 JSON、trace 和 pprof 等专业产物。
+
+入口在采集前保存设备的 `global.hide_error_dialogs` 原值并临时设为 `1`，
+避免采集期间的 ANR 对话框改变目标应用焦点。正常、失败和中断退出都会
+恢复原值。该设置不禁用 ANR 检测或记录，只隐藏系统错误对话框。
+
 默认入口会给离线分析器追加：
 
 ```bash
@@ -80,14 +98,14 @@ test_mmap_phys_analyzer.py
 mmap 调用栈。显式传入新的 `--classify-config` 或 `--top-n` 时，用户参数会排在默认值
 之后生效，只改变本次运行的输出口径。
 
-默认目标进程来自 `MMAP_PHYS_APP`。当前 `config.sh` 默认值为：
+默认目标进程来自 `MMAP_PHYS_APP`。当前 `config.sh` 配置值为：
 
 ```text
-com.fs.t.prf
+com.tencent.dhwdxkty.trunk.profiler
 ```
 
-命令行前缀里的 `MMAP_PHYS_APP=...` 会覆盖 `config.sh` 默认值；如果没有任何配置，
-脚本内部回退到 `com.tencent.dhwdxkty.trunk.profiler`。
+如果 `config.sh` 没有提供该变量，脚本内部回退到
+`com.tencent.dhwdxkty.trunk.profiler`。
 
 `run_mmap_phys_profile.sh` 只会在目标包是 `com.fs.t.prf` 或
 `com.tencent.dhwdxkty.trunk.profiler` 时向应用外部目录推送 FS 专用
@@ -115,7 +133,33 @@ PYTHON=python TRACE_PROCESSOR=/path/to/trace_processor_shell TRACECONV=/path/to/
 `MMAP_PHYS_ACTIVITY=<package>/<activity>`。未设置时保留旧行为，只发送一次
 launcher Intent。
 
-运行前需要目标 App 已启动；脚本会等待目标进程出现。采集过程中可以触发 App 行为，例如：
+主功能会先启动并确认唯一 root `traced_perf`，再启动只采 ftrace/process_stats 的
+生命周期 Perfetto 会话，然后重启目标 App，以覆盖启动期 mmap。App PID 出现后再启动
+只采 `linux.perf` 的调用栈会话，避免首次进程描述符请求发生得过早。随后持续采集
+smaps，依次等待 `登录场景完成` 和
+`RegistForGameStart.LoadOtherTable.End`，并执行 `config.sh` 中
+`PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。测试模块契约、结束竞速和
+`ProfileActionSession` 与 Native heap 入口完全相同。
+
+主功能不使用 `--duration-ms` 自动收尾；测试协程完成、模块最长等待时间到期、人工中断或 App 死亡后，采集器主动向 Perfetto 发送 `SIGINT`。`--duration-ms` 只控制无栈验证等固定时长路径。
+
+需要更换测试场景时，在 `config.sh` 中配置：
+
+```bash
+export PERF_PROFILE_ACTION_SCRIPT=profile_actions/send_battle_record_gm.py
+```
+
+执行器向测试模块传入一次性的 `ProfileActionSession`。Session 的 `run_adb()`、`invoke_rpc()` 和 `wait_for_app_log()` 分别负责配置设备上的 ADB、一次性 Poco 端口发现与复用转发、以及本轮 App PID 的日志检查。运行失败统一记录日志并返回 `success=False`；是否抛异常并让本轮失败由测试脚本决定。
+
+```python
+async def run_profile_action(session):
+  result = await session.invoke_rpc(
+      "DoRecordCheat",
+      ["CheatFunc_BatchCheatOption.战斗录像:@40011@@|"],
+  )
+  if not result.success:
+    raise RuntimeError(result.error)
+```
 
 ```text
 在手机上手动进入目标场景并执行需要观测的操作。
@@ -171,6 +215,7 @@ memory_validation.json
 
 该模式不采 `android.heapprofd`。malloc 总量验证已经从无栈验证中删除；需要验证 Perfetto malloc 统计能力时，使用独立 heapprofd malloc APK demo。
 运行无栈验证时脚本会先 `am force-stop` 目标 App，再启动 Perfetto，最后拉起目标 App，确保启动期 mmap syscall 不会在 Perfetto 就绪前漏掉。
+无栈验证保持固定 duration，不等待登录/表加载，也不执行 `PERF_PROFILE_ACTION_SCRIPT`。
 
 验证模式采集和汇总内容：
 
@@ -224,7 +269,7 @@ mmap_trace.perfetto-trace 和 smaps/
 ```text
 --duration-ms
   -> Perfetto 采集时长，单位 ms。
-  -> 默认 75000 ms，也就是 1 分 15 秒。
+  -> 默认 75000 ms，也就是 1 分 15 秒；只对固定时长路径生效，主调用栈模式由测试模块结束。
 
 --smaps-interval-ms
   -> smaps 快照间隔，单位 ms。
@@ -522,22 +567,62 @@ src/profiling/perf/event_config.cc
 `perf_samples_skipped_dataloss=0`，但 `__intrinsic_perf_sample.callsite_id` 仍全为
 NULL，`stack_profile_callsite` 行数为 0，无法支撑 mmap 调用栈归因。
 
-如果侧载 GN standalone 版 `traced_perf` 到 `/system/bin/traced_perf`，注意 init rc
-仍会以 `user nobody` 启动 service；这种模式可能因无法打开目标进程
-`/proc/<pid>/maps` / `mem` 而产生 `perf_samples_skipped` 或无 callsite 的样本。主功能
-验证可临时用 root 启动 standalone producer：
+主功能必须先启动 root standalone `/system/bin/traced_perf`，再启动生命周期 Perfetto
+会话和 App。`linux.perf` 数据源在 App PID出现后的调用栈会话中启动，并分配给已经注册
+的唯一 root producer；等数据源开始后才替换 producer，已经开始的数据源不会迁移。
+采集期间还会把
+`sys.init.perf_lsm_hooks` 临时设为 `0`，抑制 init rc 根据
+`traced.lazy.traced_perf=1` 再拉起 nobody producer；唯一性检查要求设备上只有脚本记录的
+root PID。采集结束后先停止 Perfetto，再停止本轮 producer，并恢复原始属性和 init
+service 状态。该步骤由
+`MMAP_PHYS_USE_ROOT_TRACED_PERF=1` 控制，设置为 0 可回退系统 producer，但正式
+调用栈验收通常会因 `/proc/<pid>/maps` 权限失败。
 
-```bash
-adb -s 1C111FDF600AW5 shell \
-  "su 0 sh -c 'killall traced_perf 2>/dev/null || true; /system/bin/traced_perf --background'"
+主功能收尾会额外按目标 PID 查询 `perf_sample`：`perf_samples` 表示目标进程样本数，
+`perf_callsites` 表示其中带 `callsite_id` 的样本数。查询明确返回
+`perf_callsites=0` 时，脚本输出
+`MMAP_PROFILE_FAILED|reason=perf_callstacks_missing` 并返回失败，即使 trace、JSON 或
+pprof 文件已经生成也不能判为成功。查询工具不可用或查询本身失败时不会伪装成
+`perf_callsites=0`，而是保留“未检查”状态，避免把检查链路故障误报成已确认的空栈。
+
+2026-08-12 在 Pixel 6 `1C111FDF600AW5` 的正式 App 真机采集中，目标 PID 有
+`21154` 个 perf samples，但 `perf_callsites=0`，同时设备日志出现：
+
+```text
+E/perfetto proc_descriptors.cc:61 Failed to open /proc/<pid>/maps
+(errno: 13, Permission denied)
 ```
 
-随后运行主采集并保留 kernel frames。2026-07-07 验证结果：
+这说明登录、表加载、GM RPC 和 120 秒模块等待控制流可以成功，但设备上的
+`traced_perf` 无法取得展开用户栈所需的 maps，因此本轮调用栈归因必须判失败。
+应修复 producer 权限或以满足权限要求的方式启动 `traced_perf` 后重新采集；不能通过
+放宽健康检查接受空调用栈。
+
+如果侧载 GN standalone 版 `traced_perf` 到 `/system/bin/traced_perf`，注意 init rc
+仍会以 `user nobody` 启动 service；这种模式可能因无法打开目标进程
+`/proc/<pid>/maps` / `mem` 而产生 `perf_samples_skipped` 或无 callsite 的样本。只额外
+启动 root producer也不够：2026-08-13 真机短 trace 显示，同一 session 同时向 root
+producer（ds 139）和 init lazy 拉起的 nobody producer（ds 140）发送了
+`StartDataSource(linux.perf)`，后者仍报告 maps 权限错误。抑制 lazy producer后，目标
+PID 的短探针得到 `perf_samples=2, perf_callsites=1`，证明 root 展开链路有效。
+
+主采集应直接使用脚本的唯一 root producer控制并保留 kernel frames。2026-07-07 验证结果：
 `PerfData/mmap_phys/2026-07-07_21-36-59`，60 秒登录场景采集，
 `perf_samples_skipped_dataloss=0`、`perf_cpu_lost_records=0`、
 `perf_samples=92046`、`samples_with_callsite=8275`；离线
 `mmap_phys_analyzer.py` 成功输出 `mmap_phys_attribution.json` 和
 `mmap_phys_attribution.pprof.pb.gz`。
+
+2026-08-13 进一步确认 App启动时机影响。Perfetto
+`perf_producer.cc:854-855,913-915,1110-1114` 显示：目标 PID第一次出现时会异步请求
+进程描述符；若超时，状态进入 `kFdsTimedOut`，后续样本继续跳过，当前状态机不会自动
+重试。同一 root producer的真机对照为：perf会话先于 App时 `21829/0`；App PID出现后
+启动 perf短探针时 `766/766`；双会话完整默认流程为 `208/208`。
+
+主功能因此保留两份独立文件：`mmap_trace.perfetto-trace` 保存 App前启动的生命周期，
+`mmap_callstack_trace.perfetto-trace` 保存 PID出现后启动的调用栈。分析器用 Linux全局
+tid和 BOOTTIME时间戳关联。不能直接拼接两个 protobuf stream；真机验证过直接拼接会
+产生 `invalid_clock_snapshots` 和 `sorter_push_event_out_of_order`。
 
 ### `raw_syscalls` 与 `syscall_events` 的区别
 
@@ -1559,7 +1644,8 @@ libvulkan
 
 ```bash
 python -u -B mmap_phys_analyzer.py \
-  --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
+  --trace PerfData/mmap_phys/<时间戳>/mmap_trace.perfetto-trace \
+  --callstack-trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
@@ -1668,6 +1754,12 @@ trace_health.perf_samples_skipped_dataloss
   -> traced_perf 内部调用栈 sample 丢失数；来自 trace_processor stats 中的
      perf_samples_skipped_dataloss。
   -> 非 0 表示调用栈归因可能缺样，主功能结果不应作为最终结论。
+
+trace_health.perf_samples / trace_health.perf_callsites
+  -> 主功能按目标 PID 统计的 perf 样本数及带 callsite_id 的样本数。
+  -> 查询明确返回 perf_callsites=0 时，validation issues 包含
+     perf_callstacks_missing，采集入口返回失败。
+  -> 常见根因是 traced_perf 无权读取 /proc/<pid>/maps，不能用空归因文件替代有效栈。
 
 health_report.alignment.native_heap
   -> smaps Native Heap 类 VMA 与 meminfo Native Heap PSS 的对齐结果。
@@ -1792,7 +1884,8 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 
 ```bash
 python -u -B mmap_phys_analyzer.py \
-  --trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
+  --trace PerfData/mmap_phys/<时间戳>/mmap_trace.perfetto-trace \
+  --callstack-trace PerfData/mmap_phys/<时间戳>/symbolized-trace \
   --smaps-dir PerfData/mmap_phys/<时间戳>/smaps \
   --pid <目标 pid> \
   --output PerfData/mmap_phys/<时间戳>/mmap_phys_attribution.json \
@@ -1800,8 +1893,10 @@ python -u -B mmap_phys_analyzer.py \
   --trace-processor $PerfettoRoot/out/linux_clang_release/trace_processor_shell
 ```
 
-如果目录中没有 `symbolized-trace`，可以退回使用 `mmap_trace.perfetto-trace`，
-但 `libil2cpp.so` 等业务 so 可能只显示地址或不完整函数名。
+如果目录中没有 `symbolized-trace`，`--callstack-trace` 可以退回使用
+`mmap_callstack_trace.perfetto-trace`，但 `libil2cpp.so` 等业务 so 可能只显示地址或
+不完整函数名。旧单 session目录没有 `mmap_callstack_trace.perfetto-trace` 时，仍可只传
+一个 `--trace`。
 
 ## 性能实现说明
 

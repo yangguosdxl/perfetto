@@ -1,0 +1,3 @@
+[submodule "00wann/device_test_framework"]
+	path = 00wann/device_test_framework
+	url = https://git.idianhun.com/fs/device-test-framework.git

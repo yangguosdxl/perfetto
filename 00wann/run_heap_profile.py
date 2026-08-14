@@ -20,16 +20,25 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
-APP = "com.fs.t.prf"
-LAUNCH_ACTIVITY = "com.fs.t.prf/com.dhplugin.unity.MainActivity"
+from profile_action_api import ProfileActionContext
+from profile_action_runner import (load_action_module,
+                                   resolve_action_module_path,
+                                   run_profile_action_module)
+
+APP = os.environ.get("MMAP_PHYS_APP")
+LAUNCH_ACTIVITY = f"{APP}/com.dhplugin.unity.MainActivity"
 LOGIN_DONE_PATTERN = "登录场景完成"
+GM_READY_PATTERN = "RegistForGameStart.LoadOtherTable.End"
+RPC_LOCAL_PORT = int(os.environ.get("HEAP_PROFILE_RPC_LOCAL_PORT", "12346"))
+GM_READY_TIMEOUT_SECONDS = int(
+    os.environ.get("HEAP_PROFILE_GM_READY_TIMEOUT_S", "180"))
+TRACE_BUFFER_KIB = 63488
 DEFAULT_FS_SYMBOLS_DIR = Path(
     r"D:\dr2\Trunk_LocalBuild\ClientPublish\DreamRivakes2_U3DProj"
     r"\BuildCache\Published\Android\DreamRivakes2.apk"
     r"\unityLibrary\symbols\arm64-v8a")
 LEGACY_SYMBOLS_RELATIVE_DIR = Path("workspace/allsymbols/arm64-v8a")
 LOGIN_TIMEOUT_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_TIMEOUT_S", "0"))
-LOGIN_STABLE_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_STABLE_S", "30"))
 APP_START_TIMEOUT_SECONDS = int(
     os.environ.get("HEAP_PROFILE_APP_START_TIMEOUT_S", "60"))
 MALLOC_LIVE_SQL = ("select coalesce(sum(size), 0) as malloc_live_bytes "
@@ -419,6 +428,9 @@ def capture_meminfo_snapshot(out_dir: Path, package_name: str) -> bool:
         check=False,
     )
   if proc.returncode == 0:
+    if b"No process found for:" in tmp_path.read_bytes():
+      tmp_path.unlink(missing_ok=True)
+      return False
     tmp_path.replace(meminfo_path)
     return True
   tmp_path.unlink(missing_ok=True)
@@ -438,6 +450,51 @@ def write_validation(validation_path: Path,
     for line in lines:
       print(line)
       out.write(line + "\n")
+
+
+def append_run_summary(out_dir: Path, line: str) -> None:
+  with (out_dir / "run_summary.txt").open("a", encoding="utf-8") as summary:
+    summary.write(line + "\n")
+
+
+def print_profile_config(
+    perfetto_root: Path,
+    traceconv: Path,
+    trace_processor: Path,
+    env: dict[str, str],
+    interval_bytes: str,
+    shmem_size_bytes: str,
+    action_module_path: Path,
+) -> tuple[str, str]:
+  """在真机操作前输出本轮关键配置。"""
+  serial = env.get("ANDROID_SERIAL", "")
+  config_line = (
+      "HEAP_PROFILE_CONFIG|"
+      f"app={APP}|activity={LAUNCH_ACTIVITY}|serial={serial}|"
+      f"interval_bytes={interval_bytes}|shmem_size_bytes={shmem_size_bytes}|"
+      f"trace_buffer_kib={TRACE_BUFFER_KIB}|"
+      f"gm_ready_timeout_s={GM_READY_TIMEOUT_SECONDS}|"
+      f"rpc_local_port={RPC_LOCAL_PORT}|action_script={action_module_path}"
+  )
+  tool_line = (
+      "HEAP_PROFILE_TOOLS|"
+      f"perfetto_root={perfetto_root}|traceconv={traceconv}|"
+      f"trace_processor={trace_processor}|"
+      f"symbol_paths={env.get('PERFETTO_BINARY_PATH', '')}"
+  )
+  print(config_line)
+  print(tool_line)
+  return config_line, tool_line
+
+
+def write_profile_config_snapshot(out_dir: Path,
+                                  config_lines: tuple[str, str]) -> None:
+  """heapprofd 启动后再保存配置，避免提前占用 Perfetto 输出目录。"""
+  config_line, tool_line = config_lines
+  (out_dir / "heap_profile_config.txt").write_text(
+      config_line + "\n" + tool_line + "\n", encoding="utf-8")
+  append_run_summary(out_dir, config_line)
+  append_run_summary(out_dir, tool_line)
 
 
 def validate_heap_profile_against_meminfo(
@@ -579,16 +636,7 @@ def wait_for_login_done(out_dir: Path, shutdown_requested: callable) -> bool:
       if chunk:
         text = tail + chunk
         if LOGIN_DONE_PATTERN in text:
-          print(
-              "LOGIN_SCENE_DONE|"
-              f"pattern={LOGIN_DONE_PATTERN}|"
-              f"stable_seconds={LOGIN_STABLE_SECONDS}"
-          )
-          stable_deadline = time.time() + LOGIN_STABLE_SECONDS
-          while time.time() < stable_deadline:
-            if shutdown_requested():
-              return False
-            time.sleep(min(0.2, max(0, stable_deadline - time.time())))
+          print(f"LOGIN_SCENE_DONE|pattern={LOGIN_DONE_PATTERN}")
           return True
         tail = text[-len(LOGIN_DONE_PATTERN):]
     time.sleep(0.2)
@@ -598,6 +646,59 @@ def wait_for_login_done(out_dir: Path, shutdown_requested: callable) -> bool:
       f"pattern={LOGIN_DONE_PATTERN}|timeout_s={LOGIN_TIMEOUT_SECONDS}"
   )
   return False
+
+
+def wait_for_gm_ready(out_dir: Path, shutdown_requested: callable,
+                      process_alive: callable) -> str:
+  """登录后等待延迟表加载完成，避免过早进入战斗录像。"""
+  logcat_path = out_dir / "logcat.txt"
+  deadline = time.time() + GM_READY_TIMEOUT_SECONDS
+  offset = 0
+  tail = ""
+  next_liveness_check = 0.0
+
+  while time.time() < deadline:
+    if shutdown_requested():
+      return "shutdown"
+    now = time.time()
+    if now >= next_liveness_check:
+      if not process_alive():
+        print(
+            "HEAP_PROFILE_GM_READY=FAIL|reason=app_died|"
+            f"pattern={GM_READY_PATTERN}"
+        )
+        return "app_died"
+      next_liveness_check = now + 1.0
+    if logcat_path.exists():
+      with logcat_path.open(encoding="utf-8", errors="replace") as logcat:
+        logcat.seek(offset)
+        chunk = logcat.read()
+        offset = logcat.tell()
+      if chunk:
+        text = tail + chunk
+        if GM_READY_PATTERN in text:
+          print(f"HEAP_PROFILE_GM_READY=PASS|pattern={GM_READY_PATTERN}")
+          return "ready"
+        tail = text[-len(GM_READY_PATTERN):]
+    time.sleep(0.2)
+
+  print(
+      "HEAP_PROFILE_GM_READY=FAIL|reason=timeout|"
+      f"pattern={GM_READY_PATTERN}|timeout_s={GM_READY_TIMEOUT_SECONDS}"
+  )
+  return "timeout"
+
+
+def target_process_is_alive(package_name: str, expected_pid: str,
+                            env: dict[str, str]) -> bool:
+  proc = run(
+      [adb_binary(), "shell", "pidof", package_name],
+      env=env,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      text=True,
+  )
+  return proc.returncode == 0 and expected_pid in proc.stdout.split()
 
 
 def wait_for_pid(package_name: str, shutdown_requested: callable,
@@ -643,6 +744,12 @@ def parse_args(argv: list[str]) -> tuple[list[str], list[str], list[str]]:
 def main(argv: list[str]) -> int:
   script_dir = Path(__file__).resolve().parent
   os.chdir(script_dir)
+  if not APP:
+    print(
+        "HEAP_PROFILE_FAILED|reason=app_config_missing|"
+        f"config={script_dir / 'config.sh'}|name=MMAP_PHYS_APP"
+    )
+    return 1
   perfetto_root = load_perfetto_root(script_dir)
   env = build_env(perfetto_root, script_dir=script_dir)
   os.environ.update(env)
@@ -651,9 +758,29 @@ def main(argv: list[str]) -> int:
   trace_processor = resolve_perfetto_tool(perfetto_root, "trace_processor_shell",
                                           "TRACE_PROCESSOR")
   duration_args, interval_args, shmem_args = parse_args(argv)
+  interval_bytes = interval_args[1] if interval_args else ""
+  shmem_size_bytes = shmem_args[1] if shmem_args else ""
+  try:
+    action_module_path = resolve_action_module_path(script_dir)
+    action_module = load_action_module(action_module_path)
+  except (OSError, RuntimeError) as exc:
+    print(f"HEAP_PROFILE_FAILED|reason=action_script_invalid|error={exc}")
+    return 1
 
-  out_dir = script_dir / "PerfData/mem" / _datetime.datetime.now().strftime(
-      "%Y-%m-%d_%H-%M-%S")
+  configured_output = os.environ.get("DEVICE_TEST_OUTPUT_DIR", "").strip()
+  out_dir = (
+      Path(configured_output).resolve() if configured_output else
+      script_dir / "PerfData/mem" / _datetime.datetime.now().strftime(
+          "%Y-%m-%d_%H-%M-%S"))
+  config_lines = print_profile_config(
+      perfetto_root,
+      traceconv,
+      trace_processor,
+      env,
+      interval_bytes,
+      shmem_size_bytes,
+      action_module_path,
+  )
   out_dir.mkdir(parents=True, exist_ok=True)
 
   if source_fsbootcmd(script_dir, env) != 0:
@@ -671,11 +798,14 @@ def main(argv: list[str]) -> int:
   app_start_failed = False
   app_start_timeout_failed = False
   profiler_shutdown_timeout_failed = False
+  gm_ready_failed = False
+  action_failed = False
+  action_running = False
 
   def request_shutdown(signum, _frame) -> None:
     nonlocal shutdown_requested
     shutdown_requested = True
-    if profiler_proc and profiler_proc.poll() is None:
+    if profiler_proc and profiler_proc.poll() is None and not action_running:
       print("\n收到中断信号，已请求 heap_profile.py 停止采集并等待 trace 收尾...")
       request_profiler_shutdown(profiler_proc)
 
@@ -740,12 +870,14 @@ def main(argv: list[str]) -> int:
       force_stop_profiler(profiler_proc)
     pump_thread.join(timeout=5)
     return 1
+  write_profile_config_snapshot(out_dir, config_lines)
 
   try:
     if not shutdown_requested:
       logcat_proc, logcat_stdout, logcat_stderr = start_logcat_capture(
           out_dir, env)
       print(f"\nheapprofd 已就绪，启动目标 Activity: {LAUNCH_ACTIVITY}")
+      app_launch_time = time.monotonic()
       launch_proc = launch_target_app(env)
       if launch_proc.returncode != 0:
         app_start_failed = True
@@ -765,7 +897,50 @@ def main(argv: list[str]) -> int:
         print(f"\r应用已启动 {APP} pid={pid}")
         login_done = wait_for_login_done(out_dir, lambda: shutdown_requested)
         if login_done:
-          request_profiler_shutdown(profiler_proc)
+          login_seconds = time.monotonic() - app_launch_time
+          login_line = f"APP_LOGIN_SECONDS|seconds={login_seconds:.3f}"
+          print(login_line)
+          append_run_summary(out_dir, login_line)
+          gm_ready_start = time.monotonic()
+          gm_ready_state = wait_for_gm_ready(
+              out_dir,
+              lambda: shutdown_requested,
+              lambda: target_process_is_alive(APP, pid, env),
+          )
+          if gm_ready_state == "ready":
+            gm_ready_seconds = time.monotonic() - gm_ready_start
+            gm_ready_line = (
+                "GM_READY_SECONDS_AFTER_LOGIN|"
+                f"seconds={gm_ready_seconds:.3f}"
+            )
+            print(gm_ready_line)
+            append_run_summary(out_dir, gm_ready_line)
+          if gm_ready_state == "ready":
+            context = ProfileActionContext(
+                app=APP,
+                pid=int(pid),
+                output_dir=out_dir.resolve(),
+                logcat_path=(out_dir / "logcat.txt").resolve(),
+                adb=adb_binary(),
+                rpc_local_port=RPC_LOCAL_PORT,
+                android_serial=env.get("ANDROID_SERIAL", ""),
+                summary_path=(out_dir / "run_summary.txt").resolve(),
+            )
+            action_running = True
+            try:
+              action_result = run_profile_action_module(
+                  action_module,
+                  context,
+                  lambda: shutdown_requested,
+                  lambda: target_process_is_alive(APP, pid, env),
+              )
+            finally:
+              action_running = False
+            action_failed = not action_result.success
+            request_profiler_shutdown(profiler_proc)
+          elif not shutdown_requested:
+            gm_ready_failed = True
+            request_profiler_shutdown(profiler_proc)
         elif not shutdown_requested:
           login_timeout_failed = True
           request_profiler_shutdown(profiler_proc)
@@ -801,6 +976,12 @@ def main(argv: list[str]) -> int:
     return heap_profile_rc
   if login_timeout_failed:
     print(f"HEAP_PROFILE_FAILED|reason=login_scene_timeout|out_dir={out_dir}")
+    return 1
+  if gm_ready_failed:
+    print(f"HEAP_PROFILE_FAILED|reason=gm_ready_failed|out_dir={out_dir}")
+    return 1
+  if action_failed:
+    print(f"HEAP_PROFILE_FAILED|reason=profile_action_failed|out_dir={out_dir}")
     return 1
   return validation_rc
 

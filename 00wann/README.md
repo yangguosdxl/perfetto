@@ -7,6 +7,7 @@
 | --------------------------------------------------- | -------------------------------------------------- |
 | `mmap_phys_analyzer.md`                             | mmap 真实物理内存归因、无栈 mmap 验证、分类输出和已知边界。                |
 | `heap_profile.md`                                   | Native heap profile 采集、meminfo 对比和启动耗时评估。          |
+| `device_test_framework.md`                          | 通用配置、平台适配、malloc/mmap 插件、流程和统一报告。             |
 | `hybridclr_mmap_malloc_symbol_report_2026-06-22.md` | HybridCLR mmap 优化的符号路径根因、重新符号化和 malloc 分类验证报告。     |
 | `heap_analyzer/README.md`                           | Native heap 调用栈查询、fs.ini 分类、pprof 和 speedscope 输出。 |
 | `meminfo_android_demo_validation.md`                | `dumpsys meminfo` 真机 demo 的构建、指标和验证结论。             |
@@ -48,8 +49,10 @@ Android SDK/NDK/JDK
 
 ```text
 真机采集
-  run_mmap_phys_profile.sh
-    -> collect_mmap_phys_data.py
+  run_heap_profile.sh / run_mmap_phys_profile.sh
+    -> run_device_test.sh
+      -> AndroidAdapter + FeaturePlugin + FlowSpec
+        -> run_heap_profile.py / collect_mmap_phys_data.py
       -> mmap_phys_analyzer.py
 
 离线 mmap 分析
@@ -84,7 +87,7 @@ Native heap 调用栈分析
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | mmap 采集、mmap 验证、host 兼容性改动 | 45 秒无栈 mmap 验证：`MMAP_PHYS_APP=com.example.meminfodemo MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000` |
 | mmap 调用栈归因改动               | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景                                                                                                                       |
-| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，以 `登录场景完成` 日志出现后稳定 30 秒为收尾信号                                                                                                           |
+| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，登录和表就绪后按 `config.sh` 执行测试模块，由模块协程或最长等待时间收尾                                                                                                           |
 | heapprofd malloc 统计改动      | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh`                                                                                                                            |
 | meminfo demo 或解析改动         | 跑 `./run_meminfo_android_demo.sh`                                                                                                                                        |
 
@@ -97,6 +100,10 @@ Native heap 调用栈分析
 
 用途：mmap 真实物理内存归因的主入口，也负责无栈 mmap 健康验证。
 
+采集前会临时隐藏 Android 系统错误/ANR 对话框，避免对话框改变目标应用
+焦点；所有退出路径会恢复 `global.hide_error_dialogs` 原值。这不会禁用系统 ANR
+检测和记录。
+
 默认行为：
 
 ```text
@@ -105,11 +112,12 @@ Native heap 调用栈分析
 3. 设置 PERFETTO_BINARY_PATH=./workspace/allsymbols/arm64-v8a。
 4. 读取 config.sh 和 common_tools.sh。
 5. Windows Git Bash 下把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，确保 `traceconv.exe` 能启动 `llvm-symbolizer.exe`。
-6. 默认目标进程来自 `MMAP_PHYS_APP`；当前 `config.sh` 默认 `com.fs.t.prf`，未配置时脚本回退 `com.tencent.dhwdxkty.trunk.profiler`。
+6. 默认目标进程来自 `MMAP_PHYS_APP`；当前 `config.sh` 配置为 `com.tencent.dhwdxkty.trunk.profiler`，未配置时脚本回退同一包名。
 7. 推送 FSBootCmdLine.cfg；仅当目标包是 FS 包时推送 debugconfig.txt，demo/其他包会跳过该 FS 专用配置。
 8. 调用 collect_mmap_phys_data.py。
 9. 默认启用 mmap 调用栈采集，并追加 --classify-config heap_analyzer/fs.ini --top-n 0。
-10. 输出到 PerfData/mmap_phys/<时间戳>/。
+10. 主调用栈模式先抑制 init lazy producer并确认唯一 root `traced_perf`，再启动仅含 ftrace/process_stats 的生命周期 Perfetto 会话，然后重启 App；生命周期会话先于 App，保证启动期 mmap syscall 不漏采。
+11. App PID 出现后再启动仅含 `linux.perf` 的调用栈会话，避免进程刚创建时首次描述符 lookup 超时后 PID 永久进入 `kFdsTimedOut`。测试模块结束后停止两个会话和 root producer，并恢复原始系统状态。
 ```
 
 常用命令：
@@ -127,7 +135,7 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 
 | 参数                     | 默认值                    | 说明                                         |
 | ---------------------- | ---------------------- | ------------------------------------------ |
-| `-d, --duration-ms`    | `75000`                | Perfetto 采集时长，单位 ms。                       |
+| `-d, --duration-ms`    | `75000`                | 固定时长路径的 Perfetto 采集时长；主调用栈模式由测试模块结束。       |
 | `--smaps-interval-ms`  | `1000`                 | smaps 快照间隔，单位 ms。                          |
 | `-o, --output`         | 自动生成                   | 输出目录。                                      |
 | `--mmap-callstacks`    | 默认开启                   | 采集 mmap 调用栈并运行物理归因分析。                      |
@@ -147,8 +155,10 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 
 | 变量                   | 默认值                                   | 说明                                    |
 | -------------------- | ------------------------------------- | ------------------------------------- |
-| `MMAP_PHYS_APP`      | `config.sh` 默认为 `com.fs.t.prf`，未配置时脚本回退 `com.tencent.dhwdxkty.trunk.profiler` | 目标包名或进程名；命令行前缀里的 `MMAP_PHYS_APP=...` 会覆盖 `config.sh` 默认值。 |
+| `MMAP_PHYS_APP`      | `config.sh` 当前配置为 `com.tencent.dhwdxkty.trunk.profiler` | 目标包名或进程名。 |
 | `MMAP_PHYS_ACTIVITY` | 空                                     | 目标进程不存在时用 `am start -n` 拉起的 Activity。 |
+| `PERF_PROFILE_ACTION_SCRIPT` | `profile_actions/send_battle_record_gm.py` | 登录和表就绪后执行的 Python 测试模块。 |
+| `MMAP_PHYS_USE_ROOT_TRACED_PERF` | `1` | 主调用栈模式是否在 Perfetto 会话前启动唯一 root standalone `traced_perf`；采集期间临时抑制 init lazy producer，收尾恢复原状态。正式归因建议保持开启。 |
 | `PYTHON`             | 自动探测                                  | 指定 Python。                            |
 | `TRACE_PROCESSOR`    | 自动探测                                  | 覆盖 trace processor。                   |
 | `TRACECONV`          | 自动探测                                  | 覆盖 traceconv。                         |
@@ -184,8 +194,21 @@ PerfData/mmap_phys/<时间戳>/
 ```text
 主功能：重点看 mmap_phys_attribution.json 和 pprof 数据。
 无栈验证：memory_validation.json 中 validation.status 应为 pass，mmap.syscall_events 和 mmap.smaps_snapshots 应大于 0，trace_health 丢失项应为 0。
-主功能健康：除无栈字段外，还要看 trace_health.perf_samples_skipped_dataloss 是否为 0；非 0 表示 traced_perf 内部调用栈 sample 丢失，调用栈归因结果不应作为最终结论。
+主功能健康：除无栈字段外，还要求 trace_health.perf_samples_skipped_dataloss=0 且 trace_health.perf_callsites>0。
+如果目标进程已有 perf_samples 但 perf_callsites=0，入口输出 MMAP_PROFILE_FAILED|reason=perf_callstacks_missing 并返回失败；常见原因是 traced_perf 无权读取 /proc/<pid>/maps，空 JSON/pprof 不能作为成功结果。
 ```
+
+两个真机采集脚本现在是统一框架的兼容入口。通用配置位于 `device_test.ini`，
+旧 `config.sh` 和环境变量继续兼容；每轮在原专业结果目录额外生成
+`run_config.json`、`run_manifest.json`、`run_summary.txt` 和 `report.md`。
+通用核心通过 `device_test_framework/` Git 子模块引用，malloc/mmap 和 FS 流程保留在
+`device_test_plugins/`；框架结构、配置优先级和子模块升级方式见
+`docs/device_test_framework.md`。
+
+主功能保留两份独立 trace：`mmap_trace.perfetto-trace` 保存 App 前启动的 mmap 生命周期，
+`mmap_callstack_trace.perfetto-trace` 保存 App PID 出现后启动的 perf 调用栈。分析器按 Linux
+全局 tid 和 BOOTTIME 纳秒时间关联；不能直接字节拼接，因为两个 session 的 clock
+snapshot 会倒序并触发 `invalid_clock_snapshots` / `sorter_push_event_out_of_order`。
 
 ## `collect_mmap_phys_data.py`
 
@@ -279,12 +302,18 @@ PerfData/mmap_phys/<时间戳>/
 `perf_cpu_lost_records`。安装本地 queue=4096 且带 enqueue 诊断日志的 `traced_perf` 后，
 120 秒主采集 `perf_samples_skipped_dataloss=0`。若使用 GN standalone 版
 `traced_perf` 侧载到 init service，service 仍按 `user nobody` 运行，可能因
-`/proc/<pid>/maps` 权限导致 `callsite_id` 全空；主功能归因验证时需先用 root 启动
-standalone producer，例如 `adb shell su 0 sh -c 'killall traced_perf 2>/dev/null || true; /system/bin/traced_perf --background'`，
-再运行采集。60 秒登录场景验证结果：
+`/proc/<pid>/maps` 权限导致 `callsite_id` 全空。不能只手工再启动一个 root producer：
+`linux.perf` 会同时分配给 root 与 init lazy 拉起的 nobody producer。主功能脚本会在
+Perfetto 会话前临时抑制 lazy producer并确认设备上只有一个 root `traced_perf`，收尾恢复
+原始属性和 service 状态。60 秒登录场景验证结果：
 `perf_samples_skipped_dataloss=0`、`perf_cpu_lost_records=0`、
 `perf_samples=92046`、`samples_with_callsite=8275`，离线归因输出
 `mmap_phys_attribution.json` 和 `mmap_phys_attribution.pprof.pb.gz` 成功。
+
+2026-08-13 Pixel 6 对照结果：唯一 root producer但 perf会话先于 App时为
+`perf_samples=21829, perf_callsites=0`；同一 producer改为 App PID出现后再启动 perf短
+探针为 `766/766`。双会话完整默认流程为目标 PID `208/208`，且独立加载两份原始 trace
+没有 clock snapshot乱序错误。
 
 额外环境变量：
 
@@ -318,7 +347,8 @@ standalone producer，例如 `adb shell su 0 sh -c 'killall traced_perf 2>/dev/n
 
 | 参数                                  | 默认值       | 说明                                                     |
 | ----------------------------------- | --------- | ------------------------------------------------------ |
-| `--trace`                           | 必填        | 包含 mmap/perf 事件的 Perfetto trace，推荐 `symbolized-trace`。 |
+| `--trace`                           | 必填        | 包含 mmap syscall 生命周期的 Perfetto trace。                   |
+| `--callstack-trace`                 | 同 `--trace` | 独立的 linux.perf 调用栈 trace；双 session采集时传 `symbolized-trace`。 |
 | `--smaps-dir`                       | 必填        | smaps 快照目录。                                            |
 | `--pid`                             | 必填        | 目标进程 pid。                                              |
 | `--output`                          | 必填        | 输出 Chrome JSON trace。                                  |
@@ -404,13 +434,17 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 
 用途：Native heap profile 采集入口，包装 `run_heap_profile.py`。
 
+采集前会临时隐藏 Android 系统错误/ANR 对话框，避免高开销采样期间反复
+失焦；所有退出路径会恢复 `global.hide_error_dialogs` 原值。这不会延长 ANR
+阈值，系统仍会记录 ANR。
+
 默认行为：
 
 ```text
-1. 自动选择 Python。
+1. 切换到脚本目录并加载 config.sh，再自动选择 Python。
 2. 调用 run_heap_profile.py。
-3. 目标包名固定为 com.fs.t.prf。
-4. 不传 duration；脚本等待 `登录场景完成` 日志出现后继续稳定采集 30 秒，再请求 Perfetto 收尾。人工 Ctrl+C 时，Windows 下通过新进程组和 Ctrl-Break bridge 触发 Perfetto 的 SIGINT 收尾。
+3. 目标包名读取 config.sh 的 MMAP_PHYS_APP。
+4. 不传 duration；脚本依次等待 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`，再执行 `PERF_PROFILE_ACTION_SCRIPT` 配置的异步测试模块。模块协程完成或最长等待时间到期后请求 Perfetto 收尾；App 死亡时失败。人工 Ctrl+C 会先取消并等待模块清理，再触发 Perfetto 的 SIGINT 收尾。
 5. 不传 interval 时使用 1024 bytes。
 6. 不传 shmem-size 时使用 8388608 bytes。
 7. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
@@ -449,9 +483,15 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 | `RUN_HEAP_PROFILE_SYMBOLS_DIR`            | 当前 FS 打包产物符号目录 | 未设置 `PERFETTO_BINARY_PATH` 时，用于覆盖优先符号目录。      |
 | `HEAP_PROFILE_ACTIVE_TIMEOUT_S`           | `60`           | 等待 `Profiling active` 的超时。                    |
 | `HEAP_PROFILE_LOGIN_TIMEOUT_S`            | `0`            | 等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。           |
-| `HEAP_PROFILE_LOGIN_STABLE_S`             | `30`           | 登录完成后的稳定采集秒数；真机验收保持默认 30。                     |
+| `HEAP_PROFILE_GM_READY_TIMEOUT_S`         | `180`          | 登录后等待 `RegistForGameStart.LoadOtherTable.End` 的超时。          |
+| `PERF_PROFILE_ACTION_SCRIPT`              | `profile_actions/send_battle_record_gm.py` | 表加载完成后执行的 Python 测试模块。                  |
+| `HEAP_PROFILE_LOGIN_STABLE_S`             | `120`          | 默认 GM 模块的兼容等待时间覆盖；新模块直接实现 `get_collection_wait_seconds()`。 |
+| `HEAP_PROFILE_RPC_LOCAL_PORT`              | `12346`        | Poco RPC 使用的本机 ADB 转发端口。                                  |
+| `HEAP_PROFILE_RPC_TIMEOUT_S`               | `10`           | Poco RPC 连接和响应超时。                                           |
 | `HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S`  | `600`          | 等待 profiler shutdown 的超时。                     |
 | `HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES` | `67108864`     | malloc live 和 meminfo Native Heap Alloc 允许差值。 |
+
+执行器为自定义测试模块创建一次性的 `ProfileActionSession`。脚本通过 `session.run_adb()`、`session.invoke_rpc()` 和 `session.wait_for_app_log()` 使用公共功能；设备选择、一次性 Poco 端口发现、复用转发、Poco JSON-RPC 协议、日志和详情文件均由 Session 处理。运行失败返回 `success=False`，是否抛异常由测试脚本决定；RPC 默认要求 `result=True` 并写 `gm_rpc.txt`。
 
 
 Windows 下脚本会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，确保 `traceconv.exe` 可以启动 `llvm-symbolizer.exe` 完成符号化。
@@ -461,6 +501,9 @@ Windows 下脚本会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，
 ```text
 PerfData/mem/<时间戳>/
   heap_profile.log
+  heap_profile_config.txt
+  run_summary.txt
+  gm_rpc.txt
   raw-trace
   symbolized-trace
   heap_dump.*.pb 或 heap_dump.*.pb.gz
@@ -477,16 +520,16 @@ PerfData/mem/<时间戳>/
 默认行为：
 
 ```text
-1. 读取 config.sh 中的 PerfettoRoot。
+1. 使用入口从 config.sh 导出的 MMAP_PHYS_APP，并读取 PerfettoRoot。
 2. 设置符号化和 PYTHONPATH 环境。
 3. 自动选择 traceconv 和 trace_processor。
 4. 推送 FSBootCmdLine.cfg 和 debugconfig.txt。
 5. force-stop 目标 App。
 6. 启动 Perfetto heap_profile.py，并等待 Profiling active。
-7. 使用 `adb shell am start -n com.fs.t.prf/com.dhplugin.unity.MainActivity` 拉起固定 Activity。
-8. 等待 logcat 输出 `登录场景完成`，日志出现后稳定采集 30 秒，再请求 profiler shutdown 并保存 meminfo。
-9. 查询 heap_profile_allocation 累计 live bytes。
-10. 与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值验证。
+7. 使用 `adb shell am start -n $MMAP_PHYS_APP/com.dhplugin.unity.MainActivity` 拉起固定 Activity。
+8. 等待 logcat 输出 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`，再加载 `PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。
+9. 创建一次 `ProfileActionSession`，先调用同步 `get_collection_wait_seconds(session)`，再运行异步 `run_profile_action(session)`；协程完成、最长等待时间、人工中断或 App 死亡进行竞速，最后由 Session 统一清理公共资源。默认模块会调用战斗录像 GM 并声明 120 秒最长等待。
+10. 查询 heap_profile_allocation 累计 live bytes，与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值验证。
 ```
 
 参数说明：
@@ -500,7 +543,7 @@ PerfData/mem/<时间戳>/
 
 环境变量同 `run_heap_profile.sh`。
 
-注意：Native heap 采集使用 `adb shell am start -n com.fs.t.prf/com.dhplugin.unity.MainActivity` 拉起固定 Activity，不使用 `adb monkey` 随机触发测试场景。
+注意：Native heap 采集使用 `config.sh` 中目标包的固定 `com.dhplugin.unity.MainActivity`，不使用 `adb monkey` 随机触发测试场景。
 
 ## `run_heap_startup_eval.sh`
 
