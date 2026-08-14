@@ -36,13 +36,7 @@ ARM64_MREMAP_NR = 216
 
 IS_INTERRUPTED = False
 SMAPS_HEADER_RE = re.compile(rb"^[0-9a-fA-F]+-[0-9a-fA-F]+\s+")
-LOGCAT_PID_RE = re.compile(r"\(\s*(\d+)\)")
-LOGIN_DONE_PATTERN = "登录场景完成"
-TABLE_READY_PATTERN = "RegistForGameStart.LoadOtherTable.End"
 RPC_LOCAL_PORT = int(os.environ.get("HEAP_PROFILE_RPC_LOCAL_PORT", "12346"))
-LOGIN_TIMEOUT_SECONDS = int(os.environ.get("HEAP_PROFILE_LOGIN_TIMEOUT_S", "0"))
-TABLE_READY_TIMEOUT_SECONDS = int(
-    os.environ.get("HEAP_PROFILE_GM_READY_TIMEOUT_S", "180"))
 
 TRACE_HEALTH_STATS = (
     "traced_buf_buffer_size",
@@ -560,48 +554,6 @@ def stop_logcat_capture(process, stdout_file, stderr_file):
   for file_obj in (stdout_file, stderr_file):
     if file_obj:
       file_obj.close()
-
-
-def wait_for_app_log_pattern(logcat_path: str,
-                             pid: int,
-                             pattern: str,
-                             timeout_seconds: int) -> str:
-  """同步阶段等待：只接受当前 App PID 的完整 logcat 行。"""
-  deadline = (
-      time.monotonic() + timeout_seconds if timeout_seconds > 0 else None)
-  offset = 0
-  tail = ""
-  while not IS_INTERRUPTED:
-    if not is_process_alive(pid):
-      return "app_died"
-    if os.path.exists(logcat_path):
-      size = os.path.getsize(logcat_path)
-      if size < offset:
-        offset = 0
-        tail = ""
-      with open(logcat_path, encoding="utf-8", errors="replace") as logcat:
-        logcat.seek(offset)
-        chunk = logcat.read()
-        offset = logcat.tell()
-      if chunk:
-        text = tail + chunk
-        lines = text.splitlines(keepends=True)
-        tail = ""
-        if lines and not lines[-1].endswith(("\n", "\r")):
-          tail = lines.pop()
-        for line in lines:
-          pid_match = LOGCAT_PID_RE.search(line)
-          if (pid_match and int(pid_match.group(1)) == pid and
-              pattern in line):
-            print(f"APP_LOG_READY|pattern={pattern}|pid={pid}")
-            return "ready"
-    if deadline is not None and time.monotonic() >= deadline:
-      print(
-          f"APP_LOG_WAIT=FAIL|reason=timeout|pattern={pattern}|"
-          f"pid={pid}|timeout_s={timeout_seconds}")
-      return "timeout"
-    time.sleep(0.2)
-  return "interrupted"
 
 
 def pull_trace(device_trace: str, host_trace: str):
@@ -2094,37 +2046,25 @@ def run_profile_controlled_collection(args, action_module):
     smaps_thread.start()
 
     logcat_path = os.path.join(args.output, "logcat.txt")
-    login_state = wait_for_app_log_pattern(
-        logcat_path, pid, LOGIN_DONE_PATTERN, LOGIN_TIMEOUT_SECONDS)
-    if login_state != "ready":
-      print(f"MMAP_PROFILE_FAILED|reason=login_{login_state}|pid={pid}")
-      stage_failed = True
-    else:
-      table_state = wait_for_app_log_pattern(
-          logcat_path, pid, TABLE_READY_PATTERN, TABLE_READY_TIMEOUT_SECONDS)
-      if table_state != "ready":
-        print(f"MMAP_PROFILE_FAILED|reason=table_{table_state}|pid={pid}")
-        stage_failed = True
-      else:
-        context = ProfileActionContext(
-            app=args.name,
-            pid=pid,
-            output_dir=Path(args.output).resolve(),
-            logcat_path=Path(logcat_path).resolve(),
-            adb=os.environ.get("ADB_BINARY", "adb"),
-            rpc_local_port=RPC_LOCAL_PORT,
-            android_serial=os.environ.get("ANDROID_SERIAL", ""),
-            rpc_timeout_seconds=float(
-                os.environ.get("HEAP_PROFILE_RPC_TIMEOUT_S", "10")),
-            summary_path=Path(args.output, "run_summary.txt").resolve(),
-        )
-        result = run_profile_action_module(
-            action_module,
-            context,
-            lambda: IS_INTERRUPTED,
-            lambda: is_process_alive(pid),
-        )
-        stage_failed = not result.success
+    context = ProfileActionContext(
+        app=args.name,
+        pid=pid,
+        output_dir=Path(args.output).resolve(),
+        logcat_path=Path(logcat_path).resolve(),
+        adb=os.environ.get("ADB_BINARY", "adb"),
+        rpc_local_port=RPC_LOCAL_PORT,
+        android_serial=os.environ.get("ANDROID_SERIAL", ""),
+        rpc_timeout_seconds=float(
+            os.environ.get("HEAP_PROFILE_RPC_TIMEOUT_S", "30")),
+        summary_path=Path(args.output, "run_summary.txt").resolve(),
+    )
+    result = run_profile_action_module(
+        action_module,
+        context,
+        lambda: IS_INTERRUPTED,
+        lambda: is_process_alive(pid),
+    )
+    stage_failed = not result.success
   except Exception as exc:  # noqa: BLE001 - 必须先收尾 trace 再返回失败。
     print(
         f"MMAP_PROFILE_FAILED|reason=collection_control_failed|"

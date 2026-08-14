@@ -1,6 +1,57 @@
 #!/usr/bin/env bash
 
 # 这些函数只做宿主机工具探测，不执行采集逻辑；各入口脚本按需 source。
+source config.sh
+
+# 采集时只隐藏 ANR 等系统错误对话框，不影响系统记录 ANR。
+ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE=
+ANDROID_ERROR_DIALOGS_SUPPRESSED=0
+
+suppress_android_error_dialogs() {
+  local adb_bin=${ADB_BINARY:-adb}
+  local original_value
+  if ! original_value=$("$adb_bin" shell settings get global hide_error_dialogs 2>/dev/null); then
+    echo "ANDROID_ERROR_DIALOGS_WARN|action=read|setting=hide_error_dialogs" >&2
+    return 0
+  fi
+  original_value=${original_value//$'\r'/}
+  if ! "$adb_bin" shell settings put global hide_error_dialogs 1 >/dev/null 2>&1; then
+    echo "ANDROID_ERROR_DIALOGS_WARN|action=suppress|setting=hide_error_dialogs|original=${original_value:-empty}" >&2
+    return 0
+  fi
+  ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE=$original_value
+  ANDROID_ERROR_DIALOGS_SUPPRESSED=1
+  echo "ANDROID_ERROR_DIALOGS|state=suppressed|original=${original_value:-empty}"
+}
+
+restore_android_error_dialogs() {
+  if [[ "$ANDROID_ERROR_DIALOGS_SUPPRESSED" != "1" ]]; then
+    return 0
+  fi
+
+  local adb_bin=${ADB_BINARY:-adb}
+  local rc=0
+  if [[ "$ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE" == "null" ]]; then
+    "$adb_bin" shell settings delete global hide_error_dialogs >/dev/null 2>&1 || rc=$?
+  else
+    "$adb_bin" shell settings put global hide_error_dialogs \
+      "$ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE" >/dev/null 2>&1 || rc=$?
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    echo "ANDROID_ERROR_DIALOGS|state=restored|value=${ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE:-empty}"
+  else
+    echo "ANDROID_ERROR_DIALOGS_WARN|action=restore|setting=hide_error_dialogs|original=${ANDROID_ERROR_DIALOGS_ORIGINAL_VALUE:-empty}|rc=$rc" >&2
+  fi
+  ANDROID_ERROR_DIALOGS_SUPPRESSED=0
+  return 0
+}
+
+restore_android_error_dialogs_on_exit() {
+  local rc=$?
+  trap - EXIT
+  restore_android_error_dialogs
+  exit "$rc"
+}
 
 is_windows_git_bash() {
   [[ "${OSTYPE:-}" == msys* || "${MSYSTEM:-}" != "" ]]

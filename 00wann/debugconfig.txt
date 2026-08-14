@@ -1,5 +1,6 @@
 {
     "Wait10SForAttachDebug":0,
     "MemoryLevel":1,
-    "DeviceQualityLevel":0
+    "DeviceQualityLevel":0,
+    "DisableLanUpdateCheckVersion":true
 }

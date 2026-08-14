@@ -12,7 +12,7 @@ mmap_phys_analyzer.md
 
 # native heap
 run_heap_profile.sh
-如果是在 AI 中验证 `run_heap_profile.sh`，不要传 duration 参数，也不要用固定时长截断采集；必须等 logcat 出现 `登录场景完成` 后继续稳定采集 30 秒，再让脚本自动收尾。需要调整采样参数时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。
+如果是在 AI 中验证 `run_heap_profile.sh`，不要传 duration 参数，也不要用固定时长截断采集；必须等 logcat 依次出现 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`、登录后 GM RPC 成功并继续稳定采集 120 秒，再让脚本自动收尾。需要调整采样参数时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。
 评估 Native heap profile 对启动耗时影响时，使用 `run_heap_startup_eval.sh`，启动完成点必须按 logcat 出现 `LAN 更新流程开始` 判断；不能用 `am start -W` 的 Activity 可见时间替代业务启动完成时间。
 查Bug时要以perfetto源码为依据
 
@@ -34,7 +34,7 @@ run_heap_profile.sh
 - unity3d 引擎源代码：`D:\wann\u3d2019`，因为不是构建应用使用的 unity2022.3.62，所以只作为研究引擎实现的**参考**
 - gradle: `D:\bin\gradle-7.5.1`
 - unity2022.3.62安装路径：`D:\Program Files\Unity 2022.3.62f3`，sdk,ndk,java都使用这里的
-- 真机测试以进入登录场景为结束标志，游戏启动后会自动进入登录场景，届时游戏会输出日志：登录场景完成；看到该日志后必须稳定采集 30 秒再收尾
+- 真机测试必须等 `RegistForGameStart.LoadOtherTable.End` 后再触发登录后 GM；GM RPC 成功后必须稳定采集 120 秒再收尾
 - 安装新编译的apk时不要卸载真机上旧的apk
 - 做优化时，如果涉及il2cpp，则要创建分支，确保修改隔离得比较干净。合并主干时要和我确认。
 - 确认优化有效且ecma335测试都通过后，写验收报告，把appil2cpp同步到originil2cpp，并提交appil2cpp和originil2cpp

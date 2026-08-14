@@ -463,16 +463,18 @@ wait_for_test_log_pattern() {
 }
 
 expected_app="com.example.heapprofile"
-default_collection_wait_seconds=$(env -u HEAP_PROFILE_LOGIN_STABLE_S "$real_python" - "$python_action_path" <<'PY'
+default_stable_collection_seconds=$(env -u HEAP_PROFILE_LOGIN_STABLE_S "$real_python" - "$python_action_path" <<'PY'
 import runpy
 import sys
 
 namespace = runpy.run_path(sys.argv[1])
-print(namespace["get_collection_wait_seconds"](None))
+if "get_collection_wait_seconds" in namespace:
+  raise SystemExit("测试脚本不应再实现公共等待时间函数")
+print(namespace["get_stable_collection_seconds"]())
 PY
 )
-if [[ "$default_collection_wait_seconds" != "120.0" ]]; then
-  echo "默认测试模块最长采集时间必须是 120 秒"
+if [[ "$default_stable_collection_seconds" != "120.0" ]]; then
+  echo "默认测试模块必须在 GM 后稳定采集 120 秒"
   exit 1
 fi
 run_script "$TEST_LOG"
@@ -509,15 +511,18 @@ if ! grep -Fq "PYTHON_GOT_SIGINT" "$TEST_LOG"; then
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq "LOGIN_SCENE_DONE|pattern=" "$tmpdir/run_heap_profile_test.out" || \
-   ! grep -Fq "PROFILE_ACTION=PASS|reason=wait_elapsed|wait_seconds=1" \
+if ! grep -Fq "PROFILE_ACTION_STAGE=WAIT_LOGIN|timeout_s=none" \
+      "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "PROFILE_ACTION_STAGE=STABLE_COLLECTION|seconds=1" \
+      "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "PROFILE_ACTION=PASS|reason=action_completed" \
       "$tmpdir/run_heap_profile_test.out"; then
-  echo "登录并完成 GM RPC 后必须按测试模块等待时间结束采集"
+  echo "测试脚本必须自行等待登录、执行 GM 并在稳定采集后结束"
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
 if ! grep -Fq \
-    "HEAP_PROFILE_CONFIG|app=$expected_app|activity=$expected_app/com.dhplugin.unity.MainActivity|serial=FAKE_HEAP_DEVICE|interval_bytes=1024|shmem_size_bytes=8388608|trace_buffer_kib=63488|gm_ready_timeout_s=180|rpc_local_port=22346|action_script=" \
+    "HEAP_PROFILE_CONFIG|app=$expected_app|activity=$expected_app/com.dhplugin.unity.MainActivity|serial=FAKE_HEAP_DEVICE|interval_bytes=1024|shmem_size_bytes=8388608|trace_buffer_kib=63488|rpc_local_port=22346|action_script=" \
     "$tmpdir/run_heap_profile_test.out"; then
   echo "启动时未输出完整关键配置"
   cat "$tmpdir/run_heap_profile_test.out"
@@ -540,8 +545,11 @@ if ! grep -Fq "PROFILE_ACTION_RPC=PASS|method=DoRecordCheat" "$tmpdir/run_heap_p
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
-if ! grep -Fq "HEAP_PROFILE_GM_READY=PASS" "$tmpdir/run_heap_profile_test.out"; then
-  echo "延迟表加载完成后未进入 GM 就绪状态"
+if ! grep -Fq "PROFILE_ACTION_STAGE=WAIT_TABLE|timeout_s=180" \
+      "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "PROFILE_ACTION_APP_LOG=PASS|pattern=RegistForGameStart.LoadOtherTable.End" \
+      "$tmpdir/run_heap_profile_test.out"; then
+  echo "独立 FS 就绪步骤未完成延迟表等待"
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
@@ -982,8 +990,10 @@ if [[ "$login_timeout_rc" -eq 0 ]]; then
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
-if ! grep -Fq "LOGIN_SCENE_TIMEOUT" "$tmpdir/run_heap_profile_test.out"; then
-  echo "显式登录超时时应输出 LOGIN_SCENE_TIMEOUT"
+if ! grep -Fq "PROFILE_ACTION_APP_LOG=FAIL" \
+      "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "wait_login_done_failed" "$tmpdir/run_heap_profile_test.out"; then
+  echo "显式登录超时时应输出测试脚本阶段和底层错误"
   cat "$TEST_LOG"
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1

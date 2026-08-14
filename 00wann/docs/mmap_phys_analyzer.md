@@ -62,7 +62,10 @@ device_test_framework/actions/
   -> 公共测试 Context、按 App PID 检查 logcat、ADB/Poco RPC 和协程结束竞速。
 
 profile_actions/send_battle_record_gm.py
-  -> 独立流程脚本子模块的默认测试模块：通过 Poco RPC 发送战斗录像 GM。
+  -> 默认测试模块：复用 FS 就绪步骤，通过 Poco RPC 发送战斗录像 GM 并自行等待。
+
+profile_actions/fs_app_ready.py
+  -> 供其他测试脚本复用的登录界面和延迟表就绪步骤。
 
 mmap_phys_analyzer.py
   -> 离线分析器：读取 trace + smaps，输出归因 JSON。
@@ -136,12 +139,12 @@ launcher Intent。
 主功能会先启动并确认唯一 root `traced_perf`，再启动只采 ftrace/process_stats 的
 生命周期 Perfetto 会话，然后重启目标 App，以覆盖启动期 mmap。App PID 出现后再启动
 只采 `linux.perf` 的调用栈会话，避免首次进程描述符请求发生得过早。随后持续采集
-smaps，依次等待 `登录场景完成` 和
-`RegistForGameStart.LoadOtherTable.End`，并执行 `config.sh` 中
-`PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。测试模块契约、结束竞速和
-`ProfileActionSession` 与 Native heap 入口完全相同。
+smaps，然后立即执行 `config.sh` 中 `PERF_PROFILE_ACTION_SCRIPT`
+指定的测试模块。默认模块自行复用 FS 就绪步骤，依次等待
+`登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`。测试模块契约、
+结束竞速和 `ProfileActionSession` 与 Native heap 入口完全相同。
 
-主功能不使用 `--duration-ms` 自动收尾；测试协程完成、模块最长等待时间到期、人工中断或 App 死亡后，采集器主动向 Perfetto 发送 `SIGINT`。`--duration-ms` 只控制无栈验证等固定时长路径。
+主功能不使用 `--duration-ms` 自动收尾；测试协程完成、人工中断或 App 死亡后，采集器主动向 Perfetto 发送 `SIGINT`。需要固定稳定采集时间时，由测试脚本在自身协程内异步等待。`--duration-ms` 只控制无栈验证等固定时长路径。
 
 需要更换测试场景时，在 `config.sh` 中配置：
 

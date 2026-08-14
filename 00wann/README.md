@@ -88,7 +88,7 @@ Native heap 调用栈分析
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | mmap 采集、mmap 验证、host 兼容性改动 | 45 秒无栈 mmap 验证：`MMAP_PHYS_APP=com.example.meminfodemo MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity ./run_mmap_phys_profile.sh --no-mmap-callstacks -d 45000` |
 | mmap 调用栈归因改动               | 跑主功能：`./run_mmap_phys_profile.sh`，采集期间在手机上手动触发目标场景                                                                                                                       |
-| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，登录和表就绪后按 `config.sh` 执行测试模块，由模块协程或最长等待时间收尾                                                                                                           |
+| Native heap profile 改动     | AI 验证不传时长：`./run_heap_profile.sh`，由 `config.sh` 选择的测试脚本自行等待业务就绪和稳定采集，脚本返回后收尾                                                                                                           |
 | heapprofd malloc 统计改动      | 跑独立 demo：`./run_heapprofd_malloc_apk_demo.sh`                                                                                                                            |
 | meminfo demo 或解析改动         | 跑 `./run_meminfo_android_demo.sh`                                                                                                                                        |
 
@@ -158,7 +158,7 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 | -------------------- | ------------------------------------- | ------------------------------------- |
 | `MMAP_PHYS_APP`      | `config.sh` 当前配置为 `com.tencent.dhwdxkty.trunk.profiler` | 目标包名或进程名。 |
 | `MMAP_PHYS_ACTIVITY` | 空                                     | 目标进程不存在时用 `am start -n` 拉起的 Activity。 |
-| `PERF_PROFILE_ACTION_SCRIPT` | `profile_actions/send_battle_record_gm.py` | 登录和表就绪后执行的 Python 测试模块。 |
+| `PERF_PROFILE_ACTION_SCRIPT` | `profile_actions/send_battle_record_gm.py` | App PID 就绪后执行的 Python 测试模块。 |
 | `MMAP_PHYS_USE_ROOT_TRACED_PERF` | `1` | 主调用栈模式是否在 Perfetto 会话前启动唯一 root standalone `traced_perf`；采集期间临时抑制 init lazy producer，收尾恢复原状态。正式归因建议保持开启。 |
 | `PYTHON`             | 自动探测                                  | 指定 Python。                            |
 | `TRACE_PROCESSOR`    | 自动探测                                  | 覆盖 trace processor。                   |
@@ -448,7 +448,7 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 1. 切换到脚本目录并加载 config.sh，再自动选择 Python。
 2. 调用 run_heap_profile.py。
 3. 目标包名读取 config.sh 的 MMAP_PHYS_APP。
-4. 不传 duration；脚本依次等待 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`，再执行 `PERF_PROFILE_ACTION_SCRIPT` 配置的异步测试模块。模块协程完成或最长等待时间到期后请求 Perfetto 收尾；App 死亡时失败。人工 Ctrl+C 会先取消并等待模块清理，再触发 Perfetto 的 SIGINT 收尾。
+4. 不传 duration；App PID 就绪后立即执行 `PERF_PROFILE_ACTION_SCRIPT` 配置的异步测试模块。模块自行等待业务检查点和稳定采集时间，协程返回后请求 Perfetto 收尾；App 死亡时失败。人工 Ctrl+C 会先取消并等待模块清理，再触发 Perfetto 的 SIGINT 收尾。
 5. 不传 interval 时使用 1024 bytes。
 6. 不传 shmem-size 时使用 8388608 bytes。
 7. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
@@ -486,12 +486,12 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 | `PERFETTO_BINARY_PATH`                    | 自动生成           | traceconv 符号搜索路径；显式设置时脚本原样保留。                 |
 | `RUN_HEAP_PROFILE_SYMBOLS_DIR`            | 当前 FS 打包产物符号目录 | 未设置 `PERFETTO_BINARY_PATH` 时，用于覆盖优先符号目录。      |
 | `HEAP_PROFILE_ACTIVE_TIMEOUT_S`           | `60`           | 等待 `Profiling active` 的超时。                    |
-| `HEAP_PROFILE_LOGIN_TIMEOUT_S`            | `0`            | 等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。           |
-| `HEAP_PROFILE_GM_READY_TIMEOUT_S`         | `180`          | 登录后等待 `RegistForGameStart.LoadOtherTable.End` 的超时。          |
-| `PERF_PROFILE_ACTION_SCRIPT`              | `profile_actions/send_battle_record_gm.py` | 表加载完成后执行的 Python 测试模块。                  |
-| `HEAP_PROFILE_LOGIN_STABLE_S`             | `120`          | 默认 GM 模块的兼容等待时间覆盖；新模块直接实现 `get_collection_wait_seconds()`。 |
+| `HEAP_PROFILE_LOGIN_TIMEOUT_S`            | `0`            | FS 就绪步骤等待 `登录场景完成` 的超时；`0` 表示不限制，真机验收不要设置。           |
+| `HEAP_PROFILE_GM_READY_TIMEOUT_S`         | `180`          | FS 就绪步骤等待 `RegistForGameStart.LoadOtherTable.End` 的超时。          |
+| `PERF_PROFILE_ACTION_SCRIPT`              | `profile_actions/send_battle_record_gm.py` | App PID 就绪后执行的 Python 测试模块。                  |
+| `HEAP_PROFILE_LOGIN_STABLE_S`             | `120`          | 默认 GM 模块在 RPC 成功后自行等待的稳定采集秒数。 |
 | `HEAP_PROFILE_RPC_LOCAL_PORT`              | `12346`        | Poco RPC 使用的本机 ADB 转发端口。                                  |
-| `HEAP_PROFILE_RPC_TIMEOUT_S`               | `10`           | Poco RPC 连接和响应超时。                                           |
+| `HEAP_PROFILE_RPC_TIMEOUT_S`               | `30`           | Poco RPC 连接和响应超时；覆盖 Native heap 高负载下的主线程延迟。                                           |
 | `HEAP_PROFILE_SHUTDOWN_SIGNAL_TIMEOUT_S`  | `600`          | 等待 profiler shutdown 的超时。                     |
 | `HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES` | `67108864`     | malloc live 和 meminfo Native Heap Alloc 允许差值。 |
 
@@ -531,8 +531,8 @@ PerfData/mem/<时间戳>/
 5. force-stop 目标 App。
 6. 启动 Perfetto heap_profile.py，并等待 Profiling active。
 7. 使用 `adb shell am start -n $MMAP_PHYS_APP/com.dhplugin.unity.MainActivity` 拉起固定 Activity。
-8. 等待 logcat 输出 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`，再加载 `PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。
-9. 创建一次 `ProfileActionSession`，先调用同步 `get_collection_wait_seconds(session)`，再运行异步 `run_profile_action(session)`；协程完成、最长等待时间、人工中断或 App 死亡进行竞速，最后由 Session 统一清理公共资源。默认模块会调用战斗录像 GM 并声明 120 秒最长等待。
+8. App PID 就绪后加载 `PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。默认模块复用 `profile_actions/fs_app_ready.py` 等待 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`。
+9. 创建一次 `ProfileActionSession` 并运行异步 `run_profile_action(session)`；测试脚本自行调用异步等待，协程完成、人工中断或 App 死亡进行竞速，最后由 Session 统一清理公共资源。默认模块在战斗录像 GM 成功后自行等待 120 秒。
 10. 查询 heap_profile_allocation 累计 live bytes，与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值验证。
 ```
 

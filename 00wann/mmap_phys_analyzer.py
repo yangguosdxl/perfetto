@@ -3,7 +3,8 @@
 离线分析 mmap 真实物理内存占用，并输出 Perfetto UI 可加载的 Chrome JSON trace。
 
 输入由两部分组成：
-1. Perfetto trace：包含 raw_syscalls mmap/munmap/mremap 事件和 linux.perf 调用栈采样。
+1. Perfetto trace：生命周期 trace包含 raw_syscalls mmap/munmap/mremap 事件；调用栈
+   可以来自同一 trace，也可以通过 --callstack-trace 使用独立 linux.perf trace。
 2. smaps 快照目录：每个文件是一份 /proc/<pid>/smaps 内容，文件名里带时间戳。
 
 输出是 Chrome trace JSON。Perfetto UI 可以直接打开这个 JSON 文件。
@@ -87,6 +88,7 @@ class PerfSample:
 class SyscallEvent:
   ts: int
   utid: int
+  tid: int
   name: str
   syscall_id: Optional[int]
   ret: Optional[int]
@@ -291,6 +293,7 @@ def build_syscalls_sql(pid: Optional[int] = None) -> str:
       fe.id AS event_id,
       fe.ts AS ts,
       fe.utid AS utid,
+      th.tid AS tid,
       fe.name AS event_name,
       fe.arg_set_id AS arg_set_id
     FROM __intrinsic_ftrace_event fe
@@ -329,6 +332,7 @@ def build_syscalls_sql(pid: Optional[int] = None) -> str:
     tfe.event_id AS event_id,
     tfe.ts AS ts,
     tfe.utid AS utid,
+    tfe.tid AS tid,
     tfe.event_name AS event_name,
     a.id AS arg_id,
     a.key AS key,
@@ -360,6 +364,7 @@ def build_syscalls_sql(pid: Optional[int] = None) -> str:
     fe.id AS event_id,
     fe.ts AS ts,
     fe.utid AS utid,
+    th.tid AS tid,
     fe.name AS event_name,
     a.id AS arg_id,
     a.key AS key,
@@ -367,6 +372,7 @@ def build_syscalls_sql(pid: Optional[int] = None) -> str:
     IFNULL(a.string_value, '') AS string_value,
     a.value_type AS value_type
   FROM __intrinsic_ftrace_event fe
+  JOIN __intrinsic_thread th ON fe.utid = th.id
   JOIN interesting_events ie ON fe.id = ie.event_id
   JOIN __intrinsic_args a ON fe.arg_set_id = a.arg_set_id
   ORDER BY fe.ts, fe.id, a.id
@@ -387,6 +393,7 @@ def load_syscalls(tp: str,
       ev = SyscallEvent(
           ts=int(row["ts"]),
           utid=int(row["utid"]),
+          tid=int(row.get("tid") or row["utid"]),
           name=row["event_name"],
           syscall_id=None,
           ret=None,
@@ -460,19 +467,23 @@ def syscall_kind(ev: SyscallEvent) -> Optional[str]:
 
 
 def build_sample_index(
-    samples: List[PerfSample]) -> Dict[int, Tuple[List[int], List[PerfSample]]]:
-  by_utid: Dict[int, List[PerfSample]] = {}
+    samples: List[PerfSample],
+    use_linux_tid: bool = False
+) -> Dict[int, Tuple[List[int], List[PerfSample]]]:
+  """单 trace按 utid，跨 Perfetto session时按稳定的 Linux tid建索引。"""
+  grouped: Dict[int, List[PerfSample]] = {}
   for sample in samples:
-    by_utid.setdefault(sample.utid, []).append(sample)
+    key = sample.tid if use_linux_tid else sample.utid
+    grouped.setdefault(key, []).append(sample)
   return {
-      utid: ([sample.ts for sample in values], values)
-      for utid, values in by_utid.items()
+      key: ([sample.ts for sample in values], values)
+      for key, values in grouped.items()
   }
 
 
 def nearest_sample(index: Dict[int, Tuple[List[int], List[PerfSample]]],
-                   utid: int, ts: int, window_ns: int) -> Optional[PerfSample]:
-  item = index.get(utid)
+                   tid: int, ts: int, window_ns: int) -> Optional[PerfSample]:
+  item = index.get(tid)
   if not item:
     return None
   times, samples = item
@@ -490,8 +501,10 @@ def nearest_sample(index: Dict[int, Tuple[List[int], List[PerfSample]]],
 
 def build_lifecycle_events(syscalls: List[SyscallEvent],
                            samples: List[PerfSample],
-                           stack_window_ns: int) -> List[Tuple[int, str, dict]]:
-  sample_index = build_sample_index(samples)
+                           stack_window_ns: int,
+                           cross_session: bool = False
+                           ) -> List[Tuple[int, str, dict]]:
+  sample_index = build_sample_index(samples, use_linux_tid=cross_session)
   pending: Dict[int, List[Tuple[str, SyscallEvent, Optional[PerfSample]]]] = {}
   events = []
 
@@ -500,7 +513,9 @@ def build_lifecycle_events(syscalls: List[SyscallEvent],
     if kind is None:
       continue
     if is_enter(ev) and not is_exit(ev):
-      sample = nearest_sample(sample_index, ev.utid, ev.ts, stack_window_ns)
+      sample_key = ev.tid if cross_session else ev.utid
+      sample = nearest_sample(
+          sample_index, sample_key, ev.ts, stack_window_ns)
       pending.setdefault(ev.utid, []).append((kind, ev, sample))
       continue
     if not is_exit(ev):
@@ -1505,7 +1520,10 @@ def main() -> int:
   parser = argparse.ArgumentParser(
       description="按 mmap 调用栈归因 smaps PSS/RSS，并输出 Perfetto 可加载 JSON")
   parser.add_argument(
-      "--trace", required=True, help="包含 mmap/perf 事件的 Perfetto trace")
+      "--trace", required=True, help="包含 mmap syscall 事件的 Perfetto trace")
+  parser.add_argument(
+      "--callstack-trace",
+      help="单独的 linux.perf 调用栈 trace；未指定时与 --trace 相同")
   parser.add_argument("--smaps-dir", required=True, help="smaps 快照目录")
   parser.add_argument("--pid", type=int, required=True, help="目标进程 pid")
   parser.add_argument("--output", required=True, help="输出 Chrome JSON trace")
@@ -1555,11 +1573,12 @@ def main() -> int:
     return 1
 
   print("加载 perf 调用栈采样...")
-  samples = load_perf_samples(args.trace_processor, args.trace)
+  callstack_trace = args.callstack_trace or args.trace
+  samples = load_perf_samples(args.trace_processor, callstack_trace)
   print(f"perf samples: {len(samples)}")
 
   print("加载调用栈表...")
-  stacks = load_stacks(args.trace_processor, args.trace)
+  stacks = load_stacks(args.trace_processor, callstack_trace)
   print(f"stacks: {len(stacks)}")
 
   print("加载 syscall 事件...")
@@ -1567,7 +1586,11 @@ def main() -> int:
   print(f"syscall events: {len(syscalls)}")
 
   print("构建 mmap 生命周期...")
-  lifecycle = build_lifecycle_events(syscalls, samples, args.stack_window_ns)
+  lifecycle = build_lifecycle_events(
+      syscalls,
+      samples,
+      args.stack_window_ns,
+      cross_session=bool(args.callstack_trace))
   print(f"lifecycle events: {len(lifecycle)}")
 
   print("加载 smaps 快照...")

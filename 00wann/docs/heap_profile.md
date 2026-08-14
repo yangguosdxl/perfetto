@@ -10,7 +10,7 @@
 高开销采样期间的“应用未响应”对话框反复改变窗口焦点。正常、失败和中断退出
 都会恢复原值。该设置只隐藏对话框，不修改 Android 的 ANR 阈值，系统仍会记录 ANR。
 
-默认执行时不向 Perfetto 传固定 duration。脚本会在 heapprofd 就绪后启动目标 App，并依次等待 logcat 出现 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`；随后加载 `config.sh` 配置的 Python 测试模块。测试模块协程完成或模块声明的最长等待时间到期后，脚本请求 `heap_profile.py` 进入 `Waiting for profiler shutdown...` 收尾流程：
+默认执行时不向 Perfetto 传固定 duration。脚本会在 heapprofd 就绪后启动目标 App，App PID 出现后立即加载 `config.sh` 配置的 Python 测试模块。测试模块自行等待业务就绪条件和采集时间，协程返回后，脚本请求 `heap_profile.py` 进入 `Waiting for profiler shutdown...` 收尾流程：
 
 ```bash
 00wann/run_heap_profile.sh
@@ -65,32 +65,32 @@ PerfData/mem/<日期时间>/heap_profile_config.txt
 PerfData/mem/<日期时间>/run_summary.txt
 ```
 
-登录完成后，脚本先等待延迟表加载完成日志：
+采集器不识别 FS 业务日志。默认测试模块复用
+`profile_actions/fs_app_ready.py` 中的 `wait_login_done()` 和
+`wait_table_ready()`，按顺序等待：
 
 ```text
+登录场景完成
 RegistForGameStart.LoadOtherTable.End
 ```
 
-这个门槛用于避免测试操作在 `MatchAiImageConfig` 等配置尚未加载时开始。采集器随后加载：
+这两个可复用步骤只匹配本轮 App PID，避免测试操作在
+`MatchAiImageConfig` 等配置尚未加载时开始。采集器加载：
 
 ```bash
 PERF_PROFILE_ACTION_SCRIPT=profile_actions/send_battle_record_gm.py
 ```
 
-相对路径以 `00wann` 为基准。模块必须实现：
+相对路径以 `00wann` 为基准。模块只需实现：
 
 ```python
-def get_collection_wait_seconds(session) -> float | None:
-  """返回最长采集秒数；None 表示不设置超时。"""
-
-
 async def run_profile_action(session) -> None:
-  """执行测试操作；协程结束时结束采集。"""
+  """自行等待就绪条件并执行测试；协程返回时结束采集。"""
 ```
 
-采集器先调用 `get_collection_wait_seconds()`，再启动 `run_profile_action()`。等待时间先到时会取消协程并等待其 `finally` 清理完成，本轮正常结束；协程先完成时提前结束；协程抛异常或 App 原 PID 死亡时保存 trace 但本轮失败；`None` 表示只等待协程、人工中断或 App 死亡。
+测试脚本在自己需要的位置调用 `asyncio.sleep()` 或日志等待。执行器只在协程返回、人工中断或 App 原 PID 死亡时结束；协程抛异常或 App 死亡时保存 trace 但本轮失败。
 
-默认模块 `profile_actions/send_battle_record_gm.py` 返回 120 秒，并从本轮 `logcat.txt` 中查找目标 PID 的：
+默认模块 `profile_actions/send_battle_record_gm.py` 在两个 FS 就绪步骤完成后，从本轮 `logcat.txt` 中查找目标 PID 的：
 
 ```text
 Tcp server started and listening at <5001..5005>
@@ -107,7 +107,7 @@ Tcp server started and listening at <5001..5005>
 }
 ```
 
-公共 Session 默认要求响应 `result=true` 且没有 `error`，成功时输出 `PROFILE_ACTION_RPC=PASS`。默认模块当前没有战斗完成信号，因此 RPC 成功后通过 `session.wait_forever()` 保持协程挂起，由 120 秒最长等待触发取消。RPC 失败时公共接口返回 `success=False` 并保存诊断，默认脚本选择抛异常使本轮失败。本轮 RPC 详情默认保存到 `gm_rpc.txt`；公共输出保存到 `profile_action.log` 并同步追加到 `run_summary.txt`。
+公共 Session 默认要求响应 `result=true` 且没有 `error`，成功时输出 `PROFILE_ACTION_RPC=PASS`。默认模块在 RPC 成功后自行 `asyncio.sleep(120)`，然后正常返回并结束采集。RPC 失败时公共接口返回 `success=False` 并保存诊断，默认脚本选择抛异常使本轮失败。本轮 RPC 详情默认保存到 `gm_rpc.txt`；公共输出保存到 `profile_action.log` 并同步追加到 `run_summary.txt`。
 
 执行器为每轮测试创建一次 `ProfileActionSession`。公共 API 和协程 runner 位于
 `device_test_framework/actions/` 子模块，具体测试目的位于独立 `profile_actions/`
@@ -174,7 +174,7 @@ Windows Git Bash 中如果没有 `python3`，入口会回退到 `python` 或 `py
 
 AI 做真机验证时不要传入 duration 参数。采集结束必须由目标 App logcat 输出 `登录场景完成`、延迟表就绪并执行配置测试模块后触发；默认 GM 模块会等待 120 秒。下探采样 interval 时使用 `00wann/run_heap_profile.sh <interval_bytes>`；对比缓冲区时使用 `00wann/run_heap_profile.sh <interval_bytes> <shmem_size>`。历史命令中的 `45000` 只做兼容忽略，不再作为推荐用法。
 
-默认不限制等待登录场景的时间。只有显式设置 `HEAP_PROFILE_LOGIN_TIMEOUT_S=<秒>` 时，脚本才会在未等到 `登录场景完成` 时超时退出；真机验收不要设置这个变量。`HEAP_PROFILE_GM_READY_TIMEOUT_S` 默认是 180，用于等待延迟表加载完成。`HEAP_PROFILE_RPC_LOCAL_PORT` 默认是 12346，`HEAP_PROFILE_RPC_TIMEOUT_S` 默认是 10。`HEAP_PROFILE_LOGIN_STABLE_S` 只由默认 GM 测试模块作为兼容覆盖读取，默认 120；新测试模块应在自身的 `get_collection_wait_seconds()` 中直接声明等待时间。
+默认不限制等待登录场景的时间。只有显式设置 `HEAP_PROFILE_LOGIN_TIMEOUT_S=<秒>` 时，FS 就绪步骤才会在未等到 `登录场景完成` 时超时退出；真机验收不要设置这个变量。`HEAP_PROFILE_GM_READY_TIMEOUT_S` 默认是 180，用于等待延迟表加载完成。`HEAP_PROFILE_RPC_LOCAL_PORT` 默认是 12346，`HEAP_PROFILE_RPC_TIMEOUT_S` 默认是 30，用于覆盖 Native heap 高负载下的 App 主线程延迟。`HEAP_PROFILE_LOGIN_STABLE_S` 只由默认 GM 测试模块读取，默认 120；新测试模块应在自身协程的准确阶段调用异步等待。
 
 ## 2026-08-11 三轮采样间隔结果
 

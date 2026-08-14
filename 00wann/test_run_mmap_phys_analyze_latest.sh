@@ -44,6 +44,7 @@ touch -t 202606051008 \
   "$tmpdir/PerfData/mmap_phys/2026-06-05_10-08-27/mmap_trace.perfetto-trace"
 touch -t 202606051740 \
   "$tmpdir/PerfData/mmap_phys/2026-06-05_17-40-36/mmap_trace.perfetto-trace" \
+  "$tmpdir/PerfData/mmap_phys/2026-06-05_17-40-36/mmap_callstack_trace.perfetto-trace" \
   "$tmpdir/PerfData/mmap_phys/2026-06-05_17-40-36/symbolized-trace"
 touch "$tmpdir/mmap_phys_analyzer.py"
 
@@ -53,13 +54,18 @@ export TEST_LOG="$tmpdir/commands.log"
 cd "$tmpdir"
 ./run_mmap_phys_analyze_latest.sh --top-n 25 >"$tmpdir/default.out"
 
-if ! grep -Fq -- "trace_processor query PerfData/mmap_phys/2026-06-05_17-40-36/symbolized-trace" "$TEST_LOG"; then
-  echo "wrapper 应使用最近目录中的 symbolized-trace 自动查询 pid"
+if ! grep -Fq -- "trace_processor query PerfData/mmap_phys/2026-06-05_17-40-36/mmap_trace.perfetto-trace" "$TEST_LOG"; then
+  echo "wrapper 应使用生命周期 trace 自动查询 pid"
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_17-40-36/symbolized-trace" "$TEST_LOG"; then
-  echo "wrapper 应默认使用最近抓取目录中的 symbolized-trace"
+if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_17-40-36/mmap_trace.perfetto-trace" "$TEST_LOG"; then
+  echo "wrapper 应默认使用最近抓取目录中的生命周期 trace"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq -- "--callstack-trace PerfData/mmap_phys/2026-06-05_17-40-36/symbolized-trace" "$TEST_LOG"; then
+  echo "wrapper 应默认使用最近抓取目录中的符号化调用栈 trace"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -122,13 +128,18 @@ if ! grep -Fq -- "--pid 1357" "$TEST_LOG"; then
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_17-40-36/symbolized-trace" "$TEST_LOG"; then
+if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_17-40-36/mmap_trace.perfetto-trace" "$TEST_LOG"; then
   echo "wrapper 仍应提供最近 trace 作为默认值"
   cat "$TEST_LOG"
   exit 1
 fi
 if ! grep -Fq -- "--trace PerfData/mmap_phys/2026-06-05_10-08-27/mmap_trace.perfetto-trace" "$TEST_LOG"; then
   echo "用户显式 --trace 应追加在默认 trace 之后以覆盖默认值"
+  cat "$TEST_LOG"
+  exit 1
+fi
+if grep -Fq -- "--callstack-trace" "$TEST_LOG"; then
+  echo "用户显式 --trace 时不应混入最近目录的默认调用栈 trace"
   cat "$TEST_LOG"
   exit 1
 fi

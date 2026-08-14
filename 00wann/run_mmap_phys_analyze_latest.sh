@@ -11,7 +11,8 @@ usage() {
 
 默认行为:
   - 自动选择 PerfData/mmap_phys 下最近一次可分析采集目录
-  - 优先使用 symbolized-trace，缺失时回退 mmap_trace.perfetto-trace
+  - 新采集目录使用 mmap_trace 作为生命周期 trace，并用 symbolized-trace 作为调用栈 trace
+  - 旧采集目录仍优先使用 symbolized-trace 单文件，缺失时回退 mmap_trace
   - 默认追加 --classify-config heap_analyzer/fs.ini
   - 未传 --pid 时按 MMAP_PHYS_APP 从 trace 中查询目标进程 pid
 
@@ -221,6 +222,15 @@ if ! latest_trace=$(select_trace_path "$latest_dir"); then
   echo "FATAL: mmap 采集目录缺少 trace: $latest_dir" >&2
   exit 1
 fi
+latest_callstack_trace=
+if [[ -f "$latest_dir/mmap_callstack_trace.perfetto-trace" ]]; then
+  if [[ -f "$latest_dir/symbolized-trace" ]]; then
+    latest_callstack_trace="$latest_dir/symbolized-trace"
+  else
+    latest_callstack_trace="$latest_dir/mmap_callstack_trace.perfetto-trace"
+  fi
+  latest_trace="$latest_dir/mmap_trace.perfetto-trace"
+fi
 latest_smaps_dir="$latest_dir/smaps"
 latest_output="$latest_dir/mmap_phys_attribution.json"
 latest_pprof_output="$latest_dir/mmap_phys_attribution.pprof.pb.gz"
@@ -268,6 +278,10 @@ cmd=(
   --trace "$latest_trace"
   --smaps-dir "$latest_smaps_dir"
 )
+if [[ -n "$latest_callstack_trace" ]] && \
+    ! has_arg "--trace" "${analyzer_args[@]}"; then
+  cmd+=(--callstack-trace "$latest_callstack_trace")
+fi
 if [[ -n "$auto_pid" ]]; then
   cmd+=(--pid "$auto_pid")
 fi
@@ -288,6 +302,9 @@ cmd+=(
 
 echo "最近 mmap 目录: $latest_dir"
 echo "默认 trace: $latest_trace"
+if [[ -n "$latest_callstack_trace" ]]; then
+  echo "默认调用栈 trace: $latest_callstack_trace"
+fi
 echo "默认 smaps: $latest_smaps_dir"
 if [[ -n "$auto_pid" ]]; then
   echo "自动 pid: $auto_pid"

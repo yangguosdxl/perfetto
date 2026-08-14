@@ -50,14 +50,10 @@ class MmapProfileControlTest(unittest.TestCase):
       stop_event.wait(1)
       events.append("smaps_stop")
 
-    def wait_log(_path, _pid, pattern, _timeout):
-      events.append("login" if pattern == collector.LOGIN_DONE_PATTERN else "table")
-      return "ready"
-
     def run_action(_module, context, _stop_requested, _process_alive):
       events.append("action")
       self.assertEqual(context.pid, 4321)
-      return ProfileActionResult(True, "action_completed", None)
+      return ProfileActionResult(True, "action_completed")
 
     patches = (
         mock.patch.object(
@@ -71,7 +67,6 @@ class MmapProfileControlTest(unittest.TestCase):
         mock.patch.object(collector, "wait_for_pid",
                           side_effect=lambda *_args: events.append("app_start") or 4321),
         mock.patch.object(collector, "collect_smaps", side_effect=collect_smaps),
-        mock.patch.object(collector, "wait_for_app_log_pattern", side_effect=wait_log),
         mock.patch.object(collector, "run_profile_action_module", side_effect=run_action),
         mock.patch.object(collector, "stop_logcat_capture"),
         mock.patch.object(collector, "stop_perfetto",
@@ -80,7 +75,7 @@ class MmapProfileControlTest(unittest.TestCase):
                           return_value={"status": 0}),
     )
     with patches[0], patches[1], patches[2], patches[3], patches[4], \
-         patches[5], patches[6], patches[7], patches[8], patches[9], patches[10]:
+         patches[5], patches[6], patches[7], patches[8], patches[9]:
       result = collector.run_profile_controlled_collection(
           self.args, types.SimpleNamespace())
 
@@ -94,8 +89,7 @@ class MmapProfileControlTest(unittest.TestCase):
     self.assertLess(
         events.index("callstack_perfetto_start"), events.index("smaps_start"))
     self.assertLess(events.index("app_start"), events.index("smaps_start"))
-    self.assertLess(events.index("login"), events.index("table"))
-    self.assertLess(events.index("table"), events.index("action"))
+    self.assertLess(events.index("smaps_start"), events.index("action"))
     self.assertLess(events.index("action"), events.index("smaps_stop"))
     self.assertLess(events.index("smaps_stop"), events.index("perfetto_stop"))
 
@@ -123,11 +117,9 @@ class MmapProfileControlTest(unittest.TestCase):
          mock.patch.object(collector, "wait_for_pid", return_value=4321), \
          mock.patch.object(collector, "collect_smaps",
                            side_effect=RuntimeError("smaps 测试失败")), \
-         mock.patch.object(collector, "wait_for_app_log_pattern",
-                           return_value="ready"), \
          mock.patch.object(collector, "run_profile_action_module",
                            return_value=ProfileActionResult(
-                               True, "action_completed", None)), \
+                               True, "action_completed")), \
          mock.patch.object(collector, "stop_logcat_capture"), \
          mock.patch.object(collector, "stop_perfetto"), \
          mock.patch.object(collector, "finish_collection",

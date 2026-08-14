@@ -16,6 +16,27 @@ import mmap_phys_analyzer as analyzer
 
 class MmapPhysAnalyzerTest(unittest.TestCase):
 
+  def test_跨session按linux_tid匹配调用栈(self):
+    """不同 trace 的 utid 不同，必须使用稳定的 Linux tid 关联。"""
+    samples = [
+        analyzer.PerfSample(
+            ts=1_000_000, utid=900, pid=42, tid=77, callsite_id=12)
+    ]
+    syscalls = [
+        analyzer.SyscallEvent(
+            ts=1_000_100, utid=100, tid=77, name="sys_enter",
+            syscall_id=analyzer.ARM64_MMAP_NR, ret=None,
+            args={"arg1": 4096}),
+        analyzer.SyscallEvent(
+            ts=1_000_200, utid=100, tid=77, name="sys_exit",
+            syscall_id=analyzer.ARM64_MMAP_NR, ret=0x1000, args={}),
+    ]
+
+    events = analyzer.build_lifecycle_events(
+        syscalls, samples, stack_window_ns=1_000, cross_session=True)
+
+    self.assertEqual(events[0][2]["stack_id"], 12)
+
   def test_default_trace_processor_uses_perfetto_root_from_config(self):
     """默认 trace_processor 应从 config.sh 的 PerfettoRoot 推导。"""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -270,6 +291,29 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(status["status"], "fail")
     self.assertIn("perf_samples_skipped_dataloss", status["issues"])
 
+  def test_memory_validation_fails_when_target_callstacks_are_missing(self):
+    """目标样本存在但没有 callsite 时，主功能不能输出空归因后误报成功。"""
+    status = collector.build_memory_validation_status(
+        {"syscall_events": 1, "smaps_snapshots": 1},
+        {
+            "perfetto_data_loss": 0,
+            "ftrace_data_loss": 0,
+            "perf_data_loss": 0,
+            "perf_samples": 21154,
+            "perf_callsites": 0,
+        })
+
+    self.assertEqual(status["status"], "fail")
+    self.assertIn("perf_callstacks_missing", status["issues"])
+
+  def test_memory_validation_accepts_target_callstacks(self):
+    status = collector.build_memory_validation_status(
+        {"syscall_events": 1, "smaps_snapshots": 1},
+        {"perf_samples": 21154, "perf_callsites": 8275})
+
+    self.assertEqual(status["status"], "pass")
+    self.assertNotIn("perf_callstacks_missing", status["issues"])
+
   def test_perfetto_config_collects_raw_syscall_enter_and_exit(self):
     """采集 mmap 归因必须同时拿到 syscall 参数和返回值。"""
     config = collector.build_perfetto_config(
@@ -488,13 +532,7 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
         return inner
 
-      with mock.patch.object(collector, "parse_args", return_value=args), \
-          mock.patch.object(collector, "wait_for_pid", return_value=1234), \
-          mock.patch.object(collector, "write_config", record("write_config")), \
-          mock.patch.object(collector, "start_perfetto",
-                            record("start_perfetto", 5678)), \
-          mock.patch.object(collector, "collect_smaps", record("collect_smaps")), \
-          mock.patch.object(collector, "pull_trace", record("pull_trace")), \
+      with mock.patch.object(collector, "pull_trace", record("pull_trace")), \
           mock.patch.object(collector, "capture_meminfo",
                             record("capture_meminfo", os.path.join(tmpdir, "dumpsys_meminfo.txt"))), \
           mock.patch.object(collector, "symbolize_trace",
@@ -503,8 +541,17 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
                             record("check_trace_health", {})), \
           mock.patch.object(collector, "run_analyzer", record("run_analyzer")), \
           mock.patch.object(collector, "collect_memory_validation",
-                            record("collect_memory_validation")):
-        self.assertEqual(collector.main(), 0)
+                            record("collect_memory_validation", {
+                                "trace_health": {},
+                            })):
+        result = collector.finish_collection(
+            args,
+            1234,
+            "/data/misc/perfetto-traces/test",
+            os.path.join(tmpdir, "mmap_trace.perfetto-trace"),
+            os.path.join(tmpdir, "smaps"))
+
+    self.assertEqual(result["status"], 0)
 
     self.assertIn("capture_meminfo", calls)
     self.assertLess(
@@ -552,16 +599,57 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
                             return_value=os.path.join(tmpdir, "symbolized-trace")), \
           mock.patch.object(collector, "capture_meminfo",
                             return_value=os.path.join(tmpdir, "dumpsys_meminfo.txt")), \
-          mock.patch.object(collector, "check_trace_health", return_value={}), \
+          mock.patch.object(collector, "check_trace_health", return_value={
+              "perf_samples": 10,
+              "perf_callsites": 5,
+          }), \
           mock.patch.object(collector, "run_analyzer",
                             side_effect=fake_run_analyzer), \
           mock.patch.object(collector, "collect_memory_validation",
-                            return_value={"trace_health": {}}):
+                            return_value={
+                                "trace_health": {
+                                    "perf_samples": 10,
+                                    "perf_callsites": 5,
+                                },
+                            }):
         result = collector.run_collection(args)
 
     self.assertEqual(result["status"], 0)
     self.assertEqual(analyzed_traces,
                      [os.path.join(tmpdir, "symbolized-trace")])
+
+  def test_finish_collection_fails_when_target_callstacks_are_missing(self):
+    """目标 perf 样本没有 callsite 时，收尾入口必须返回失败。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          output=tmpdir,
+          mmap_callstacks=True,
+          no_analyze=True,
+          traceconv="traceconv")
+      with mock.patch.object(collector, "pull_trace"), \
+          mock.patch.object(collector, "capture_meminfo",
+                            return_value=os.path.join(tmpdir, "dumpsys_meminfo.txt")), \
+          mock.patch.object(collector, "symbolize_trace",
+                            return_value=os.path.join(tmpdir, "symbolized-trace")), \
+          mock.patch.object(collector, "check_trace_health", return_value={
+              "perf_samples": 21154,
+              "perf_callsites": 0,
+          }), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            return_value={"trace_health": {}}), \
+          mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        result = collector.finish_collection(
+            args,
+            32096,
+            "/data/misc/perfetto-traces/test",
+            os.path.join(tmpdir, "mmap_trace.perfetto-trace"),
+            os.path.join(tmpdir, "smaps"))
+
+    self.assertEqual(result["status"], 1)
+    self.assertIn(
+        "MMAP_PROFILE_FAILED|reason=perf_callstacks_missing|pid=32096|"
+        "samples=21154", stdout.getvalue())
 
   def test_finish_collection_propagates_memory_validation_failure(self):
     """perf 丢样等通用健康失败必须传递到采集进程退出码。"""
