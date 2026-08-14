@@ -58,11 +58,11 @@ run_mmap_phys_analyze_latest.sh
 collect_mmap_phys_data.py
   -> 采集脚本：启动 Perfetto，周期拉 smaps，调用离线分析器，并生成内存总量验证报告。
 
-profile_action_api.py / profile_action_runner.py
-  -> 测试模块 Context、按 App PID 检查 logcat，以及协程结束竞速。
+device_test_framework/actions/
+  -> 公共测试 Context、按 App PID 检查 logcat、ADB/Poco RPC 和协程结束竞速。
 
 profile_actions/send_battle_record_gm.py
-  -> 默认测试模块：通过 Poco RPC 发送战斗录像 GM。
+  -> 独立流程脚本子模块的默认测试模块：通过 Poco RPC 发送战斗录像 GM。
 
 mmap_phys_analyzer.py
   -> 离线分析器：读取 trace + smaps，输出归因 JSON。
@@ -351,6 +351,8 @@ data_sources {
 4 KiB 页数，主要用于吸收启动期 mmap tracepoint 的短时峰值；如果
 `memory_validation.json` 中 `trace_health.perf_data_loss` 非 0，先检查
 linux.perf ring buffer，不要优先增大 Perfetto 全局 `--buffer-kb`。
+`memory_validation.json` 的任一 `validation.issues` 都会让采集进程返回非零退出码，
+通用真机框架据此把 `feature_run` 和 `run_manifest.status` 标记为失败。
 主功能配置显式设置 `user_frames: UNWIND_DWARF`；这是 mmap 归因所需的用户态调用栈
 来源。`kernel_frames: true` 也应保留用于主功能验收，因为 mmap tracepoint sample
 可能全部以 kernel cpu_mode 进入 trace_processor；关闭 kernel frames 后即使

@@ -20,11 +20,7 @@ cp "$script_dir/run_device_test.py" "$tmpdir/run_device_test.py"
 cp "$script_dir/device_test.ini" "$tmpdir/device_test.ini"
 cp -R "$script_dir/device_test_framework" "$tmpdir/device_test_framework"
 cp -R "$script_dir/device_test_plugins" "$tmpdir/device_test_plugins"
-cp "$script_dir/profile_action_api.py" "$tmpdir/profile_action_api.py"
-cp "$script_dir/profile_action_runner.py" "$tmpdir/profile_action_runner.py"
-mkdir -p "$tmpdir/profile_actions"
-cp "$script_dir/profile_actions/send_battle_record_gm.py" \
-  "$tmpdir/profile_actions/send_battle_record_gm.py"
+cp -R "$script_dir/profile_actions" "$tmpdir/profile_actions"
 cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 

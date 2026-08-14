@@ -52,6 +52,7 @@ Android SDK/NDK/JDK
   run_heap_profile.sh / run_mmap_phys_profile.sh
     -> run_device_test.sh
       -> AndroidAdapter + FeaturePlugin + FlowSpec
+        -> device_test_framework.actions + profile_actions
         -> run_heap_profile.py / collect_mmap_phys_data.py
       -> mmap_phys_analyzer.py
 
@@ -195,6 +196,8 @@ PerfData/mmap_phys/<时间戳>/
 主功能：重点看 mmap_phys_attribution.json 和 pprof 数据。
 无栈验证：memory_validation.json 中 validation.status 应为 pass，mmap.syscall_events 和 mmap.smaps_snapshots 应大于 0，trace_health 丢失项应为 0。
 主功能健康：除无栈字段外，还要求 trace_health.perf_samples_skipped_dataloss=0 且 trace_health.perf_callsites>0。
+任一健康检查失败都会让采集后端返回非零退出码，并由通用框架把
+`run_manifest.status` 写为 `fail`；不能只看流程脚本 RPC 是否成功。
 如果目标进程已有 perf_samples 但 perf_callsites=0，入口输出 MMAP_PROFILE_FAILED|reason=perf_callstacks_missing 并返回失败；常见原因是 traced_perf 无权读取 /proc/<pid>/maps，空 JSON/pprof 不能作为成功结果。
 ```
 
@@ -202,7 +205,8 @@ PerfData/mmap_phys/<时间戳>/
 旧 `config.sh` 和环境变量继续兼容；每轮在原专业结果目录额外生成
 `run_config.json`、`run_manifest.json`、`run_summary.txt` 和 `report.md`。
 通用核心通过 `device_test_framework/` Git 子模块引用，malloc/mmap 和 FS 流程保留在
-`device_test_plugins/`；框架结构、配置优先级和子模块升级方式见
+`device_test_plugins/`；ADB、Poco RPC、日志和协程 runner 位于框架的 `actions/`，具体
+测试目的位于独立 `profile_actions/` Git 子模块。框架结构、配置优先级和子模块升级方式见
 `docs/device_test_framework.md`。
 
 主功能保留两份独立 trace：`mmap_trace.perfetto-trace` 保存 App 前启动的 mmap 生命周期，

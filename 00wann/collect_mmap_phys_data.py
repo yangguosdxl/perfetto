@@ -23,10 +23,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from profile_action_api import ProfileActionContext
-from profile_action_runner import (load_action_module,
-                                   resolve_action_module_path,
-                                   run_profile_action_module)
+from device_test_framework.actions import (
+    ProfileActionContext,
+    load_action_module,
+    resolve_action_module_path,
+    run_profile_action_module,
+)
 
 ARM64_MMAP_NR = 222
 ARM64_MUNMAP_NR = 215
@@ -1749,15 +1751,29 @@ def collect_memory_validation(args,
 
   if not meminfo_path:
     print("跳过 meminfo 对比：采样结束后未成功保存 dumpsys meminfo", file=sys.stderr)
-    return {"trace_health": trace_health, "report_path": ""}
+    return {
+        "status": 1,
+        "trace_health": trace_health,
+        "report_path": "",
+        "validation": {
+            "status": "fail",
+            "issues": ["meminfo_missing"],
+        },
+    }
 
+  validation = build_memory_validation_status(mmap_summary, trace_health)
   report_path = write_memory_validation_report(
       args.output,
       mmap_summary,
       meminfo_path,
       trace_health,
       smaps_dir=os.path.join(args.output, "smaps"))
-  return {"trace_health": trace_health, "report_path": report_path}
+  return {
+      "status": 0 if validation["status"] == "pass" else 1,
+      "trace_health": trace_health,
+      "report_path": report_path,
+      "validation": validation,
+  }
 
 
 def run_analyzer(args, pid: int, trace_path: str, smaps_dir: str,
@@ -1953,12 +1969,18 @@ def finish_collection(args, pid: int, device_trace: str, trace_path: str,
       args.mmap_callstacks and trace_health is not None and
       "perf_callsites" in trace_health and
       int_value(trace_health["perf_callsites"]) == 0)
-  validation["status"] = 1 if callstacks_missing else 0
+  validation["status"] = max(
+      int_value(validation.get("status")), 1 if callstacks_missing else 0)
   if callstacks_missing:
     print(
         "MMAP_PROFILE_FAILED|reason=perf_callstacks_missing|"
         f"pid={pid}|samples={int_value((trace_health or {}).get('perf_samples'))}|"
         "请检查 traced_perf 读取 /proc/<pid>/maps 的权限")
+  elif validation["status"] != 0:
+    issues = validation.get("validation", {}).get("issues", [])
+    print(
+        "MMAP_PROFILE_FAILED|reason=memory_validation_failed|issues="
+        + ",".join(str(issue) for issue in issues))
   validation["output"] = args.output
   return validation
 
@@ -2092,6 +2114,8 @@ def run_profile_controlled_collection(args, action_module):
             adb=os.environ.get("ADB_BINARY", "adb"),
             rpc_local_port=RPC_LOCAL_PORT,
             android_serial=os.environ.get("ANDROID_SERIAL", ""),
+            rpc_timeout_seconds=float(
+                os.environ.get("HEAP_PROFILE_RPC_TIMEOUT_S", "10")),
             summary_path=Path(args.output, "run_summary.txt").resolve(),
         )
         result = run_profile_action_module(
@@ -2156,7 +2180,8 @@ def main() -> int:
 
   script_dir = Path(__file__).resolve().parent
   try:
-    action_path = resolve_action_module_path(script_dir)
+    action_path = resolve_action_module_path(
+        script_dir, os.environ.get("PERF_PROFILE_ACTION_SCRIPT", ""))
     action_module = load_action_module(action_path)
   except (OSError, RuntimeError) as exc:
     print(f"MMAP_PROFILE_FAILED|reason=action_script_invalid|error={exc}")

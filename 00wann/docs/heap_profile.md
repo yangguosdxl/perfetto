@@ -109,7 +109,9 @@ Tcp server started and listening at <5001..5005>
 
 公共 Session 默认要求响应 `result=true` 且没有 `error`，成功时输出 `PROFILE_ACTION_RPC=PASS`。默认模块当前没有战斗完成信号，因此 RPC 成功后通过 `session.wait_forever()` 保持协程挂起，由 120 秒最长等待触发取消。RPC 失败时公共接口返回 `success=False` 并保存诊断，默认脚本选择抛异常使本轮失败。本轮 RPC 详情默认保存到 `gm_rpc.txt`；公共输出保存到 `profile_action.log` 并同步追加到 `run_summary.txt`。
 
-执行器为每轮测试创建一次 `ProfileActionSession`。测试模块直接调用 Session 方法：
+执行器为每轮测试创建一次 `ProfileActionSession`。公共 API 和协程 runner 位于
+`device_test_framework/actions/` 子模块，具体测试目的位于独立 `profile_actions/`
+子模块。测试模块直接调用 Session 方法：
 
 ```python
 async def run_profile_action(session):

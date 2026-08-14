@@ -20,10 +20,12 @@ import time
 from pathlib import Path
 from typing import BinaryIO
 
-from profile_action_api import ProfileActionContext
-from profile_action_runner import (load_action_module,
-                                   resolve_action_module_path,
-                                   run_profile_action_module)
+from device_test_framework.actions import (
+    ProfileActionContext,
+    load_action_module,
+    resolve_action_module_path,
+    run_profile_action_module,
+)
 
 APP = os.environ.get("MMAP_PHYS_APP")
 LAUNCH_ACTIVITY = f"{APP}/com.dhplugin.unity.MainActivity"
@@ -761,7 +763,8 @@ def main(argv: list[str]) -> int:
   interval_bytes = interval_args[1] if interval_args else ""
   shmem_size_bytes = shmem_args[1] if shmem_args else ""
   try:
-    action_module_path = resolve_action_module_path(script_dir)
+    action_module_path = resolve_action_module_path(
+        script_dir, os.environ.get("PERF_PROFILE_ACTION_SCRIPT", ""))
     action_module = load_action_module(action_module_path)
   except (OSError, RuntimeError) as exc:
     print(f"HEAP_PROFILE_FAILED|reason=action_script_invalid|error={exc}")
@@ -924,6 +927,8 @@ def main(argv: list[str]) -> int:
                 adb=adb_binary(),
                 rpc_local_port=RPC_LOCAL_PORT,
                 android_serial=env.get("ANDROID_SERIAL", ""),
+                rpc_timeout_seconds=float(
+                    os.environ.get("HEAP_PROFILE_RPC_TIMEOUT_S", "10")),
                 summary_path=(out_dir / "run_summary.txt").resolve(),
             )
             action_running = True

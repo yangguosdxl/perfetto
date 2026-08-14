@@ -21,23 +21,30 @@ device_test_framework/                 独立 Git 子模块
   config / engine / reporting         通用配置、阶段引擎和报告
   platforms/android.py                Android 连接与运行级资源管理
   features/base.py / flows/base.py    通用扩展协议
+  actions/api.py / runner.py          ADB、Poco RPC、日志和流程协程执行
 
 device_test_plugins/                   00wann 项目代码
   malloc.py / mmap.py                 专业后端参数和 FS 文件准备
   environment.py                      旧变量兼容与项目后端环境
   perfetto_tools.py                    Perfetto 工具定位
   registry.py                          Android、malloc/mmap、FS 流程注册
+
+profile_actions/                       独立 Git 子模块
+  send_battle_record_gm.py             当前默认测试目的
 ```
 
 独立仓库远端为：
 
 ```text
 https://git.idianhun.com/fs/device-test-framework.git
+https://git.idianhun.com/fs/device-test-profile-actions.git
 ```
 
 父仓库固定经过验收的子模块 commit，不自动跟随远端 `main`。首次检出父仓库需使用
 `git clone --recurse-submodules`，已有工作树使用 `git submodule update --init --recursive`。
-通用核心不能引用 `run_heap_profile.py`、`collect_mmap_phys_data.py`、FS 包名或业务日志。
+通用核心不能引用 `run_heap_profile.py`、`collect_mmap_phys_data.py`、FS 包名或具体 GM。
+流程脚本子模块只调用 `device_test_framework.actions.ProfileActionSession`，不能复制 ADB、
+Poco 端口发现、RPC 或协程竞速实现。
 
 ## 入口
 
@@ -108,6 +115,10 @@ FeaturePlugin
 FlowSpec
   fs_login_battle：向后端声明登录、表加载和测试模块环境
   none：禁用登录后流程，例如无栈 mmap 验证
+
+Action SDK
+  ProfileActionSession：ADB、目标 App 日志、Poco RPC 和公共资源清理
+  runner：脚本契约、等待时间、协程/App 存活/人工中断竞速
 ```
 
 项目注册表位于 `device_test_plugins/registry.py`，扩展项必须显式注册，不扫描目录或动态加载。
@@ -161,6 +172,7 @@ malloc 和 mmap 的 trace、meminfo、健康报告、归因 JSON、pprof 等专�
 
 ```bash
 python -m unittest discover -s device_test_framework/tests -t . -v
+python -m unittest discover -s profile_actions/tests -v
 python -m unittest -v test_device_test_framework.py
 python -m unittest discover -v
 bash -n run_device_test.sh run_heap_profile.sh run_mmap_phys_profile.sh
@@ -171,7 +183,7 @@ bash -n run_device_test.sh run_heap_profile.sh run_mmap_phys_profile.sh
 Shell 集成测试默认删除临时目录。定位失败时可设置 `KEEP_TEST_TMP=1` 保留本轮夹具、
 命令日志和统一报告。
 
-升级通用框架时，先在独立仓库完成测试和推送，再在父仓库更新子模块指针：
+升级通用框架或流程脚本时，先在独立仓库完成测试和推送，再在父仓库更新对应指针：
 
 ```bash
 cd device_test_framework
@@ -179,4 +191,10 @@ git fetch origin
 git checkout <已验收 commit>
 cd ..
 git add device_test_framework
+
+cd profile_actions
+git fetch origin
+git checkout <已验收 commit>
+cd ..
+git add profile_actions
 ```

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import collect_mmap_phys_data as collector
-from profile_action_runner import ProfileActionResult
+from device_test_framework.actions import ProfileActionResult
 
 
 class MmapProfileControlTest(unittest.TestCase):

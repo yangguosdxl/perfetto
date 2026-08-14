@@ -563,6 +563,51 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
     self.assertEqual(analyzed_traces,
                      [os.path.join(tmpdir, "symbolized-trace")])
 
+  def test_finish_collection_propagates_memory_validation_failure(self):
+    """perf 丢样等通用健康失败必须传递到采集进程退出码。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args = collector.argparse.Namespace(
+          name="com.example.app",
+          output=tmpdir,
+          mmap_callstacks=True,
+          no_analyze=True,
+          traceconv="traceconv")
+      validation = {
+          "status": 1,
+          "trace_health": {
+              "perf_samples": 100,
+              "perf_callsites": 100,
+          },
+          "validation": {
+              "status": "fail",
+              "issues": ["perf_data_loss"],
+          },
+      }
+      with mock.patch.object(collector, "pull_trace"), \
+          mock.patch.object(collector, "capture_meminfo",
+                            return_value=os.path.join(
+                                tmpdir, "dumpsys_meminfo.txt")), \
+          mock.patch.object(collector, "symbolize_trace",
+                            return_value=os.path.join(tmpdir, "symbolized-trace")), \
+          mock.patch.object(collector, "check_trace_health", return_value={
+              "perf_samples": 100,
+              "perf_callsites": 100,
+          }), \
+          mock.patch.object(collector, "collect_memory_validation",
+                            return_value=validation), \
+          mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        result = collector.finish_collection(
+            args,
+            32096,
+            "/data/misc/perfetto-traces/test",
+            os.path.join(tmpdir, "mmap_trace.perfetto-trace"),
+            os.path.join(tmpdir, "smaps"))
+
+    self.assertEqual(result["status"], 1)
+    self.assertIn(
+        "MMAP_PROFILE_FAILED|reason=memory_validation_failed|"
+        "issues=perf_data_loss", stdout.getvalue())
+
   def test_main_no_mmap_callstacks_restarts_app_before_validation(self):
     """无栈验证应先重启目标 App，并让 Perfetto 先于 App 启动。"""
     with tempfile.TemporaryDirectory() as tmpdir:
