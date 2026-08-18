@@ -1,6 +1,6 @@
 # Native heap profile 采集脚本
 
-`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，目标包名统一读取同目录 `config.sh` 中的 `MMAP_PHYS_APP`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。它现在是通用真机测试框架的兼容入口：`run_device_test.sh` 通过 `device_test_framework` 子模块执行配置、Android 连接、运行级清理和统一报告，`device_test_plugins` 中的 malloc 插件再调用 `run_heap_profile.py` 执行专业采集时序。入口会自动切换到自身所在目录并加载配置，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。
+`run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，目标包名统一读取同目录 `config.sh` 中的 `MMAP_PHYS_APP`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。它现在是通用真机测试框架的兼容入口：`run_device_test.sh` 通过 `device_test_framework` 子模块执行配置、Android 连接、运行级清理和统一报告，`device_test_plugins` 中的 malloc 插件再调用 `run_heap_profile.py` 执行专业采集时序。入口会自动切换到自身所在目录并加载配置，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。采集、统一报告和平台清理成功后，入口会自动执行 `run_heap_alloc_stacks_by_symbol_latest.sh`，分析最近一次 Native heap trace 的分配调用栈。
 
 通用配置、插件和报告结构见 `docs/device_test_framework.md`。每轮除原有 Native heap
 产物外还会生成 `run_config.json`、`run_manifest.json`、`run_summary.txt` 和
@@ -16,9 +16,15 @@
 00wann/run_heap_profile.sh
 ```
 
+采集入口成功返回后，wrapper 使用 `run_heap_alloc_stacks_by_symbol_latest.sh` 自身的默认参数，
+自动选择 `PerfData/mem` 下最近一次 trace，优先分析 `symbolized-trace` 并执行 `fs.ini` 全量
+分类。`run_heap_profile.sh` 的 interval 和 shmem 位置参数不会传给分析脚本。采集失败时输出
+`HEAP_PROFILE_POST_ANALYSIS=SKIP`，避免误分析旧 trace；分析失败时输出
+`HEAP_PROFILE_POST_ANALYSIS=FAIL` 并让总入口返回失败。
+
 人工按 Ctrl+C 时，Python 主脚本也会请求 `heap_profile.py` 停止采集。Linux 下直接转发 `SIGINT`；Windows 下 `subprocess` 不支持对子进程发送 `SIGINT`，脚本会用新进程组和 Ctrl-Break bridge 把控制台事件转换为 `heap_profile.py` 内部的 `SIGINT` 处理。主脚本不会直接 130 退出；它会继续等待 `heap_profile.py` 把 `raw-trace`、`symbolized-trace` 和 `heap_dump.*.pb` 或 `heap_dump.*.pb.gz` 拉回本地并完成处理，然后保存 `heap_profile.log`、抓取 `dumpsys meminfo`，并执行后续 malloc live 与 `Native Heap Alloc` 验证。
 
-如需指定采样 interval，可把 interval 作为第一个参数传入，单位为 bytes。不传时脚本当前使用 1024。2026-08-11 的真实数据中，1024 的启动到登录耗时为 113.485 秒，`diff_bytes=114905353`，因此需要在保持 64 MiB 验收阈值的同时继续调试更低开销的采样间隔：
+如需指定采样 interval，可把 interval 作为第一个参数传入，单位为 bytes。不传时脚本当前使用 1024。2026-08-11 的真实数据中，1024 的启动到登录耗时为 113.485 秒，`diff_bytes=114905353`，因此需要在保留 64 MiB 健康提示阈值的同时继续调试更低开销的采样间隔：
 
 ```bash
 00wann/run_heap_profile.sh 1024
@@ -231,17 +237,24 @@ abs(malloc_live_bytes - meminfo_native_heap_alloc_bytes)
 HEAP_PROFILE_MEMINFO_ALLOWED_DIFF_BYTES=67108864
 ```
 
-验证通过时输出 `HEAP_MEMINFO_VALIDATION=PASS`。如果不相当，脚本输出 `HEAP_MEMINFO_VALIDATION=FAIL` 并返回失败。百 MB 级差异不能通过百分比阈值放行，必须继续定位是否存在 heapprofd 丢包、trace 缺失、并发 profiling 残留导致的 `heapprofd_rejected_concurrent`、采样间隔过粗、启动前分配未覆盖、meminfo 抓取晚于采集窗口，或 `Native Heap Alloc` 中存在 heapprofd 未统计来源等根因。报告中会保留 `health_sum`、`heap_dump_count`、trace 路径和 meminfo 路径。
+差值不超过阈值时输出 `HEAP_MEMINFO_VALIDATION=PASS`。差值超过阈值时输出
+`HEAP_MEMINFO_VALIDATION=WARN`，该结果仅作为健康提示并返回成功，不阻断后续最新调用栈分析。
+trace 缺失、meminfo 获取或解析失败、malloc live SQL 查询失败等数据不可用问题仍输出
+`HEAP_MEMINFO_VALIDATION=FAIL` 并返回失败。百 MB 级差异仍应结合 heapprofd 丢包、并发 profiling
+残留导致的 `heapprofd_rejected_concurrent`、采样间隔、启动前分配覆盖范围、meminfo 抓取时点，
+以及 `Native Heap Alloc` 中 heapprofd 未统计来源进行诊断。报告中会保留 `health_sum`、
+`heap_dump_count`、trace 路径和 meminfo 路径。
 
 修改 `run_heap_profile.sh` 后可运行：
 
 ```bash
 bash 00wann/test_run_heap_profile.sh
+bash 00wann/test_run_heap_alloc_stacks_by_symbol_latest.sh
 bash -n 00wann/run_heap_profile.sh 00wann/test_run_heap_profile.sh
 python -m py_compile 00wann/run_heap_profile.py
 ```
 
-测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。测试中的本地 RPC 服务会校验 Poco 小端长度头、`DoRecordCheat` 方法和完整 GM 参数，也会覆盖 RPC 失败后的 Perfetto 正常收尾。Linux 环境会模拟人工 Ctrl+C，确认中断会传递给 `heap_profile.py`，并在 `heap_profile.py` 完成 trace/heap dump 本地收尾后继续完成 meminfo 抓取和 SQL 验证；Windows 环境会额外验证 Ctrl-Break bridge 能触发 `heap_profile.py` 的 `SIGINT` 收尾逻辑。
+测试会用假的 `adb` 模拟“第一次 `pidof` 为空、第二次返回 PID”的状态，验证脚本在应用未启动时会先拉起应用，并且随后继续执行 Native heap profile 采集。测试中的本地 RPC 服务会校验 Poco 小端长度头、`DoRecordCheat` 方法和完整 GM 参数，也会覆盖 RPC 失败后的 Perfetto 正常收尾。Linux 环境会模拟人工 Ctrl+C，确认中断会传递给 `heap_profile.py`，并在 `heap_profile.py` 完成 trace/heap dump 本地收尾后继续完成 meminfo 抓取和 SQL 验证；Windows 环境会额外验证 Ctrl-Break bridge 能触发 `heap_profile.py` 的 `SIGINT` 收尾逻辑。wrapper 测试还会验证采集成功后执行最新调用栈分析、采集失败时跳过分析，以及分析失败退出码向总入口传播。
 
 ## 启动耗时评估
 

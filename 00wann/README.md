@@ -436,7 +436,8 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 
 ## `run_heap_profile.sh`
 
-用途：Native heap profile 采集入口，包装 `run_heap_profile.py`。
+用途：Native heap profile 采集入口，包装 `run_heap_profile.py`，采集成功后自动分析最近一次
+Native heap trace 的分配调用栈。
 
 采集前会临时隐藏 Android 系统错误/ANR 对话框，避免高开销采样期间反复
 失焦；所有退出路径会恢复 `global.hide_error_dialogs` 原值。这不会延长 ANR
@@ -452,6 +453,7 @@ MMAP_PHYS_APP=com.example.app ./run_mmap_phys_analyze_latest.sh
 5. 不传 interval 时使用 1024 bytes。
 6. 不传 shmem-size 时使用 8388608 bytes。
 7. 未设置 `PERFETTO_BINARY_PATH` 时，优先使用当前 FS 打包产物 `unityLibrary/symbols/arm64-v8a`，并追加 `workspace/allsymbols/arm64-v8a` 作为补充符号目录。
+8. 采集、统一报告和平台清理成功后，自动执行 `run_heap_alloc_stacks_by_symbol_latest.sh`；使用该脚本的默认最新 trace 和全量分类参数。采集失败时跳过分析，分析失败时入口返回失败。
 ```
 
 命令：
@@ -515,7 +517,10 @@ PerfData/mem/<时间戳>/
   heap_meminfo_validation.txt
 ```
 
-验收要点：`heap_meminfo_validation.txt` 应输出 `HEAP_MEMINFO_VALIDATION=PASS`；如果出现 `heapprofd_rejected_concurrent`，需要先清理残留 profiling session 再重跑。
+健康检查要点：`heap_meminfo_validation.txt` 会输出 `HEAP_MEMINFO_VALIDATION=PASS` 或
+`HEAP_MEMINFO_VALIDATION=WARN`。`WARN` 表示 malloc live 与 Native Heap Alloc 差值超过阈值，
+仅作为健康提示，不阻断后续调用栈分析；trace、meminfo 或 SQL 数据不可用仍输出 `FAIL` 并使采集
+失败。如果出现 `heapprofd_rejected_concurrent`，需要先清理残留 profiling session 再重跑。
 
 ## `run_heap_profile.py`
 
@@ -533,7 +538,7 @@ PerfData/mem/<时间戳>/
 7. 使用 `adb shell am start -n $MMAP_PHYS_APP/com.dhplugin.unity.MainActivity` 拉起固定 Activity。
 8. App PID 就绪后加载 `PERF_PROFILE_ACTION_SCRIPT` 指定的测试模块。默认模块复用 `profile_actions/fs_app_ready.py` 等待 `登录场景完成` 和 `RegistForGameStart.LoadOtherTable.End`。
 9. 创建一次 `ProfileActionSession` 并运行异步 `run_profile_action(session)`；测试脚本自行调用异步等待，协程完成、人工中断或 App 死亡进行竞速，最后由 Session 统一清理公共资源。默认模块在战斗录像 GM 成功后自行等待 120 秒。
-10. 查询 heap_profile_allocation 累计 live bytes，与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值验证。
+10. 查询 heap_profile_allocation 累计 live bytes，与 dumpsys meminfo Native Heap Alloc 做 64 MiB 阈值健康对比；差值超限输出 `WARN`，不作为流程门禁。
 ```
 
 参数说明：

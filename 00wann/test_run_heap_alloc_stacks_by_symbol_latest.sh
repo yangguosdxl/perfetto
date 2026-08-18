@@ -9,6 +9,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 cp "$script_dir/run_heap_alloc_stacks_by_symbol_latest.sh" \
   "$tmpdir/run_heap_alloc_stacks_by_symbol_latest.sh"
 cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
+cp "$script_dir/config.sh" "$tmpdir/config.sh"
 
 mkdir -p "$tmpdir/bin" "$tmpdir/heap_analyzer"
 cp "$script_dir/heap_analyzer/fs.ini" "$tmpdir/heap_analyzer/fs.ini"

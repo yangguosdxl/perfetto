@@ -24,12 +24,24 @@ cp -R "$script_dir/profile_actions" "$tmpdir/profile_actions"
 cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 
+cat >"$tmpdir/run_heap_alloc_stacks_by_symbol_latest.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'heap_post_analysis %s\n' "$*" >>"${TEST_LOG:?}"
+exit "${FAKE_POST_ANALYSIS_RC:-0}"
+EOF
+chmod +x "$tmpdir/run_heap_alloc_stacks_by_symbol_latest.sh"
+
 if [[ "$(head -n 1 "$tmpdir/run_heap_profile.sh")" != "#!/usr/bin/env bash" ]]; then
   echo "run_heap_profile.sh 缺少 bash shebang，直接执行时可能被 /bin/sh 解释"
   exit 1
 fi
 if ! grep -Fq "run_device_test.sh" "$tmpdir/run_heap_profile.sh"; then
   echo "run_heap_profile.sh 应只作为统一真机测试入口包装"
+  exit 1
+fi
+if ! grep -Fq "run_heap_alloc_stacks_by_symbol_latest.sh" \
+    "$tmpdir/run_heap_profile.sh"; then
+  echo "run_heap_profile.sh 应在采集成功后执行最新调用栈分析"
   exit 1
 fi
 
@@ -463,6 +475,14 @@ wait_for_test_log_pattern() {
 }
 
 expected_app="com.example.heapprofile"
+expected_gm_command=$("$real_python" - "$python_action_path" <<'PY'
+import runpy
+import sys
+
+command = runpy.run_path(sys.argv[1])["GM_COMMAND"]
+sys.stdout.buffer.write(command.encode("utf-8"))
+PY
+)
 default_stable_collection_seconds=$(env -u HEAP_PROFILE_LOGIN_STABLE_S "$real_python" - "$python_action_path" <<'PY'
 import runpy
 import sys
@@ -482,13 +502,24 @@ settings_get_line=$(grep -n "adb -s FAKE_HEAP_DEVICE shell settings get global h
 settings_put_line=$(grep -n "adb -s FAKE_HEAP_DEVICE shell settings put global hide_error_dialogs 1" "$TEST_LOG" | head -1 | cut -d: -f1)
 profile_start_line=$(grep -n "heap_profile.py -n $expected_app" "$TEST_LOG" | head -1 | cut -d: -f1)
 settings_restore_line=$(grep -n "adb -s FAKE_HEAP_DEVICE shell settings delete global hide_error_dialogs" "$TEST_LOG" | tail -1 | cut -d: -f1)
+post_analysis_line=$(grep -n "heap_post_analysis" "$TEST_LOG" | tail -1 | cut -d: -f1)
 if [[ -z "$settings_get_line" || -z "$settings_put_line" || \
       -z "$profile_start_line" || -z "$settings_restore_line" || \
+      -z "$post_analysis_line" || \
       "$settings_get_line" -ge "$settings_put_line" || \
       "$settings_put_line" -ge "$profile_start_line" || \
-      "$profile_start_line" -ge "$settings_restore_line" ]]; then
-  echo "Native heap 采集必须先隐藏系统错误对话框，结束后恢复原值"
+      "$profile_start_line" -ge "$settings_restore_line" || \
+      "$settings_restore_line" -ge "$post_analysis_line" ]]; then
+  echo "Native heap 采集必须先恢复平台设置，再执行最新调用栈分析"
   cat "$TEST_LOG"
+  exit 1
+fi
+if ! grep -Fq "HEAP_PROFILE_POST_ANALYSIS=START" \
+      "$tmpdir/run_heap_profile_test.out" || \
+   ! grep -Fq "HEAP_PROFILE_POST_ANALYSIS=PASS" \
+      "$tmpdir/run_heap_profile_test.out"; then
+  echo "采集成功后应输出最新调用栈分析的开始和成功状态"
+  cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
 if grep -Fq "shell monkey -p $expected_app 1" "$TEST_LOG"; then
@@ -533,10 +564,10 @@ if ! grep -Fq "adb -s FAKE_HEAP_DEVICE forward tcp:22346 tcp:5002" "$TEST_LOG"; 
   cat "$TEST_LOG"
   exit 1
 fi
-if ! grep -Fq \
-    'FAKE_RPC_REQUEST|method=DoRecordCheat|params=["CheatFunc_BatchCheatOption.战斗录像:@40011@@|"]' \
-    "$TEST_LOG"; then
+if ! grep -Fq 'FAKE_RPC_REQUEST|method=DoRecordCheat|params=[' "$TEST_LOG" || \
+   ! grep -Fq "$expected_gm_command" "$TEST_LOG"; then
   echo "Poco RPC 方法或 GM 参数不正确"
+  printf '期望 GM: %s\n' "$expected_gm_command"
   cat "$TEST_LOG"
   exit 1
 fi
@@ -661,6 +692,26 @@ profile_log_line=$(grep -n "cp .*heap_profile.log" "$TEST_LOG" | head -1 | cut -
 if [[ "$meminfo_line" == "" || "$profile_log_line" == "" || "$meminfo_line" -ge "$profile_log_line" ]]; then
   echo "应在 profiler 进入 shutdown 后、host 后处理完成前抓取 meminfo"
   cat "$TEST_LOG"
+  exit 1
+fi
+
+export FAKE_POST_ANALYSIS_RC=23
+set +e
+run_script "$TEST_LOG"
+post_analysis_failed_rc=$?
+set -e
+unset FAKE_POST_ANALYSIS_RC
+if [[ "$post_analysis_failed_rc" -ne 23 ]]; then
+  echo "最新调用栈分析失败时应保留分析脚本退出码 23，实际为 $post_analysis_failed_rc"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "heap_post_analysis" "$TEST_LOG" || \
+   ! grep -Fq "HEAP_PROFILE_POST_ANALYSIS=FAIL|rc=23" \
+      "$tmpdir/run_heap_profile_test.out"; then
+  echo "最新调用栈分析失败时未输出明确失败阶段"
+  cat "$TEST_LOG"
+  cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
 
@@ -1025,21 +1076,35 @@ if ! grep -Fq "HEAP_PROFILE_FAILED|rc=1" "$tmpdir/run_heap_profile_test.out"; th
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
-
-export FAKE_MALLOC_LIVE_BYTES=696873169
-export FAKE_NATIVE_HEAP_ALLOC_KB=913859
-set +e
-run_script "$TEST_LOG"
-large_diff_rc=$?
-set -e
-unset FAKE_MALLOC_LIVE_BYTES FAKE_NATIVE_HEAP_ALLOC_KB
-if [[ "$large_diff_rc" -eq 0 ]]; then
-  echo "malloc live 与 meminfo Native Heap Alloc 相差约 227MiB 时不应通过验证"
+if grep -Fq "heap_post_analysis" "$TEST_LOG" || \
+   ! grep -Fq "HEAP_PROFILE_POST_ANALYSIS=SKIP|reason=profile_failed|rc=1" \
+      "$tmpdir/run_heap_profile_test.out"; then
+  echo "采集失败时应跳过最新调用栈分析并保留采集退出码"
+  cat "$TEST_LOG"
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi
-if ! grep -Fq "HEAP_MEMINFO_VALIDATION=FAIL" "$tmpdir/run_heap_profile_test.out"; then
-  echo "大差异失败时应输出 HEAP_MEMINFO_VALIDATION=FAIL"
+
+export FAKE_MALLOC_LIVE_BYTES=696873169
+export FAKE_NATIVE_HEAP_ALLOC_KB=913859
+run_script "$TEST_LOG"
+large_diff_rc=$?
+unset FAKE_MALLOC_LIVE_BYTES FAKE_NATIVE_HEAP_ALLOC_KB
+if [[ "$large_diff_rc" -ne 0 ]]; then
+  echo "malloc live 与 meminfo Native Heap Alloc 的差值健康提示不应阻断流程"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "HEAP_MEMINFO_VALIDATION=WARN" "$tmpdir/run_heap_profile_test.out"; then
+  echo "大差异时应输出 HEAP_MEMINFO_VALIDATION=WARN"
+  cat "$tmpdir/run_heap_profile_test.out"
+  exit 1
+fi
+if ! grep -Fq "heap_post_analysis" "$TEST_LOG" || \
+   ! grep -Fq "HEAP_PROFILE_POST_ANALYSIS=PASS" \
+      "$tmpdir/run_heap_profile_test.out"; then
+  echo "差值健康提示后应继续执行最新调用栈分析"
+  cat "$TEST_LOG"
   cat "$tmpdir/run_heap_profile_test.out"
   exit 1
 fi

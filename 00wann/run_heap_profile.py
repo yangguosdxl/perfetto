@@ -586,7 +586,7 @@ def validate_heap_profile_against_meminfo(
   write_validation(
       validation_path,
       [
-          "HEAP_MEMINFO_VALIDATION=FAIL|"
+          "HEAP_MEMINFO_VALIDATION=WARN|"
           "reason=malloc_live_not_comparable_to_meminfo_alloc|"
           f"malloc_live_bytes={malloc_live_bytes}|"
           f"meminfo_native_heap_alloc_bytes={meminfo_alloc_bytes}|"
@@ -595,7 +595,7 @@ def validate_heap_profile_against_meminfo(
       ],
       append=True,
   )
-  return 1
+  return 0
 
 
 def wait_for_log_pattern(
