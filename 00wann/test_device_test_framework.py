@@ -185,6 +185,32 @@ class ProjectFeatureTest(unittest.TestCase):
         "测试调试配置\n", encoding="utf-8")
     self.assertTrue(MmapFeature().validate(self.context).success)
 
+  def testMalloc和Mmap声明统一归档文件(self):
+    malloc = MallocFeature()
+    malloc.register_archive_requests(self.context)
+    malloc_requests = {
+        item.name: item for item in self.context.archive_requests}
+    self.assertTrue(malloc_requests["logcat.txt"].required)
+    self.assertTrue(malloc_requests["logcat.txt"].move)
+    self.assertFalse(malloc_requests["FSBootCmdLine.cfg"].move)
+    self.assertFalse(malloc_requests["debugconfig.txt"].move)
+    self.assertIn("heap_profile_config.txt", malloc_requests)
+
+    mmap_context = RunContext(
+        FrameworkConfig(**{**self.config.__dict__, "feature": "mmap"}),
+        self.context.output_dir,
+        self.platform,
+        create_flow(self.config.action_script),
+    )
+    mmap = MmapFeature()
+    mmap.register_archive_requests(mmap_context)
+    mmap_requests = {item.name: item for item in mmap_context.archive_requests}
+    self.assertIn("FSBootCmdLine.cfg", mmap_requests)
+    self.assertIn("debugconfig.txt", mmap_requests)
+    self.assertIn("mmap_phys_config.pbtxt", mmap_requests)
+    self.assertIn("mmap_lifecycle_config.pbtxt", mmap_requests)
+    self.assertIn("mmap_callstack_config.pbtxt", mmap_requests)
+
 
 class RegistryAndFlowTest(unittest.TestCase):
 

@@ -173,7 +173,11 @@ MMAP_PHYS_ACTIVITY=com.example.meminfodemo/.MainActivity \
 
 ```text
 PerfData/mmap_phys/<时间戳>/
-  mmap_phys_config.pbtxt
+  archive/
+    mmap_phys_config.pbtxt
+    logcat.txt
+    test_config.ini
+    run_config.json
   mmap_trace.perfetto-trace
   symbolized-trace
   smaps/
@@ -202,8 +206,10 @@ PerfData/mmap_phys/<时间戳>/
 ```
 
 两个真机采集脚本现在是统一框架的兼容入口。通用配置位于 `device_test.ini`，
-旧 `config.sh` 和环境变量继续兼容；每轮在原专业结果目录额外生成
-`run_config.json`、`run_manifest.json`、`run_summary.txt` 和 `report.md`。
+旧 `config.sh` 和环境变量继续兼容；每轮在原专业结果目录额外生成单一
+`archive/` 归档目录、`run_manifest.json`、`run_summary.txt` 和 `report.md`。
+`archive/` 集中保存应用日志、原始 INI、归一化生效配置、FS 输入配置和专业
+Perfetto 配置；trace、smaps 与分析结果仍保持原位置。
 通用核心通过 `device_test_framework/` Git 子模块引用，malloc/mmap 和 FS 流程保留在
 `device_test_plugins/`；ADB、Poco RPC、日志和协程 runner 位于框架的 `actions/`，具体
 测试目的位于独立 `profile_actions/` Git 子模块。框架结构、配置优先级和子模块升级方式见
@@ -507,7 +513,11 @@ Windows 下脚本会把 `PerfettoRoot/buildtools/win/clang/bin` 加入 `PATH`，
 ```text
 PerfData/mem/<时间戳>/
   heap_profile.log
-  heap_profile_config.txt
+  archive/
+    heap_profile_config.txt
+    logcat.txt
+    test_config.ini
+    run_config.json
   run_summary.txt
   gm_rpc.txt
   raw-trace

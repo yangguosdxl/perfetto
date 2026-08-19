@@ -6,7 +6,7 @@ import os
 
 from device_test_framework.config import LegacyEnvironmentMapping
 from device_test_framework.features.base import BackendFeature
-from device_test_framework.models import RunContext
+from device_test_framework.models import ArchiveRequest, OperationResult, RunContext
 
 
 LEGACY_ENVIRONMENT = LegacyEnvironmentMapping(
@@ -39,6 +39,9 @@ def initialize_project_environment() -> None:
 class ProjectBackendFeature(BackendFeature):
   """向现有专业采集器提供归一化后的项目环境。"""
 
+  archive_input_names: tuple[str, ...] = ()
+  archive_output_names: tuple[str, ...] = ()
+
   def build_environment(self, context: RunContext) -> dict[str, str]:
     env = super().build_environment(context)
     config = context.config
@@ -51,3 +54,51 @@ class ProjectBackendFeature(BackendFeature):
         "HEAP_PROFILE_RPC_TIMEOUT_S": str(config.rpc.timeout_seconds),
     })
     return env
+
+  def get_archive_input_names(self, _context: RunContext) -> tuple[str, ...]:
+    return self.archive_input_names
+
+  def register_archive_requests(self, context: RunContext) -> None:
+    """宿主声明文件语义，通用框架只负责收尾归档。"""
+    for name in self.get_archive_input_names(context):
+      context.request_archive(ArchiveRequest(
+          name,
+          context.config.project_root / name,
+          "config",
+          self.name,
+          True,
+          False,
+          "本轮宿主输入配置",
+      ))
+    context.request_archive(ArchiveRequest(
+        "logcat.txt",
+        context.output_dir / "logcat.txt",
+        "app_log",
+        self.name,
+        True,
+        True,
+        "本轮应用主日志",
+    ))
+    context.request_archive(ArchiveRequest(
+        "logcat.err.txt",
+        context.output_dir / "logcat.err.txt",
+        "app_log_error",
+        self.name,
+        False,
+        True,
+        "应用日志采集进程错误输出",
+    ))
+    for name in self.archive_output_names:
+      context.request_archive(ArchiveRequest(
+          name,
+          context.output_dir / name,
+          "config",
+          self.name,
+          False,
+          True,
+          "本轮专业采集配置",
+      ))
+
+  def run(self, context: RunContext) -> OperationResult:
+    self.register_archive_requests(context)
+    return super().run(context)

@@ -140,6 +140,7 @@ connect
   -> feature_run
   -> feature_close
   -> platform_close
+  -> archive
 ```
 
 所有平台和功能公共接口使用 `OperationResult` 返回成功或失败。框架会捕获未处理异常，
@@ -156,14 +157,23 @@ mmap   -> PerfData/mmap_phys/<时间戳>/
 连接或前置校验失败 -> PerfData/framework_failed/<功能>/<时间戳>/
 ```
 
-每轮新增四个统一产物：
+每轮数据输出目录使用一个扁平的 `archive/` 目录集中保存应用日志和
+测试配置：
 
 ```text
-run_config.json    归一化配置快照
+archive/logcat.txt          应用主日志
+archive/logcat.err.txt      日志采集进程错误输出，存在时归档
+archive/test_config.ini     本轮原始 INI，存在时归档
+archive/run_config.json     归一化生效配置
+archive/<专业配置>       FS 输入和 Perfetto 等专业采集配置
 run_manifest.json  状态、阶段、错误、后端命令和全部产物索引
 run_summary.txt    便于脚本检查的结构化单行结果
 report.md          人工阅读总报告和专业产物链接
 ```
+
+专业后端运行结束后，框架移动其声明的日志和生成配置，复制输入配置，
+不在输出根目录保留重复文件。必需应用日志缺失会使原本成功的测试改判失败；
+如更早的专业阶段已失败，归档错误记入 `archive` 阶段，但不覆盖首个失败原因。
 
 malloc 和 mmap 的 trace、meminfo、健康报告、归因 JSON、pprof 等专业产物保持原名。
 框架只建立索引，不把 malloc live、Native Heap Alloc、mmap PSS 等不同口径合并成一个值。

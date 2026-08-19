@@ -84,8 +84,9 @@ test_mmap_phys_analyzer.py
 
 该脚本现在经 `run_device_test.sh mmap` 启动。框架配置位于 `device_test.ini`，旧
 `config.sh` 和 mmap 后端参数继续兼容；完整结构见 `docs/device_test_framework.md`。
-每轮在原 mmap 目录增加 `run_config.json`、`run_manifest.json`、`run_summary.txt` 和
-`report.md`，其中 `report.md` 链接本轮健康报告、归因 JSON、trace 和 pprof 等专业产物。
+每轮在原 mmap 目录增加 `archive/`、`run_manifest.json`、`run_summary.txt` 和
+`report.md`。`archive/` 集中保存应用日志、INI、归一化配置、FS 输入和 Perfetto
+配置；`report.md` 链接本轮健康报告、归因 JSON、trace 和 pprof 等专业产物。
 
 入口在采集前保存设备的 `global.hide_error_dialogs` 原值并临时设为 `1`，
 避免采集期间的 ANR 对话框改变目标应用焦点。正常、失败和中断退出都会
@@ -258,6 +259,11 @@ mmap_trace.perfetto-trace 和 smaps/
 ```
 
 验证模式不会生成新的 `mmap_phys_attribution.json`、`mmap_phys_attribution.pprof.pb.gz` 或 `mmap_phys_attribution.speedscope.json`，因为当前运行没有采集 mmap 调用栈。它适合回答“无栈 mmap 事件是否能采到、smaps 是否能汇总”，不适合回答“哪个调用栈占了物理内存”，也不再回答“malloc live 是否接近 Native Heap Alloc”。
+
+无栈验证的启动顺序固定为“停止目标 App → 启动 Perfetto → 启动 logcat →
+启动 App”，避免启动期 mmap 或应用日志漏采。无论正常完成、失败还是人工中断，
+采集器都会停止 logcat 并关闭文件句柄；统一框架随后将日志移入
+`archive/logcat.txt` 和 `archive/logcat.err.txt`。
 
 ## 常用参数
 
@@ -694,8 +700,14 @@ PerfData/mmap_phys/<时间戳>/
 主功能一次成功运行会生成：
 
 ```text
-mmap_phys_config.pbtxt
+archive/mmap_phys_config.pbtxt
   -> 本次 Perfetto 采集配置。
+
+archive/logcat.txt
+  -> 本次应用测试日志。
+
+archive/test_config.ini / archive/run_config.json
+  -> 本轮原始 INI 与归一化生效配置。
 
 mmap_trace.perfetto-trace
   -> 原始 Perfetto trace。
@@ -729,8 +741,14 @@ memory_validation.json
 验证模式一次成功运行会生成：
 
 ```text
-mmap_phys_config.pbtxt
+archive/mmap_phys_config.pbtxt
   -> 本次 Perfetto 采集配置；不包含 linux.perf callstack_sampling。
+
+archive/logcat.txt
+  -> 本次应用测试日志。
+
+archive/test_config.ini / archive/run_config.json
+  -> 本轮原始 INI 与归一化生效配置。
 
 mmap_trace.perfetto-trace
   -> 原始 Perfetto trace。

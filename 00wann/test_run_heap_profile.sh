@@ -22,6 +22,7 @@ cp -R "$script_dir/device_test_framework" "$tmpdir/device_test_framework"
 cp -R "$script_dir/device_test_plugins" "$tmpdir/device_test_plugins"
 cp -R "$script_dir/profile_actions" "$tmpdir/profile_actions"
 cp "$script_dir/common_tools.sh" "$tmpdir/common_tools.sh"
+cp "$script_dir/FSBootCmdLine.cfg" "$tmpdir/FSBootCmdLine.cfg"
 cp "$script_dir/debugconfig.txt" "$tmpdir/debugconfig.txt"
 
 cat >"$tmpdir/run_heap_alloc_stacks_by_symbol_latest.sh" <<'EOF'

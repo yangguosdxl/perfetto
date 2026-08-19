@@ -593,6 +593,9 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       with mock.patch.object(collector, "wait_for_pid", return_value=1234), \
           mock.patch.object(collector, "write_config"), \
           mock.patch.object(collector, "start_perfetto", return_value=5678), \
+          mock.patch.object(collector, "start_logcat_capture",
+                            return_value=(None, None, None)), \
+          mock.patch.object(collector, "stop_logcat_capture"), \
           mock.patch.object(collector, "collect_smaps"), \
           mock.patch.object(collector, "pull_trace"), \
           mock.patch.object(collector, "symbolize_trace",
@@ -767,6 +770,10 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       with mock.patch.object(collector, "write_config", record("write_config")), \
           mock.patch.object(collector, "start_perfetto",
                             record("start_perfetto", 5678)), \
+          mock.patch.object(collector, "start_logcat_capture",
+                            record("start_logcat", (None, None, None))), \
+          mock.patch.object(collector, "stop_logcat_capture",
+                            record("stop_logcat")), \
           mock.patch.object(collector, "wait_for_pid",
                             record("wait_for_pid", 1234)), \
           mock.patch.object(collector, "collect_smaps", record("collect_smaps")), \
@@ -782,7 +789,10 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
 
     self.assertEqual(result["status"], 0)
     self.assertLess(calls.index("start_perfetto"), calls.index("wait_for_pid"))
+    self.assertLess(calls.index("start_perfetto"), calls.index("start_logcat"))
+    self.assertLess(calls.index("start_logcat"), calls.index("wait_for_pid"))
     self.assertLess(calls.index("wait_for_pid"), calls.index("collect_smaps"))
+    self.assertLess(calls.index("collect_smaps"), calls.index("stop_logcat"))
 
   def test_no_mmap_callstacks_does_not_enable_heapprofd(self):
     """无栈验证不能生成 heapprofd 配置。"""
@@ -812,6 +822,9 @@ class MmapPhysAnalyzerTest(unittest.TestCase):
       with mock.patch.object(collector, "write_config", side_effect=fake_write_config), \
           mock.patch.object(collector, "wait_for_pid", return_value=1234), \
           mock.patch.object(collector, "start_perfetto", return_value=5678), \
+          mock.patch.object(collector, "start_logcat_capture",
+                            return_value=(None, None, None)), \
+          mock.patch.object(collector, "stop_logcat_capture"), \
           mock.patch.object(collector, "collect_smaps"), \
           mock.patch.object(collector, "pull_trace"), \
           mock.patch.object(collector, "capture_meminfo",

@@ -1955,16 +1955,22 @@ def run_collection(args, start_target_after_perfetto: bool = False):
       perf_ring_buffer_read_period_ms=args.perf_ring_buffer_read_period_ms,
       include_mmap_callstacks=args.mmap_callstacks)
   write_config(config, args.output)
-  if start_target_after_perfetto:
-    # 验证 attempt 必须先让 ftrace 就绪，再启动 App，
-    # 否则启动期 mmap 会被漏采，事件健康检查没有意义。
-    perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
-    pid = wait_for_pid(args.name, args.wait_timeout_s)
-  else:
-    pid = wait_for_pid(args.name, args.wait_timeout_s)
-    perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
-
+  perfetto_pid = None
+  logcat_process = logcat_stdout = logcat_stderr = None
+  collection_finished = False
   try:
+    if start_target_after_perfetto:
+      # 无栈验证必须先让 ftrace 就绪，再开始日志并启动 App，
+      # 否则启动期 mmap 会被漏采，事件健康检查没有意义。
+      perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
+      logcat_process, logcat_stdout, logcat_stderr = start_logcat_capture(
+          args.output)
+      pid = wait_for_pid(args.name, args.wait_timeout_s)
+    else:
+      pid = wait_for_pid(args.name, args.wait_timeout_s)
+      logcat_process, logcat_stdout, logcat_stderr = start_logcat_capture(
+          args.output)
+      perfetto_pid = start_perfetto(config, device_trace, args.no_guardrails)
     collect_smaps(
         pid,
         perfetto_pid,
@@ -1973,8 +1979,10 @@ def run_collection(args, start_target_after_perfetto: bool = False):
         args.use_su,
         args.duration_ms,
         run_as_package=args.name)
+    collection_finished = True
   finally:
-    if IS_INTERRUPTED:
+    stop_logcat_capture(logcat_process, logcat_stdout, logcat_stderr)
+    if perfetto_pid is not None and (IS_INTERRUPTED or not collection_finished):
       stop_perfetto(perfetto_pid)
 
   return finish_collection(args, pid, device_trace, trace_path, smaps_dir)

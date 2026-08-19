@@ -11,6 +11,8 @@ from .environment import ProjectBackendFeature
 class MallocFeature(ProjectBackendFeature):
   name = "malloc"
   output_category = "mem"
+  archive_input_names = ("FSBootCmdLine.cfg", "debugconfig.txt")
+  archive_output_names = ("heap_profile_config.txt",)
   required_capabilities = frozenset({
       "perfetto", "app_lifecycle", "log_capture", "port_forward",
       "process_memory_snapshot",

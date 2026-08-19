@@ -14,6 +14,12 @@ from .perfetto_tools import resolve_perfetto_tool
 class MmapFeature(ProjectBackendFeature):
   name = "mmap"
   output_category = "mmap_phys"
+  archive_input_names = ("FSBootCmdLine.cfg",)
+  archive_output_names = (
+      "mmap_phys_config.pbtxt",
+      "mmap_lifecycle_config.pbtxt",
+      "mmap_callstack_config.pbtxt",
+  )
   fs_apps = frozenset({
       "com.fs.t.prf", "com.tencent.dhwdxkty.trunk.profiler"})
   required_capabilities = frozenset({
@@ -53,6 +59,12 @@ class MmapFeature(ProjectBackendFeature):
       env["MMAP_PHYS_USE_ROOT_TRACED_PERF"] = (
           "1" if root_perf.lower() in ("1", "true", "yes", "on") else "0")
     return env
+
+  def get_archive_input_names(self, context: RunContext) -> tuple[str, ...]:
+    names = list(super().get_archive_input_names(context))
+    if context.config.app_id in self.fs_apps:
+      names.append("debugconfig.txt")
+    return tuple(names)
 
   def build_command(self, context: RunContext) -> list[str]:
     options = context.config.feature_options

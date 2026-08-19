@@ -57,7 +57,25 @@ cat >"$tmpdir/bin/python3" <<'EOF'
 set -euo pipefail
 printf 'python3 %s\n' "$*" >>"${TEST_LOG:?}"
 printf 'PATH %s\n' "$PATH" >>"${TEST_LOG:?}"
-exit "${FAKE_PYTHON_RC:-0}"
+rc=${FAKE_PYTHON_RC:-0}
+output_dir=""
+while (($# > 0)); do
+  if [[ "$1" == "--output" && $# -ge 2 ]]; then
+    output_dir=$2
+    break
+  fi
+  shift
+done
+if ((rc == 0)) && [[ -n "$output_dir" ]]; then
+  if command -v cygpath >/dev/null 2>&1; then
+    output_dir=$(cygpath -u "$output_dir")
+  fi
+  mkdir -p "$output_dir"
+  printf '假应用日志\n' >"$output_dir/logcat.txt"
+  : >"$output_dir/logcat.err.txt"
+  printf '假 Perfetto 配置\n' >"$output_dir/mmap_phys_config.pbtxt"
+fi
+exit "$rc"
 EOF
 chmod +x "$tmpdir/bin/adb" "$tmpdir/bin/python3"
 

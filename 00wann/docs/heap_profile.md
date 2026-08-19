@@ -3,8 +3,9 @@
 `run_heap_profile.sh` 用于启动 Perfetto Native heap profile 采集，目标包名统一读取同目录 `config.sh` 中的 `MMAP_PHYS_APP`，采集结果保存到 `00wann/PerfData/mem/<日期时间>/`。它现在是通用真机测试框架的兼容入口：`run_device_test.sh` 通过 `device_test_framework` 子模块执行配置、Android 连接、运行级清理和统一报告，`device_test_plugins` 中的 malloc 插件再调用 `run_heap_profile.py` 执行专业采集时序。入口会自动切换到自身所在目录并加载配置，因此可以从仓库根目录执行 `00wann/run_heap_profile.sh`，也可以在 `00wann` 目录内执行 `./run_heap_profile.sh`。采集、统一报告和平台清理成功后，入口会自动执行 `run_heap_alloc_stacks_by_symbol_latest.sh`，分析最近一次 Native heap trace 的分配调用栈。
 
 通用配置、插件和报告结构见 `docs/device_test_framework.md`。每轮除原有 Native heap
-产物外还会生成 `run_config.json`、`run_manifest.json`、`run_summary.txt` 和
-`report.md`；专业后端的非零退出码和框架清理阶段都会记录在统一报告中。
+产物外还会生成 `archive/`、`run_manifest.json`、`run_summary.txt` 和
+`report.md`。`archive/` 集中保存应用日志与所有本轮测试配置；专业后端的非零
+退出码、框架清理和归档阶段都会记录在统一报告中。
 
 入口在采集前保存设备的 `global.hide_error_dialogs` 原值并临时设为 `1`，避免
 高开销采样期间的“应用未响应”对话框反复改变窗口焦点。正常、失败和中断退出
@@ -67,9 +68,13 @@ adb shell am start -n "$MMAP_PHYS_APP/com.dhplugin.unity.MainActivity"
 每轮开始时，脚本输出 `HEAP_PROFILE_CONFIG` 和 `HEAP_PROFILE_TOOLS`，内容包括目标 App、Activity、设备序列号、采样间隔、共享缓冲区、Perfetto trace 缓冲区、测试模块路径、RPC 端口、Perfetto 工具和符号目录。同样的信息保存到：
 
 ```text
-PerfData/mem/<日期时间>/heap_profile_config.txt
+PerfData/mem/<日期时间>/archive/heap_profile_config.txt
 PerfData/mem/<日期时间>/run_summary.txt
 ```
+
+测试执行期间，后端仍在输出根目录写入 `logcat.txt` 和配置快照，供 Action
+脚本读取。后端、Action 和平台清理完成后，框架将它们移入单一 `archive/`
+目录，最终输出根目录不保留重复日志或配置。
 
 采集器不识别 FS 业务日志。默认测试模块复用
 `profile_actions/fs_app_ready.py` 中的 `wait_login_done()` 和
@@ -96,7 +101,8 @@ async def run_profile_action(session) -> None:
 
 测试脚本在自己需要的位置调用 `asyncio.sleep()` 或日志等待。执行器只在协程返回、人工中断或 App 原 PID 死亡时结束；协程抛异常或 App 死亡时保存 trace 但本轮失败。
 
-默认模块 `profile_actions/send_battle_record_gm.py` 在两个 FS 就绪步骤完成后，从本轮 `logcat.txt` 中查找目标 PID 的：
+默认模块 `profile_actions/send_battle_record_gm.py` 在两个 FS 就绪步骤完成后，从执行期的
+`logcat.txt` 中查找目标 PID 的；收尾后该文件位于 `archive/logcat.txt`：
 
 ```text
 Tcp server started and listening at <5001..5005>
