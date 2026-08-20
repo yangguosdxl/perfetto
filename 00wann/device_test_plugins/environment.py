@@ -49,7 +49,8 @@ class ProjectBackendFeature(BackendFeature):
         "MMAP_PHYS_APP": config.app_id,
         "MMAP_PHYS_ACTIVITY": config.launch_id,
         "PerfettoRoot": str(config.tools.perfetto_root),
-        "PERF_PROFILE_ACTION_SCRIPT": config.action_script,
+        # 框架会忽略旧 INI 中的动作路径，必须使用注册表解析后的实际脚本。
+        "PERF_PROFILE_ACTION_SCRIPT": context.flow.action_script,
         "HEAP_PROFILE_RPC_LOCAL_PORT": str(config.rpc.local_port),
         "HEAP_PROFILE_RPC_TIMEOUT_S": str(config.rpc.timeout_seconds),
     })

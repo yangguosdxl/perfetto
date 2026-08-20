@@ -78,7 +78,8 @@ Poco 端口发现、RPC 或协程竞速实现。
 [target]               包名和启动 Activity
 [tools]                Perfetto、ADB、Python 等宿主机工具
 [rpc]                  Poco RPC 本机端口和超时
-[flow.fs_login_battle] 登录后测试模块
+[flow.send_battle_record_gm] Profile Action 脚本（旧配置路径仅作兼容读取）
+动作名直接来自 `profile_actions.PROFILE_ACTIONS`；`fs_login_battle` 不再是合法 flow。
 [feature.malloc]       malloc 采样和缓冲区参数
 [feature.mmap]         mmap buffer、smaps 和 perf ring 参数
 ```
@@ -113,7 +114,7 @@ FeaturePlugin
   mmap：准备 FS 文件并调用 collect_mmap_phys_data.py
 
 FlowSpec
-  fs_login_battle：向后端声明登录、表加载和测试模块环境
+  send_battle_record_gm / wait_some_time：由 `profile_actions.PROFILE_ACTIONS` 注册，框架按动作名创建 Flow
   none：禁用登录后流程，例如无栈 mmap 验证
 
 Action SDK

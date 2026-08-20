@@ -51,7 +51,7 @@ Android SDK/NDK/JDK
 真机采集
   run_heap_profile.sh / run_mmap_phys_profile.sh
     -> run_device_test.sh
-      -> AndroidAdapter + FeaturePlugin + FlowSpec
+      -> AndroidAdapter + FeaturePlugin + PROFILE_ACTIONS FlowSpec
         -> device_test_framework.actions + profile_actions
         -> run_heap_profile.py / collect_mmap_phys_data.py
       -> mmap_phys_analyzer.py

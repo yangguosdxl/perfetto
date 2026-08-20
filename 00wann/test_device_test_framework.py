@@ -20,10 +20,8 @@ from device_test_plugins.environment import (
     LEGACY_ENVIRONMENT,
     initialize_project_environment,
 )
-from device_test_plugins.fs_login_battle import create_flow
 from device_test_plugins.malloc import MallocFeature
 from device_test_plugins.mmap import MmapFeature
-from device_test_plugins.none import create_flow as create_no_flow
 from device_test_plugins.registry import REGISTRY
 
 
@@ -96,7 +94,7 @@ class ProjectFeatureTest(unittest.TestCase):
         config_path=root / "device_test.ini",
         platform="android",
         feature="malloc",
-        flow="fs_login_battle",
+        flow="send_battle_record_gm",
         device_id="serial",
         app_id="com.tencent.dhwdxkty.trunk.profiler",
         launch_id=(
@@ -120,7 +118,7 @@ class ProjectFeatureTest(unittest.TestCase):
         self.config,
         root / "PerfData" / "result",
         self.platform,
-        create_flow(self.config.action_script),
+        REGISTRY.create_flow(self.config.flow, self.config.action_script),
     )
 
   def tearDown(self):
@@ -139,7 +137,8 @@ class ProjectFeatureTest(unittest.TestCase):
     self.assertEqual(environment["HEAP_PROFILE_RPC_LOCAL_PORT"], "12346")
     self.assertEqual(environment["HEAP_PROFILE_RPC_TIMEOUT_S"], "12")
     self.assertEqual(
-        environment["PERF_PROFILE_ACTION_SCRIPT"], self.config.action_script)
+        environment["PERF_PROFILE_ACTION_SCRIPT"],
+        self.context.flow.action_script)
 
   def testMmap默认参数在用户参数之前且工具映射正确(self):
     tool_dir = self.config.tools.perfetto_root / (
@@ -157,7 +156,7 @@ class ProjectFeatureTest(unittest.TestCase):
         })
     context = RunContext(
         config, self.context.output_dir, self.platform,
-        create_flow(config.action_script))
+        REGISTRY.create_flow(config.flow, config.action_script))
     command = MmapFeature().build_command(context)
     self.assertIn("collect_mmap_phys_data.py", command[1])
     self.assertEqual(command[command.index("--buffer-kb") + 1], "131072")
@@ -200,7 +199,7 @@ class ProjectFeatureTest(unittest.TestCase):
         FrameworkConfig(**{**self.config.__dict__, "feature": "mmap"}),
         self.context.output_dir,
         self.platform,
-        create_flow(self.config.action_script),
+        REGISTRY.create_flow(self.config.flow, self.config.action_script),
     )
     mmap = MmapFeature()
     mmap.register_archive_requests(mmap_context)
@@ -217,14 +216,19 @@ class RegistryAndFlowTest(unittest.TestCase):
   def test项目只显式注册现有平台功能和流程(self):
     self.assertEqual(set(REGISTRY.platforms), {"android"})
     self.assertEqual(set(REGISTRY.features), {"malloc", "mmap"})
-    self.assertEqual(set(REGISTRY.flows), {"fs_login_battle", "none"})
+    self.assertEqual(
+        set(REGISTRY.flows), {"send_battle_record_gm", "wait_some_time", "none"})
+    self.assertNotIn("fs_login_battle", REGISTRY.flows)
+    with self.assertRaisesRegex(ValueError, "不支持的流程"):
+      REGISTRY.create_flow("fs_login_battle", "profile_actions/旧路径.py")
 
   def testFs流程输出测试模块而空流程禁用操作(self):
-    flow = create_flow("profile_actions/test.py")
+    flow = REGISTRY.create_flow(
+        "send_battle_record_gm", "profile_actions/旧配置路径.py")
     self.assertEqual(
-        flow.environment()["PERF_PROFILE_ACTION_SCRIPT"],
-        "profile_actions/test.py")
-    none = create_no_flow("ignored.py")
+        flow.action_script,
+        str(Path("profile_actions/send_battle_record_gm.py").resolve()))
+    none = REGISTRY.create_flow("none", "ignored.py")
     self.assertIsInstance(none, FlowSpec)
     self.assertFalse(none.enabled)
     self.assertNotIn("PERF_PROFILE_ACTION_SCRIPT", none.environment())
